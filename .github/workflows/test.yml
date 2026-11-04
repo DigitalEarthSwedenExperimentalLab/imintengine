@@ -16,6 +16,13 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
+      # Private-repo runners in DigitalEarthSwedenExperimentalLab ran out of
+      # disk during the suite; drop toolchains the tests never use.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -26,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r requirements.txt
           pip install pytest scikit-learn
 
       # This module performs interactive OIDC login during collection.
