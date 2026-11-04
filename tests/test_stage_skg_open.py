@@ -1,0 +1,1268 @@
+"""Tests for scripts/stage_skg_open.py: index parsing, the staging plan,
+the manifest contract, idempotent skipping and the resumable download.
+GDAL conversion is exercised on a tiny zip-wrapped GeoTIFF."""
+from __future__ import annotations
+
+import hashlib
+import http.server
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import zipfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from scripts import stage_skg_open as st
+
+INDEX = """<html><body><pre>
+ 2/25/2026 10:38 AM     83807378 <A HREF="/geodataport/data/sks_Volym_omdrev2_01.zip">sks_Volym_omdrev2_01.zip</A><br>
+ 2/25/2026 10:38 AM     56356781 <A HREF="/geodataport/data/sks_Grundyta_omdrev2_01.zip">sks_Grundyta_omdrev2_01.zip</A><br>
+ 2/25/2026 10:38 AM     52281246 <A HREF="/geodataport/data/sks_Medeldiameter_omdrev2_01.zip">sks_Medeldiameter_omdrev2_01.zip</A><br>
+ 4/15/2026  1:00 PM      5942179 <A HREF="/geodataport/data/sks_Volym_omdrev3_07.zip">sks_Volym_omdrev3_07.zip</A><br>
+ 4/9/2022  3:16 PM   1083208306 <A HREF="/geodataport/data/sksSLUMarkfuktighet01.zip">sksSLUMarkfuktighet01.zip</A><br>
+ 2/20/2025  1:00 PM   6541420432 <A HREF="/geodataport/data/sksTradhojd01.zip">sksTradhojd01.zip</A><br>
+ 12/1/2025  5:33 PM   2670278104 <A HREF="/geodataport/data/sks_Medelh%C3%B6jd_omdrev1.zip">sks_Medelh&#246;jd_omdrev1.zip</A><br>
+</pre></body></html>"""
+
+
+def test_parse_index_reads_size_date_and_unescapes_names():
+    idx = st.parse_index(INDEX)
+    assert idx["sks_Volym_omdrev2_01.zip"] == {"bytes": 83807378, "modified": "2/25/2026 10:38 AM"}
+    assert idx["sksSLUMarkfuktighet01.zip"]["bytes"] == 1083208306
+    assert "sks_Medelhöjd_omdrev1.zip" in idx
+
+
+def test_plan_lists_only_published_files_per_product():
+    idx = st.parse_index(INDEX)
+    items = st.plan(["grunddata", "markfukt", "tradhojd"], [2, 3], ["01", "07"], idx)
+    names = [i.name for i in items]
+    assert names == ["sks_Volym_omdrev2_01.zip", "sks_Grundyta_omdrev2_01.zip",
+                     "sks_Medeldiameter_omdrev2_01.zip", "sks_Volym_omdrev3_07.zip",
+                     "sksSLUMarkfuktighet01.zip", "sksTradhojd01.zip"]
+    by = {i.name: i for i in items}
+    assert by["sks_Volym_omdrev2_01.zip"].derived == "grunddata/omdrev2/volym_01.tif"
+    assert by["sks_Volym_omdrev3_07.zip"].omdrev == 3 and by["sks_Volym_omdrev3_07.zip"].county == "07"
+    assert by["sksSLUMarkfuktighet01.zip"].derived == "markfukt/markfukt_01.tif"
+    assert by["sksTradhojd01.zip"].derived == "tradhojd/tradhojd_10m_01.tif"
+    assert st.vrt_targets(items) == {
+        "grunddata/volym_omdrev2.vrt": ["grunddata/omdrev2/volym_01.tif"],
+        "grunddata/grundyta_omdrev2.vrt": ["grunddata/omdrev2/grundyta_01.tif"],
+        "grunddata/medeldiameter_omdrev2.vrt": ["grunddata/omdrev2/medeldiameter_01.tif"],
+        "grunddata/volym_omdrev3.vrt": ["grunddata/omdrev3/volym_07.tif"],
+        "markfukt/markfukt.vrt": ["markfukt/markfukt_01.tif"],
+        "tradhojd/tradhojd_10m.vrt": ["tradhojd/tradhojd_10m_01.tif"],
+    }
+
+
+def test_manifest_roundtrip_is_atomic_and_carries_provenance(tmp_path, monkeypatch):
+    monkeypatch.setenv("IMINT_GIT_SHA", "abc123")
+    m = st.load_manifest(tmp_path)
+    assert m["schema"] == st.MANIFEST_SCHEMA and m["files"] == {}
+    m["files"]["x.zip"] = {"sha256": "0" * 64, "bytes": 1}
+    st.save_manifest(tmp_path, m)
+    assert not (tmp_path / "MANIFEST.json.tmp").exists()
+    again = json.loads((tmp_path / "MANIFEST.json").read_text())
+    assert again["git_sha"] == "abc123" and again["updated_at"].endswith("Z")
+    assert again["files"]["x.zip"]["sha256"] == "0" * 64
+    assert again["source_url"] == st.SOURCE_URL
+
+
+def test_is_done_requires_raw_hash_and_derived_raster(tmp_path):
+    item = st.Item("a.zip", "markfukt", "markfukt/markfukt_01.tif", county="01")
+    m = st.load_manifest(tmp_path)
+    assert not st.is_done(item, m, tmp_path)
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "a.zip").write_bytes(b"zip")
+    m["files"]["a.zip"] = {"sha256": "f" * 64}
+    assert not st.is_done(item, m, tmp_path)                       # derived missing
+    m["derived"]["markfukt/markfukt_01.tif"] = {"bytes": 1, "sha256": "e" * 64}
+    assert not st.is_done(item, m, tmp_path)
+    (tmp_path / "markfukt").mkdir()
+    (tmp_path / "markfukt" / "markfukt_01.tif").write_bytes(b"tif")
+    assert st.is_done(item, m, tmp_path)
+
+
+@pytest.fixture
+def range_server(tmp_path):
+    payload = bytes(range(256)) * 400          # 102400 bytes
+    hits = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            hits.append(rng)
+            start = int(rng.split("=")[1].rstrip("-")) if rng else 0
+            body = payload[start:]
+            self.send_response(206 if rng else 200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("ETag", '"abc"')
+            self.end_headers()
+            # first answer is cut short to force a resume
+            self.wfile.write(body if hits.count(None) > 1 or rng else body[:40000])
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}/f.zip", payload, hits
+    srv.shutdown()
+
+
+def test_download_resumes_with_a_range_request(range_server, tmp_path):
+    url, payload, hits = range_server
+    target = tmp_path / "raw" / "f.zip"
+    rec = st.download(url, target, len(payload))
+    assert target.read_bytes() == payload and not target.with_name("f.zip.part").exists()
+    assert rec["resumed"] is True and hits == [None, "bytes=40000-"] and rec["etag"] == '"abc"'
+    assert st.download(url, target, len(payload)) == {"resumed": False, "attempts": 0}  # already there
+
+
+def _tiny_zip(tmp_path: Path, name: str) -> Path:
+    import rasterio
+    from rasterio.transform import from_origin
+
+    tif = tmp_path / "work" / "x.tif"
+    tif.parent.mkdir()
+    data = np.arange(64 * 64, dtype=np.int16).reshape(64, 64)
+    data[0, :] = -1
+    with rasterio.open(tif, "w", driver="GTiff", width=64, height=64, count=1, dtype="int16",
+                       crs="EPSG:3006", transform=from_origin(500000, 6250640, 10, 10),
+                       nodata=-1) as dst:
+        dst.write(data, 1)
+    zpath = tmp_path / name
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(tif, "x.tif")
+    shutil.rmtree(tif.parent)
+    return zpath
+
+
+def test_gdal_source_reads_deflate_zips_in_place(tmp_path):
+    zpath = _tiny_zip(tmp_path, "sks_Volym_omdrev2_01.zip")
+    src, tmp = st.gdal_source(zpath, tmp_path / "_work")
+    assert src == f"/vsizip/{zpath}/x.tif" and tmp is None
+    import rasterio
+    with rasterio.open(src) as ds:
+        assert ds.width == 64 and ds.nodata == -1
+
+
+@pytest.mark.skipif(shutil.which("gdal_translate") is None, reason="gdal CLI not installed")
+def test_convert_writes_a_verified_cog(tmp_path):
+    zpath = _tiny_zip(tmp_path, "sks_Volym_omdrev2_01.zip")
+    item = st.Item(zpath.name, "grunddata", "grunddata/omdrev2/volym_01.tif", 2, "volym", "01")
+    rec = st.convert(item, zpath, tmp_path / item.derived, tmp_path / "_work", "average")
+    assert rec["verified_windows"] == 5 and rec["res_m"] == 10.0 and rec["nodata"] == -1
+    assert rec["sha256"] == hashlib.sha256((tmp_path / item.derived).read_bytes()).hexdigest()
+    assert rec["blocks"] == [512, 512]
+
+
+def test_block_stat_p90_ignores_nodata_and_rounds():
+    block = np.full((20, 20), -1, dtype=np.int16)
+    block[:10, :10] = np.arange(100, dtype=np.int16).reshape(10, 10)        # 0..99 -> p90 = 89.1
+    block[:10, 10:] = 7                                                      # constant
+    block[10:, :10][0, 0] = 250                                              # one valid cell
+    out = st.block_stat(block, "p90", -1)
+    assert out.dtype == np.int16 and out.shape == (2, 2)
+    assert out.tolist() == [[89, 7], [250, -1]]
+    assert st.block_stat(block, "max", -1).tolist() == [[99, 7], [250, -1]]
+    assert st.block_stat(block, "average", -1).tolist() == [[50, 7], [250, -1]]   # 49.5 rounds to even
+
+
+def test_derive_tradhojd_10m_streams_to_the_lattice(tmp_path):
+    import rasterio
+    from rasterio.transform import from_origin
+
+    src = tmp_path / "t.tif"
+    data = np.zeros((1300, 640), dtype=np.int16)          # 2 chunks of 640 rows + 20
+    data[:, :] = np.arange(640, dtype=np.int16)[None, :] % 100
+    data[10:20, :] = -1
+    with rasterio.open(src, "w", driver="GTiff", width=640, height=1300, count=1, dtype="int16",
+                       crs="EPSG:3006", transform=from_origin(460000, 6270000, 1, 1), nodata=-1) as d:
+        d.write(data, 1)
+    rec = st.derive_tradhojd_10m(str(src), tmp_path / "out.tif", "p90")
+    assert (rec["width"], rec["height"], rec["res_m"], rec["statistic"]) == (64, 130, 10.0, "p90")
+    with rasterio.open(tmp_path / "out.tif") as o:
+        arr = o.read(1)
+        assert o.transform.c == 460000 and o.transform.f == 6270000 and o.block_shapes[0] == (512, 512)
+    assert arr[1, 0] == -1 and arr[0, 0] == 8 and arr[129, 63] == 38   # p90 of 0..9 and of 30..39
+
+
+def test_is_done_accepts_an_intentionally_dropped_raw_zip(tmp_path):
+    item = st.Item("sksTradhojd01.zip", "tradhojd", "tradhojd/tradhojd_10m_01.tif", county="01")
+    m = st.load_manifest(tmp_path)
+    m["files"]["sksTradhojd01.zip"] = {"sha256": "a" * 64, "raw_deleted_at": "2026-10-12T20:00:00Z"}
+    m["derived"]["tradhojd/tradhojd_10m_01.tif"] = {"sha256": "b" * 64}
+    (tmp_path / "tradhojd").mkdir()
+    (tmp_path / "tradhojd" / "tradhojd_10m_01.tif").write_bytes(b"tif")
+    assert st.is_done(item, m, tmp_path)                           # no raw on disk, by design
+    del m["files"]["sksTradhojd01.zip"]["raw_deleted_at"]
+    assert not st.is_done(item, m, tmp_path)                       # genuinely missing input
+    m["derived"]["tradhojd/tradhojd_10m_01.tif"] = {}
+    m["files"]["sksTradhojd01.zip"]["raw_deleted_at"] = "x"
+    assert not st.is_done(item, m, tmp_path)                       # unverified derivation
+
+
+def test_vrt_sources_come_from_the_whole_staged_inventory(tmp_path):
+    m = st.load_manifest(tmp_path)
+    for p in ("markfukt/markfukt_01.tif", "markfukt/markfukt_03.tif", "grunddata/omdrev2/volym_01.tif",
+              "grunddata/omdrev2/volym_03.tif", "grunddata/omdrev3/volym_07.tif", "grunddata/omdrev2/grundyta_01.tif"):
+        m["derived"][p] = {"sha256": "c" * 64}
+        (tmp_path / p).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / p).write_bytes(b"tif")
+    m["derived"]["markfukt/markfukt_99.tif"] = {"sha256": "d" * 64}     # recorded but not on disk
+    assert st.staged_vrt_sources(m, tmp_path, "markfukt/markfukt.vrt") == [
+        "markfukt/markfukt_01.tif", "markfukt/markfukt_03.tif"]
+    assert st.staged_vrt_sources(m, tmp_path, "grunddata/volym_omdrev2.vrt") == [
+        "grunddata/omdrev2/volym_01.tif", "grunddata/omdrev2/volym_03.tif"]
+    assert st.staged_vrt_sources(m, tmp_path, "grunddata/volym_omdrev3.vrt") == ["grunddata/omdrev3/volym_07.tif"]
+    # a subset run (county 03 only) still publishes both counties
+    items = st.plan(["markfukt"], [2], ["03"], {"sksSLUMarkfuktighet03.zip": {"bytes": 1, "modified": ""}})
+    for vrt in st.vrt_targets(items):
+        assert len(st.staged_vrt_sources(m, tmp_path, vrt)) == 2
+
+
+def test_markfukt_mosaic_makes_the_255_padding_transparent():
+    # county rasters overlap; markfukt pads outside the polygon with 255, grunddata with -1
+    assert st.vrt_nodata("markfukt/markfukt.vrt") == (255, 65535)
+    assert st.vrt_nodata("grunddata/volym_omdrev2.vrt") == (-1, -1)
+    assert st.vrt_nodata("tradhojd/tradhojd_10m.vrt") == (-1, -1)
+
+
+@pytest.mark.skipif(shutil.which("gdalbuildvrt") is None, reason="gdal CLI not installed")
+def test_overlapping_markfukt_counties_compose_without_padding_bleed(tmp_path):
+    import rasterio
+    from rasterio.transform import from_origin
+
+    m = st.load_manifest(tmp_path)
+    (tmp_path / "markfukt").mkdir()
+    # county A covers x 0-200, real data 40 on the left half, 255 padding on the right
+    a = np.full((10, 20), 255, np.uint16); a[:, :10] = 40
+    # county B covers x 100-300, real data 60 on its right half, 255 padding on the left
+    b = np.full((10, 20), 255, np.uint16); b[:, 10:] = 60
+    for name, arr, west in (("markfukt_01.tif", a, 0), ("markfukt_03.tif", b, 100)):
+        with rasterio.open(tmp_path / "markfukt" / name, "w", driver="GTiff", width=20, height=10, count=1,
+                           dtype="uint16", crs="EPSG:3006", transform=from_origin(west, 100, 10, 10),
+                           nodata=65535) as d:
+            d.write(arr, 1)
+        m["derived"]["markfukt/" + name] = {"sha256": "x" * 64}
+    rec = st.build_vrt(tmp_path, "markfukt/markfukt.vrt", st.staged_vrt_sources(m, tmp_path, "markfukt/markfukt.vrt"),
+                       *st.vrt_nodata("markfukt/markfukt.vrt"))
+    with rasterio.open(tmp_path / "markfukt" / "markfukt.vrt") as v:
+        row = v.read(1)[5]
+    assert rec["srcnodata"] == 255 and v.nodata == 65535
+    assert list(row[:10]) == [40] * 10 and list(row[20:]) == [60] * 10      # neither county's padding won
+    assert list(row[10:20]) == [65535] * 10                               # padding in both -> nodata
+
+
+def test_recovered_download_must_match_the_recorded_digest(tmp_path, monkeypatch):
+    monkeypatch.setenv("IMINT_GIT_SHA", "abc")
+    rec = {"sha256": "a" * 64, "bytes": 1}
+    assert st.check_recovered(rec, "a" * 64, "x.zip", accept=False) == rec        # same bytes: fine
+    assert st.check_recovered({}, "b" * 64, "x.zip", accept=False) == {}         # first download
+    raw = tmp_path / "raw" / "x.zip"
+    raw.parent.mkdir()
+    raw.write_bytes(b"new upstream bytes")
+    with pytest.raises(st.UpstreamChanged, match="upstream-changed"):
+        st.check_recovered(rec, "b" * 64, "x.zip", accept=False, raw=raw, dest=tmp_path)
+    assert not raw.exists() and (tmp_path / "raw" / "x.zip.upstream-changed").exists()
+    # a later run therefore sees the raw as missing and cannot skip the check
+    item = st.Item("x.zip", "markfukt", "markfukt/markfukt_01.tif", county="01")
+    m = st.load_manifest(tmp_path)
+    m["files"]["x.zip"] = rec
+    m["derived"][item.derived] = {"sha256": "d" * 64}
+    (tmp_path / "markfukt").mkdir()
+    (tmp_path / item.derived).write_bytes(b"tif")
+    assert not st.is_done(item, m, tmp_path)
+    # acceptance archives the pre-change manifest immutably and keeps the old digest
+    st.save_manifest(tmp_path, m)
+    raw.write_bytes(b"new upstream bytes")
+    out = st.check_recovered(rec, "b" * 64, "x.zip", accept=True, raw=raw, dest=tmp_path)
+    assert out["superseded_sha256"] == ["a" * 64] and out["upstream_changed_at"].endswith("Z")
+    assert rec == {"sha256": "a" * 64, "bytes": 1}                                 # input untouched
+    archived = list(tmp_path.glob("MANIFEST.superseded-*.json"))
+    assert len(archived) == 1 and json.loads(archived[0].read_text())["files"]["x.zip"]["sha256"] == "a" * 64
+    m["files"]["x.zip"] = {**out, "sha256": "b" * 64}
+    st.save_manifest(tmp_path, m)                                                  # later save in the same run
+    st.save_manifest(tmp_path, m)
+    assert json.loads(archived[0].read_text())["files"]["x.zip"]["sha256"] == "a" * 64   # archive untouched
+
+
+def test_save_manifest_keeps_the_previous_copy(tmp_path, monkeypatch):
+    monkeypatch.setenv("IMINT_GIT_SHA", "abc")
+    m = st.load_manifest(tmp_path)
+    m["files"]["a.zip"] = {"sha256": "1" * 64}
+    st.save_manifest(tmp_path, m)
+    assert not (tmp_path / "MANIFEST.previous.json").exists()
+    m["files"]["a.zip"] = {"sha256": "2" * 64}
+    st.save_manifest(tmp_path, m)
+    prev = json.loads((tmp_path / "MANIFEST.previous.json").read_text())
+    assert prev["files"]["a.zip"]["sha256"] == "1" * 64
+    assert json.loads((tmp_path / "MANIFEST.json").read_text())["files"]["a.zip"]["sha256"] == "2" * 64
+
+
+def test_manifest_archives_never_overwrite_each_other(tmp_path, monkeypatch):
+    monkeypatch.setenv("IMINT_GIT_SHA", "abc")
+    monkeypatch.setattr(st, "_now", lambda: "2026-10-13T05:50:00Z")      # freeze the second
+    m = st.load_manifest(tmp_path)
+    paths = []
+    for digest in ("1" * 64, "2" * 64, "3" * 64):
+        m["files"]["a.zip"] = {"sha256": digest}
+        st.save_manifest(tmp_path, m)
+        paths.append(st.archive_manifest(tmp_path))
+    assert [p.name for p in paths] == ["MANIFEST.superseded-20261013T055000Z.json",
+                                       "MANIFEST.superseded-20261013T055000Z-1.json",
+                                       "MANIFEST.superseded-20261013T055000Z-2.json"]
+    assert [json.loads(p.read_text())["files"]["a.zip"]["sha256"][0] for p in paths] == ["1", "2", "3"]
+    # two same-second accepted recoveries keep both pre-change records
+    rec_a = {"sha256": "a" * 64}
+    m["files"]["a.zip"] = rec_a
+    st.save_manifest(tmp_path, m)
+    st.check_recovered(rec_a, "b" * 64, "a.zip", accept=True, dest=tmp_path)
+    m["files"]["a.zip"] = {"sha256": "b" * 64}
+    st.save_manifest(tmp_path, m)
+    st.check_recovered(m["files"]["a.zip"], "c" * 64, "a.zip", accept=True, dest=tmp_path)
+    archived = sorted(tmp_path.glob("MANIFEST.superseded-*.json"))
+    assert len(archived) == 5
+    assert {json.loads(p.read_text())["files"]["a.zip"]["sha256"][0] for p in archived} >= {"a", "b"}
+
+
+# ---- Trädhöjd one county at a time, verify before delete (decision 2026-10-19) ----
+
+def _tradhojd_src(tmp_path, value=50):
+    import rasterio
+    from rasterio.transform import from_origin
+
+    src = tmp_path / "t.tif"
+    data = np.full((200, 300), value, dtype=np.int16)
+    with rasterio.open(src, "w", driver="GTiff", width=300, height=200, count=1, dtype="int16",
+                       crs="EPSG:3006", transform=from_origin(460000, 6270000, 1, 1), nodata=-1) as d:
+        d.write(data, 1)
+    return src
+
+
+def test_derivation_records_its_value_range_and_verifies_against_the_source(tmp_path):
+    rec = st.derive_tradhojd_10m(str(_tradhojd_src(tmp_path)), tmp_path / "out.tif", "p90")
+    assert rec["verified"] and (rec["value_min_dm"], rec["value_max_dm"], rec["valid_cells"]) == (50, 50, 600)
+    assert rec["bounds"] == [460000.0, 6269800.0, 460300.0, 6270000.0]
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"bounds": [0.0, 0.0, 1.0, 1.0]}, "differs from the source"),
+    ({"width": 31}, "size"),
+    ({"value_max_dm": 5000}, "outside the plausible"),
+    ({"value_min_dm": -5}, "outside the plausible"),
+    ({"valid_cells": 0}, "no valid cell"),
+])
+def test_verification_refuses_a_derived_raster_that_does_not_match(tmp_path, change, message):
+    rec = st.derive_tradhojd_10m(str(_tradhojd_src(tmp_path)), tmp_path / "out.tif", "p90")
+    expected = {k: rec[k] for k in ("width", "height", "bounds", "value_min_dm", "value_max_dm", "valid_cells")}
+    with pytest.raises(ValueError, match=message):
+        st.verify_tradhojd_10m(tmp_path / "out.tif", {**expected, **change})
+
+
+def test_garbage_values_fail_the_derivation_before_any_delete(tmp_path):
+    with pytest.raises(ValueError, match="outside the plausible"):
+        st.derive_tradhojd_10m(str(_tradhojd_src(tmp_path, value=20000)), tmp_path / "out.tif", "p90")
+
+
+class _Index:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return INDEX.encode()
+
+
+def _staging(monkeypatch, tmp_path, free_gib=1000.0):
+    """main() offline: the index page, a fake download writing the zip, a fake verified conversion."""
+    monkeypatch.setenv("IMINT_GIT_SHA", "abc")
+    monkeypatch.setattr(st, "_request", lambda *a, **k: _Index())
+    monkeypatch.setattr(st.shutil, "disk_usage", lambda p: shutil._ntuple_diskusage(0, 0, int(free_gib * 2**30)))
+    calls = []
+
+    def download(url, target, expected, **kw):
+        calls.append(("download", target.name))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"zip")
+        return {}
+
+    def convert(item, zpath, out, work, method, tradhojd_workers=1):
+        calls.append(("convert", item.name) if tradhojd_workers == 1 else ("convert", item.name, tradhojd_workers))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"tif")
+        return {"sha256": "d" * 64, "bytes": 3, "verified": True}
+
+    snapshots = []
+    real_save = st.save_manifest
+
+    def save(dest, manifest):
+        snapshots.append(json.loads(json.dumps(manifest)))
+        real_save(dest, manifest)
+
+    monkeypatch.setattr(st, "download", download)
+    monkeypatch.setattr(st, "convert", convert)
+    monkeypatch.setattr(st, "save_manifest", save)
+    monkeypatch.setattr(st, "build_vrt", lambda dest, vrt, rasters, *a: {"sources": rasters})
+    small = zipfile.ZipInfo("Tradhojd01.tif")
+    small.compress_type, small.file_size = st.ZIP_DEFLATE, 3
+    monkeypatch.setattr(st, "zip_tif_entry", lambda z: small)
+    monkeypatch.setattr(st, "zip_tiles", lambda z: None)
+    monkeypatch.setattr(st, "mask_to_county", lambda *a: False)     # the fake conversion writes no raster
+    return calls, snapshots
+
+
+def test_the_derivation_is_on_record_before_the_raw_zip_is_deleted(monkeypatch, tmp_path):
+    calls, snaps = _staging(monkeypatch, tmp_path)
+    code = st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01",
+                    "--drop-raw", "--min-free-gib", "50"])
+    assert code == 0 and calls == [("download", "sksTradhojd01.zip"), ("convert", "sksTradhojd01.zip")]
+    assert not (tmp_path / "m/raw/sksTradhojd01.zip").exists()
+    first_deleted = next(i for i, m in enumerate(snaps) if m["files"].get("sksTradhojd01.zip", {}).get("raw_deleted_at"))
+    assert "tradhojd/tradhojd_10m_01.tif" in snaps[first_deleted - 1]["derived"]
+    rec = snaps[-1]["files"]["sksTradhojd01.zip"]
+    assert rec["sha256"] and rec["bytes"] == 3 and rec["url"].endswith("sksTradhojd01.zip") and rec["downloaded_at"]
+    assert snaps[-1]["vrt"]["tradhojd/tradhojd_10m.vrt"]["sources"] == ["tradhojd/tradhojd_10m_01.tif"]
+
+
+def test_a_free_space_floor_stops_before_the_download(monkeypatch, tmp_path):
+    calls, _ = _staging(monkeypatch, tmp_path, free_gib=55.0)        # 6.1 GiB zip would leave < 50
+    code = st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01",
+                    "--drop-raw", "--min-free-gib", "50"])
+    assert code == 3 and calls == []
+
+
+def test_another_countys_raw_zip_on_disk_refuses_the_next_county(monkeypatch, tmp_path):
+    calls, _ = _staging(monkeypatch, tmp_path)
+    (tmp_path / "m/raw").mkdir(parents=True)
+    (tmp_path / "m/raw/sksTradhojd03.zip").write_bytes(b"left over")
+    with pytest.raises(RuntimeError, match="one county at a time"):
+        st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01", "--drop-raw"])
+    assert calls == []
+
+
+def test_the_floor_also_covers_inflating_a_deflate64_zip(monkeypatch, tmp_path):
+    calls, _ = _staging(monkeypatch, tmp_path, free_gib=60.0)       # the zip itself fits above 50
+    big = zipfile.ZipInfo("Tradhojd01.tif")
+    big.compress_type, big.file_size = st.ZIP_DEFLATE64, 20 * 2**30   # but inflating it would not
+    monkeypatch.setattr(st, "zip_tif_entry", lambda z: big)
+    code = st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01",
+                    "--drop-raw", "--min-free-gib", "50"])
+    assert code == 3 and calls == [("download", "sksTradhojd01.zip")]
+    assert (tmp_path / "m/raw/sksTradhojd01.zip").exists()           # kept for the resumed run
+
+
+
+def test_a_crash_between_record_and_delete_is_finished_on_resume(monkeypatch, tmp_path):
+    """Review B1: derivation recorded, raw zip still on disk -> resume re-verifies, deletes, moves on."""
+    dest = tmp_path / "m"
+    rec = st.derive_tradhojd_10m(str(_tradhojd_src(tmp_path)), tmp_path / "der.tif", "p90")
+    calls, snaps = _staging(monkeypatch, tmp_path)
+    (dest / "tradhojd").mkdir(parents=True); (dest / "raw").mkdir()
+    shutil.copy(tmp_path / "der.tif", dest / "tradhojd/tradhojd_10m_01.tif")
+    (dest / "raw/sksTradhojd01.zip").write_bytes(b"zip")
+    st.save_manifest(dest, {"files": {"sksTradhojd01.zip": {"sha256": "a" * 64, "bytes": 3}},
+                            "derived": {"tradhojd/tradhojd_10m_01.tif": {
+                                **rec, "bytes": (dest / "tradhojd/tradhojd_10m_01.tif").stat().st_size,
+                                "sha256": st.sha256_of(dest / "tradhojd/tradhojd_10m_01.tif")}},
+                            "vrt": {}, "history": []})
+    code = st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"])
+    assert code == 0 and calls == []                                   # no re-download, no re-derive
+    assert not (dest / "raw/sksTradhojd01.zip").exists()
+    assert snaps[-1]["files"]["sksTradhojd01.zip"]["raw_deleted_at"]
+    assert snaps[-1]["vrt"]["tradhojd/tradhojd_10m.vrt"]["sources"] == ["tradhojd/tradhojd_10m_01.tif"]
+
+
+def test_a_tampered_derived_raster_is_never_trusted_to_delete_the_raw_zip(monkeypatch, tmp_path):
+    dest = tmp_path / "m"
+    rec = st.derive_tradhojd_10m(str(_tradhojd_src(tmp_path)), tmp_path / "der.tif", "p90")
+    _staging(monkeypatch, tmp_path)
+    (dest / "tradhojd").mkdir(parents=True); (dest / "raw").mkdir()
+    (dest / "tradhojd/tradhojd_10m_01.tif").write_bytes(b"not the recorded raster")
+    (dest / "raw/sksTradhojd01.zip").write_bytes(b"zip")
+    st.save_manifest(dest, {"files": {"sksTradhojd01.zip": {"sha256": "a" * 64, "bytes": 3}},
+                            "derived": {"tradhojd/tradhojd_10m_01.tif": rec | {"sha256": "b" * 64}},
+                            "vrt": {}, "history": []})
+    with pytest.raises(RuntimeError, match="sha256 differs from its record"):
+        st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"])
+    assert (dest / "raw/sksTradhojd01.zip").exists()
+
+
+@pytest.mark.parametrize("leftover", ["sksTradhojd03.zip.part", "sksTradhojd03.zip.upstream-changed"])
+def test_the_one_county_guard_also_sees_partial_and_superseded_files(monkeypatch, tmp_path, leftover):
+    calls, _ = _staging(monkeypatch, tmp_path)
+    (tmp_path / "m/raw").mkdir(parents=True)
+    (tmp_path / "m/raw" / leftover).write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="one county at a time"):
+        st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01", "--drop-raw"])
+    assert calls == []
+
+
+def test_a_held_manifest_lock_refuses_before_any_download(monkeypatch, tmp_path):
+    calls, _ = _staging(monkeypatch, tmp_path)
+    dest = tmp_path / "m"
+    dest.mkdir()
+    (dest / st.LOCK_NAME).write_text('{"owner": "drop_skg_open_raw"}')
+    with pytest.raises(st.ManifestLocked, match="drop_skg_open_raw"):
+        st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"])
+    assert calls == [] and not (dest / "MANIFEST.json").exists()
+    assert (dest / st.LOCK_NAME).exists()                               # another writer's lock is left alone
+
+
+def test_the_lock_is_held_from_the_first_read_to_the_last_save_then_released(monkeypatch, tmp_path):
+    _staging(monkeypatch, tmp_path)
+    dest = tmp_path / "m"
+    held = []
+    real_load, real_save = st.load_manifest, st.save_manifest
+    monkeypatch.setattr(st, "load_manifest", lambda d: held.append((d / st.LOCK_NAME).exists()) or real_load(d))
+    monkeypatch.setattr(st, "save_manifest", lambda d, m: held.append((d / st.LOCK_NAME).exists()) or real_save(d, m))
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    assert len(held) > 2 and all(held)
+    assert not (dest / st.LOCK_NAME).exists()
+
+
+def test_a_floor_stop_and_a_crash_both_release_the_lock(monkeypatch, tmp_path):
+    _staging(monkeypatch, tmp_path, free_gib=55.0)
+    dest = tmp_path / "m"
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01",
+                    "--drop-raw", "--min-free-gib", "50"]) == 3
+    assert not (dest / st.LOCK_NAME).exists()
+    monkeypatch.setattr(st, "download", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(st.shutil, "disk_usage", lambda p: shutil._ntuple_diskusage(0, 0, 1000 * 2**30))
+    with pytest.raises(KeyboardInterrupt):
+        st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"])
+    assert not (dest / st.LOCK_NAME).exists()
+
+
+def test_a_dry_run_takes_no_lock(monkeypatch, tmp_path):
+    _staging(monkeypatch, tmp_path)
+    dest = tmp_path / "m"
+    dest.mkdir()
+    (dest / st.LOCK_NAME).write_text('{"owner": "other"}')
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--dry-run"]) == 0
+
+
+def test_sigterm_releases_the_lock_and_restores_the_handler(tmp_path):
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(SystemExit) as exc:
+        with st.manifest_lock(tmp_path, "stage_skg_open"):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)                                               # the handler raises before this ends
+    assert exc.value.code == 143
+    assert not (tmp_path / st.LOCK_NAME).exists()
+    assert signal.getsignal(signal.SIGTERM) is previous
+
+
+def test_a_pod_stopped_with_sigterm_leaves_no_lock(tmp_path):
+    code = ("import sys, time; from pathlib import Path; from scripts import stage_skg_open as st\n"
+            "with st.manifest_lock(Path(sys.argv[1]), 'stage_skg_open'):\n    time.sleep(60)\n")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(tmp_path)], cwd=Path(st.__file__).parents[1])
+    deadline = time.monotonic() + 30
+    while not (tmp_path / st.LOCK_NAME).exists():
+        assert time.monotonic() < deadline and proc.poll() is None
+        time.sleep(0.05)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=30) == 143
+    assert not (tmp_path / st.LOCK_NAME).exists()
+
+
+def test_a_writer_never_removes_a_lock_that_is_no_longer_its_own(tmp_path):
+    lock = tmp_path / st.LOCK_NAME
+    with st.manifest_lock(tmp_path, "stage_skg_open"):
+        lock.unlink()                                                   # cleared by hand as stale ...
+        lock.write_text('{"owner": "drop_skg_open_raw", "token": "other"}')   # ... and taken by another writer
+    assert lock.read_text() == '{"owner": "drop_skg_open_raw", "token": "other"}'
+
+
+def _height_raster(path, rows=1300, cols=640):
+    """A 1 m int16 Trädhöjd-like raster: random heights, a nodata margin and scattered nodata."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    rng = np.random.default_rng(7)
+    data = rng.integers(0, 350, size=(rows, cols), dtype=np.int16)
+    data[:, :90] = -1
+    data[rng.random(data.shape) < 0.05] = -1
+    data[600:700, :] = -1                                   # a band straddling the first strip boundary
+    with rasterio.open(path, "w", driver="GTiff", width=cols, height=rows, count=1, dtype="int16",
+                       crs="EPSG:3006", transform=from_origin(460000, 6270000, 1, 1), nodata=-1) as d:
+        d.write(data, 1)
+    return path
+
+
+def test_parallel_derivation_writes_the_same_raster_as_serial(tmp_path):
+    """--tradhojd-workers only spreads the strips over processes: pixels, record and file bytes match."""
+    import rasterio
+
+    src = str(_height_raster(tmp_path / "t.tif"))
+    one = st.derive_tradhojd_10m(src, tmp_path / "serial.tif", "p90")
+    three = st.derive_tradhojd_10m(src, tmp_path / "parallel.tif", "p90", workers=3)
+    with rasterio.open(tmp_path / "serial.tif") as a, rasterio.open(tmp_path / "parallel.tif") as b:
+        np.testing.assert_array_equal(a.read(1), b.read(1))
+    assert one == three and one["valid_cells"] > 0
+    assert st.sha256_of(tmp_path / "serial.tif") == st.sha256_of(tmp_path / "parallel.tif")
+
+
+def test_a_deflate_entry_is_extracted_only_when_asked(tmp_path):
+    tif = _height_raster(tmp_path / "Tradhojd01.tif", rows=40, cols=40)
+    zpath = tmp_path / "sksTradhojd01.zip"
+    with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.write(tif, "Tradhojd01.tif")
+    src, tmp = st.gdal_source(zpath, tmp_path / "work")
+    assert src.startswith("/vsizip/") and tmp is None
+    src, tmp = st.gdal_source(zpath, tmp_path / "work", extract=True)
+    assert src == str(tmp) and tmp.read_bytes() == tif.read_bytes()
+
+
+def test_workers_reach_the_conversion_and_the_floor_covers_their_extraction(monkeypatch, tmp_path):
+    calls, _ = _staging(monkeypatch, tmp_path)
+    assert st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01",
+                    "--drop-raw", "--tradhojd-workers", "8"]) == 0
+    assert ("convert", "sksTradhojd01.zip", 8) in calls
+
+    calls, _ = _staging(monkeypatch, tmp_path / "b", free_gib=60.0)
+    big = zipfile.ZipInfo("Tradhojd01.tif")
+    big.compress_type, big.file_size = st.ZIP_DEFLATE, 20 * 2**30       # plain Deflate, extracted for workers
+    monkeypatch.setattr(st, "zip_tif_entry", lambda z: big)
+    code = st.main(["--dest", str(tmp_path / "b/m"), "--products", "tradhojd", "--counties", "01",
+                    "--drop-raw", "--min-free-gib", "50", "--tradhojd-workers", "8"])
+    assert code == 3 and calls == [("download", "sksTradhojd01.zip")]
+
+
+_DEFLATE64_ZIP = Path(__file__).parent / "fixtures" / "tradhojd_deflate64.zip"     # 40x40 int16 GeoTIFF, 7z -mm=Deflate64
+
+
+def _unzip_has_deflate64() -> bool:
+    import subprocess
+
+    try:
+        return "DEFLATE64" in subprocess.run(["unzip", "-v"], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _unzip_has_deflate64(), reason="unzip without Deflate64 support")
+def test_a_deflate64_entry_is_streamed_out_by_unzip(tmp_path):
+    import zlib
+
+    import rasterio
+
+    info = st.zip_tif_entry(_DEFLATE64_ZIP)
+    assert info.compress_type == st.ZIP_DEFLATE64
+    src, tmp = st.gdal_source(_DEFLATE64_ZIP, tmp_path / "work")
+    assert src == str(tmp) and tmp.stat().st_size == info.file_size
+    assert zlib.crc32(tmp.read_bytes()) == info.CRC
+    with rasterio.open(src) as ds:
+        arr = ds.read(1)
+    assert arr[0, 0] == -1 and arr[0, 5] == 5 and arr[39, 39] == (39 * 40 + 39) % 300
+    assert "inflate64" not in sys.modules
+
+
+@pytest.mark.skipif(not _unzip_has_deflate64(), reason="unzip without Deflate64 support")
+def test_a_corrupt_deflate64_entry_fails_loudly(tmp_path):
+    bad = tmp_path / "bad.zip"
+    data = bytearray(_DEFLATE64_ZIP.read_bytes())
+    data[200:220] = b"\xff" * 20                       # inside the compressed stream
+    bad.write_bytes(bytes(data))
+    with pytest.raises(OSError, match="unzip exit"):
+        st.gdal_source(bad, tmp_path / "work")
+    assert not any((tmp_path / "work").iterdir())
+
+
+def _fake_unzip(writes: bytes, *, then: BaseException | None = None):
+    def run(cmd, *, stdout, **_):
+        assert cmd[:2] == ["unzip", "-p"]
+        stdout.write(writes)
+        stdout.flush()
+        if then is not None:
+            raise then
+        return subprocess.CompletedProcess(cmd, 0, stderr="")
+    return run
+
+
+def test_a_deflate64_work_file_with_the_wrong_crc_is_removed(monkeypatch, tmp_path):
+    size = st.zip_tif_entry(_DEFLATE64_ZIP).file_size
+    monkeypatch.setattr(st.subprocess, "run", _fake_unzip(b"\0" * size))      # exit 0, right size, wrong bytes
+    with pytest.raises(OSError, match="CRC-32"):
+        st.gdal_source(_DEFLATE64_ZIP, tmp_path / "work")
+    assert not any((tmp_path / "work").iterdir())
+
+
+def test_an_interrupted_deflate64_extraction_leaves_no_work_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(st.subprocess, "run", _fake_unzip(b"\0" * 100, then=SystemExit(143)))   # SIGTERM
+    with pytest.raises(SystemExit):
+        st.gdal_source(_DEFLATE64_ZIP, tmp_path / "work")
+    assert not any((tmp_path / "work").iterdir())
+
+
+def test_an_extracted_deflate_entry_is_crc_checked_on_disk(monkeypatch, tmp_path):
+    tif = _height_raster(tmp_path / "Tradhojd01.tif", rows=40, cols=40)
+    zpath = tmp_path / "sksTradhojd01.zip"
+    with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.write(tif, "Tradhojd01.tif")
+
+    def copy_wrong_bytes(src, out, length):
+        out.write(b"\0" * len(src.read()))
+
+    monkeypatch.setattr(st.shutil, "copyfileobj", copy_wrong_bytes)
+    with pytest.raises(OSError, match="CRC-32"):
+        st.gdal_source(zpath, tmp_path / "work", extract=True)
+    assert not any((tmp_path / "work").iterdir())
+
+
+# ── tiled counties (Trädhöjd 24: 689 tiles + a mosaic VRT, read 2026-10-21) ──
+
+_TILE = 40          # px per tile side here; 10000 in the real zip
+_W, _N = 460000, 7360000
+
+
+def _tiled_zip(tmp_path: Path, *, extra_listed: str | None = None, epsg: int = 3006) -> tuple[Path, np.ndarray]:
+    """A zip shaped like sksTradhojd24.zip: ``lan/lan.vrt`` plus tiles with
+    no CRS and no nodata tag, 0 at sea. 2x2 tile grid: (0,0) heights,
+    (0,1) all 0 (sea), (1,0) heights with an all-0 10 m cell and a mixed
+    one, (1,1) missing. Returns the zip and the expected 1 m mosaic (-1 in
+    the gap)."""
+    import rasterio
+    from rasterio.crs import CRS
+    from rasterio.transform import from_origin
+
+    rng = np.random.default_rng(24)
+    land = rng.integers(1, 300, size=(_TILE, _TILE), dtype=np.int16)
+    coast = rng.integers(1, 300, size=(_TILE, _TILE), dtype=np.int16)
+    coast[0:10, 0:10] = 0                                   # a treeless 10 m cell
+    coast[0:10, 10:20][rng.random((10, 10)) < 0.7] = 0      # a mostly treeless one
+    tiles = {(0, 0): land, (0, 1): np.zeros((_TILE, _TILE), np.int16), (1, 0): coast}
+    mosaic = np.full((2 * _TILE, 2 * _TILE), -1, np.int16)
+    src = tmp_path / "tiles"
+    src.mkdir()
+    sources = []
+    for (r, c), a in tiles.items():
+        name = f"{r}_{c}.tif"
+        with rasterio.open(src / name, "w", driver="GTiff", width=_TILE, height=_TILE, count=1, dtype="int16",
+                           transform=from_origin(_W + c * _TILE, _N - r * _TILE, 1, 1)) as d:
+            d.write(a, 1)
+        mosaic[r * _TILE:(r + 1) * _TILE, c * _TILE:(c + 1) * _TILE] = a
+        sources.append((name, r, c))
+    if extra_listed:
+        sources.append((extra_listed, 1, 1))
+    simple = "".join(
+        f'<SimpleSource><SourceFilename relativeToVRT="1">{n}</SourceFilename><SourceBand>1</SourceBand>'
+        f'<SrcRect xOff="0" yOff="0" xSize="{_TILE}" ySize="{_TILE}" />'
+        f'<DstRect xOff="{c * _TILE}" yOff="{r * _TILE}" xSize="{_TILE}" ySize="{_TILE}" /></SimpleSource>'
+        for n, r, c in sources)
+    vrt = (f'<VRTDataset rasterXSize="{2 * _TILE}" rasterYSize="{2 * _TILE}">'
+           f'<SRS dataAxisToSRSAxisMapping="1,2">{CRS.from_epsg(epsg).to_wkt()}</SRS>'
+           f'<GeoTransform>{_W}, 1, 0, {_N}, 0, -1</GeoTransform>'
+           f'<VRTRasterBand dataType="Int16" band="1"><ColorInterp>Gray</ColorInterp>{simple}</VRTRasterBand>'
+           '</VRTDataset>')
+    zpath = tmp_path / "sksTradhojd24.zip"
+    with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("lan/lan.vrt", vrt)
+        for name, _, _ in sources[:len(tiles)]:
+            z.write(src / name, f"lan/{name}")
+    return zpath, mosaic
+
+
+def test_a_tiled_county_is_extracted_and_its_gaps_read_as_nodata(tmp_path):
+    import rasterio
+
+    zpath, mosaic = _tiled_zip(tmp_path)
+    assert [i.filename for i in st.zip_tiles(zpath)][0] == "lan/lan.vrt"
+    src, root = st.gdal_source(zpath, tmp_path / "work")
+    assert src == str(tmp_path / "work/sksTradhojd24/lan/lan.vrt") and root.is_dir()
+    with rasterio.open(src) as ds:
+        assert ds.crs.to_epsg() == 3006 and ds.nodata == -1 and ds.res == (1.0, 1.0)
+        assert np.array_equal(ds.read(1), mosaic)                   # the missing tile reads -1, not 0
+
+
+def test_a_tiled_county_keeps_its_zeros_for_the_county_mask(tmp_path):
+    """The all-zero rule is retired (2026-10-22): a tiled county derives like any other, its
+    0 fill included; mask_to_county clears what lies outside the county afterwards."""
+    import rasterio
+
+    zpath, mosaic = _tiled_zip(tmp_path)
+    item = st.Item(zpath.name, "tradhojd", "tradhojd/tradhojd_10m_24.tif", county="24")
+    out = tmp_path / "m/tradhojd/tradhojd_10m_24.tif"
+    rec = st.convert(item, zpath, out, tmp_path / "work", "p90")
+    assert "all_zero_cells_nodata" not in rec and "all 0" not in rec["method"]
+    assert not (tmp_path / "work/sksTradhojd24").exists()
+    with rasterio.open(out) as ds:
+        got = ds.read(1)
+    assert (got[0:4, 4:8] == 0).all()                   # the sea tile: 0 until the county mask
+    assert (got[4:8, 4:8] == -1).all()                  # the missing tile: no data
+    assert got[4, 0] == 0                               # the treeless cell
+    mixed = mosaic[40:50, 10:20].astype(float)
+    assert got[4, 1] == np.rint(np.percentile(mixed, 90))
+    cell = mosaic[0:10, 0:10].astype(float)
+    assert got[0, 0] == np.rint(np.percentile(cell, 90))
+
+    out2 = tmp_path / "m2/tradhojd_10m_24.tif"
+    st.convert(item, zpath, out2, tmp_path / "work", "p90", tradhojd_workers=2)
+    with rasterio.open(out2) as ds:
+        assert np.array_equal(ds.read(1), got)           # the workers derive the same raster
+
+
+def test_a_tiled_vrt_that_does_not_list_the_zips_tiles_is_refused(tmp_path):
+    zpath, _ = _tiled_zip(tmp_path, extra_listed="9_9.tif")
+    with pytest.raises(ValueError, match="lists 4 sources, the zip has 3 tiles"):
+        st.gdal_source(zpath, tmp_path / "work")
+    assert not (tmp_path / "work/sksTradhojd24").exists()
+
+
+def test_a_tiled_vrt_in_another_crs_is_refused(tmp_path):
+    zpath, _ = _tiled_zip(tmp_path, epsg=3021)                     # RT90, the pre-SWEREF grid
+    with pytest.raises(ValueError, match="does not declare EPSG:3006"):
+        st.gdal_source(zpath, tmp_path / "work")
+    assert not (tmp_path / "work/sksTradhojd24").exists()
+
+
+def test_a_corrupt_tile_leaves_no_work_directory(monkeypatch, tmp_path):
+    zpath, _ = _tiled_zip(tmp_path)
+
+    def copy_wrong_bytes(src, out, length):
+        out.write(b"\0" * len(src.read()))
+
+    monkeypatch.setattr(st.shutil, "copyfileobj", copy_wrong_bytes)
+    with pytest.raises(OSError, match="CRC-32"):
+        st.gdal_source(zpath, tmp_path / "work")
+    assert not (tmp_path / "work/sksTradhojd24").exists()
+
+
+def test_the_floor_covers_every_tile_of_a_tiled_county(monkeypatch, tmp_path):
+    calls, _ = _staging(monkeypatch, tmp_path, free_gib=60.0)       # the zip itself fits above 50
+    vrt = zipfile.ZipInfo("lan/lan.vrt")
+    vrt.file_size = 1000
+    tiles = [zipfile.ZipInfo(f"lan/{i}.tif") for i in range(40)]
+    for t in tiles:
+        t.compress_type, t.file_size = st.ZIP_DEFLATE, 2**29           # 40 x 0.5 GiB = 20 GiB to extract
+    monkeypatch.setattr(st, "zip_tiles", lambda z: [vrt, *tiles])
+    code = st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01",
+                    "--drop-raw", "--min-free-gib", "50"])
+    assert code == 3 and calls == [("download", "sksTradhojd01.zip")]
+
+
+# ── truncated upstream tiles (county 24's 720_76, run r2 2026-10-21) ──
+
+_BIG = 1280         # px: two full 640-row strips. GDAL 3.10 reads a 2-source VRT strip this large in
+                    # threads and drops the read error; a smaller one (the 360-row tail of a 1000 px
+                    # tile) is read serially and raises anyway, so it cannot test SERIAL_VRT
+
+
+def _truncated_zip(tmp_path: Path) -> tuple[Path, int, list[list[float]], int]:
+    """sksTradhojd24.zip with tiles a and b (all 7, 1280 px, 128 px blocks)
+    and their VRT; b's file is cut at 60 %, as 720_76 is upstream. Returns
+    the zip, b's CRC-32, rectangles around b's unreadable blocks (the partial
+    first row, then the rows below) and how many blocks are unreadable."""
+    import rasterio
+    from rasterio.crs import CRS
+    from rasterio.errors import RasterioIOError
+    from rasterio.transform import from_origin
+
+    src = tmp_path / "tiles"
+    src.mkdir()
+    for i, name in enumerate(("a.tif", "b.tif")):
+        with rasterio.open(src / name, "w", driver="GTiff", width=_BIG, height=_BIG, count=1, dtype="int16",
+                           tiled=True, blockxsize=128, blockysize=128,
+                           transform=from_origin(_W + i * _BIG, _N, 1, 1)) as d:
+            d.write(np.full((_BIG, _BIG), 7, np.int16), 1)
+    raw = (src / "b.tif").read_bytes()
+    (src / "b.tif").write_bytes(raw[: len(raw) * 6 // 10])
+    with rasterio.open(src / "b.tif") as ds:
+        bad = []
+        for _, w in ds.block_windows(1):
+            try:
+                ds.read(1, window=w)
+            except RasterioIOError:
+                bad.append(ds.window_bounds(w))
+    top = max(b[3] for b in bad)
+    first = [b for b in bad if b[3] == top]
+    rects = [[min(b[0] for b in first), min(b[1] for b in first), max(b[2] for b in first), top],
+             [_W + _BIG, _N - _BIG, _W + 2 * _BIG, min(b[1] for b in first)]]
+    simple = "".join(
+        f'<SimpleSource><SourceFilename relativeToVRT="1">{n}</SourceFilename><SourceBand>1</SourceBand>'
+        f'<SrcRect xOff="0" yOff="0" xSize="{_BIG}" ySize="{_BIG}" />'
+        f'<DstRect xOff="{i * _BIG}" yOff="0" xSize="{_BIG}" ySize="{_BIG}" /></SimpleSource>'
+        for i, n in enumerate(("a.tif", "b.tif")))
+    vrt = (f'<VRTDataset rasterXSize="{2 * _BIG}" rasterYSize="{_BIG}">'
+           f'<SRS dataAxisToSRSAxisMapping="1,2">{CRS.from_epsg(3006).to_wkt()}</SRS>'
+           f'<GeoTransform>{_W}, 1, 0, {_N}, 0, -1</GeoTransform>'
+           f'<VRTRasterBand dataType="Int16" band="1">{simple}</VRTRasterBand></VRTDataset>')
+    zpath = tmp_path / "sksTradhojd24.zip"
+    with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("lan/lan.vrt", vrt)
+        for name in ("a.tif", "b.tif"):
+            z.write(src / name, f"lan/{name}")
+        crc = z.getinfo("lan/b.tif").CRC
+    return zpath, crc, rects, len(bad)
+
+
+def _known(monkeypatch, crc, rects, count):
+    entry = {"crc32": crc, "unreadable_blocks": count, "gaps": rects}
+    monkeypatch.setattr(st, "KNOWN_TRUNCATED_TILES", {"sksTradhojd24.zip": {"sha256": "z", "tiles": {"b.tif": entry}}})
+    return entry
+
+
+_ITEM24 = st.Item("sksTradhojd24.zip", "tradhojd", "tradhojd/tradhojd_10m_24.tif", county="24")
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_an_unreadable_tile_stops_the_derivation(monkeypatch, tmp_path, workers):
+    from rasterio.errors import RasterioIOError
+
+    monkeypatch.setattr(st, "KNOWN_TRUNCATED_TILES", {})
+    zpath, _, _, n_bad = _truncated_zip(tmp_path)
+    assert n_bad
+    with pytest.raises(RasterioIOError):
+        st.convert(_ITEM24, zpath, tmp_path / "out.tif", tmp_path / "work", "p90", tradhojd_workers=workers)
+    assert not (tmp_path / "work/sksTradhojd24").exists()
+
+
+def test_a_known_truncated_tile_is_staged_with_its_gaps_recorded(monkeypatch, tmp_path):
+    import rasterio
+
+    zpath, crc, rects, n_bad = _truncated_zip(tmp_path)
+    entry = _known(monkeypatch, crc, rects, n_bad)
+    out = tmp_path / "m/tradhojd_10m_24.tif"
+    rec = st.convert(_ITEM24, zpath, out, tmp_path / "work", "p90", tradhojd_workers=2)
+    assert rec["gaps"] == entry["gaps"] and "gaps recorded" in rec["method"]
+    with rasterio.open(out) as ds:
+        got, west, north = ds.read(1), ds.transform.c, ds.transform.f
+    for gw, gs, ge, gn in rects:
+        inside = got[math.ceil((north - gn) / 10):math.floor((north - gs) / 10),
+                     math.ceil((gw - west) / 10):math.floor((ge - west) / 10)]
+        assert inside.size and (inside == -1).all()
+    assert (got[:, :_BIG // 10] == 7).all()                        # the intact tile
+    st.convert(_ITEM24, zpath, out, tmp_path / "work", "average")
+    with rasterio.open(out) as ds:
+        assert np.isin(ds.read(1), [7, -1]).all()                  # cells cut by the gap average only real heights
+
+
+def test_a_known_tile_that_differs_from_what_was_examined_is_refused(monkeypatch, tmp_path):
+    zpath, crc, rects, n_bad = _truncated_zip(tmp_path)
+    _known(monkeypatch, crc, rects, n_bad + 1)
+    with pytest.raises(ValueError, match="unreadable blocks"):
+        st.gdal_source(zpath, tmp_path / "work")
+    assert not (tmp_path / "work/sksTradhojd24").exists()
+
+
+def test_a_known_entry_applies_only_to_its_crc(monkeypatch, tmp_path):
+    from rasterio.errors import RasterioIOError
+
+    zpath, crc, rects, n_bad = _truncated_zip(tmp_path)
+    _known(monkeypatch, crc ^ 1, rects, n_bad)                      # a republished tile is checked afresh
+    with pytest.raises(RasterioIOError):
+        st.convert(_ITEM24, zpath, tmp_path / "out.tif", tmp_path / "work", "p90")
+
+
+def _staged_county(tmp_path: Path, zip_sha: str, value_in_gap: int) -> tuple[Path, list[float]]:
+    """A dest where county 01 is already derived (raw zip dropped), 100 x 100 cells of 50 with -1 in the gap."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    dest = tmp_path / "m"
+    gap = [_W + 200.0, _N - 500.0, _W + 600.0, _N - 300.0]
+    a = np.full((100, 100), 50, np.int16)
+    a[30:50, 20:60] = value_in_gap
+    (dest / "tradhojd").mkdir(parents=True)
+    with rasterio.open(dest / "tradhojd/tradhojd_10m_01.tif", "w", driver="GTiff", width=100, height=100, count=1,
+                       dtype="int16", crs="EPSG:3006", transform=from_origin(_W, _N, 10, 10), nodata=-1) as d:
+        d.write(a, 1)
+    (dest / "MANIFEST.json").write_text(json.dumps({
+        "schema": st.MANIFEST_SCHEMA, "source_url": st.SOURCE_URL, "vrt": {}, "history": [],
+        "files": {"sksTradhojd01.zip": {"sha256": zip_sha, "raw_deleted_at": "2026-10-21T16:13:50Z"}},
+        "derived": {"tradhojd/tradhojd_10m_01.tif": {"sha256": "d" * 64, "bytes": 1, "nodata": -1}}}))
+    return dest, gap
+
+
+def _known01(monkeypatch, gap):
+    monkeypatch.setattr(st, "KNOWN_TRUNCATED_TILES", {"sksTradhojd01.zip": {
+        "sha256": "s" * 64, "tiles": {"x.tif": {"crc32": 0, "unreadable_blocks": 1, "gaps": [gap]}}}})
+
+
+def test_known_gaps_are_recorded_on_a_county_staged_before_them(monkeypatch, tmp_path):
+    calls, snaps = _staging(monkeypatch, tmp_path)
+    dest, gap = _staged_county(tmp_path, "s" * 64, -1)
+    _known01(monkeypatch, gap)
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    assert calls == []                                              # nothing downloaded or derived again
+    rec = snaps[-1]["derived"]["tradhojd/tradhojd_10m_01.tif"]
+    assert rec["gaps"] == [gap] and rec["gaps_recorded_at"]
+
+
+def test_known_gaps_are_not_recorded_over_valid_cells_or_another_zip(monkeypatch, tmp_path):
+    _staging(monkeypatch, tmp_path)
+    dest, gap = _staged_county(tmp_path, "s" * 64, 50)              # the raster has heights inside the gap
+    _known01(monkeypatch, gap)
+    with pytest.raises(ValueError, match="valid cells inside the known gap"):
+        st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"])
+
+    _, snaps = _staging(monkeypatch, tmp_path / "b")
+    dest, gap = _staged_county(tmp_path / "b", "o" * 64, -1)        # staged from another zip
+    _known01(monkeypatch, gap)
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    assert "gaps" not in snaps[-1]["derived"]["tradhojd/tradhojd_10m_01.tif"]
+
+
+# ── county mask (county 23's zeros covered counties 20-22 in the mosaic, 2026-10-22) ──
+
+_ITEM01 = st.Item("sksTradhojd01.zip", "tradhojd", "tradhojd/tradhojd_10m_01.tif", county="01")
+
+
+def _masked_dest(tmp_path: Path, *, masks: bool = True) -> tuple[Path, dict, np.ndarray]:
+    """County 01 derived (100 x 100 cells at 10 m) the way county 23 is published: 0 outside the
+    county and a neighbour's heights in its south-east corner. Grunddata (20 m, nodata -1) marks
+    the west half, markfukt (2 m, fill 255) a 20 x 20-cell block in the east half."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    dest = tmp_path / "m"
+    a = np.zeros((100, 100), np.int16)
+    a[:, :50] = 120                                    # the county's heights
+    a[10:30, 60:80] = 150                              # inside too, by markfukt only
+    a[80:, 80:] = 90                                   # a neighbour's heights, outside the county
+    prof = dict(driver="GTiff", count=1, crs="EPSG:3006", tiled=True, blockxsize=16, blockysize=16)
+    (dest / "tradhojd").mkdir(parents=True)
+    with rasterio.open(dest / _ITEM01.derived, "w", width=100, height=100, dtype="int16", nodata=-1,
+                       transform=from_origin(_W, _N, 10, 10), **prof) as d:
+        d.write(a, 1)
+    derived = {_ITEM01.derived: {"sha256": st.sha256_of(dest / _ITEM01.derived), "bytes": 1, "nodata": -1,
+                                 "width": 100, "height": 100, "bounds": [_W, _N - 1000.0, _W + 1000.0, float(_N)],
+                                 "valid_cells": 10000, "value_min_dm": 0, "value_max_dm": 150}}
+    if masks:
+        g = np.full((50, 50), -1, np.float32)
+        g[:, :25] = 100.0
+        (dest / "grunddata/omdrev2").mkdir(parents=True)
+        with rasterio.open(dest / "grunddata/omdrev2/volym_01.tif", "w", width=50, height=50, dtype="float32",
+                           nodata=-1, transform=from_origin(_W, _N, 20, 20), **prof) as d:
+            d.write(g, 1)
+        mf = np.full((500, 500), 255, np.uint16)
+        mf[50:150, 300:400] = 3                        # 10 m cells: rows 10-29, cols 60-79
+        (dest / "markfukt").mkdir()
+        with rasterio.open(dest / "markfukt/markfukt_01.tif", "w", width=500, height=500, dtype="uint16",
+                           nodata=st.MARKFUKT_NODATA, transform=from_origin(_W, _N, 2, 2), **prof) as d:
+            d.write(mf, 1)
+        derived["grunddata/omdrev2/volym_01.tif"] = {"sha256": "g" * 64, "bytes": 1}
+        derived["markfukt/markfukt_01.tif"] = {"sha256": "m" * 64, "bytes": 1}
+    manifest = {"schema": st.MANIFEST_SCHEMA, "source_url": st.SOURCE_URL, "vrt": {}, "history": [],
+                "files": {_ITEM01.name: {"sha256": "z" * 64, "raw_deleted_at": "2026-10-21T16:13:50Z"}},
+                "derived": derived}
+    (dest / "MANIFEST.json").write_text(json.dumps(manifest))
+    return dest, manifest, a
+
+
+def test_a_county_raster_is_masked_to_its_county(tmp_path):
+    import rasterio
+
+    dest, manifest, before = _masked_dest(tmp_path)
+    assert st.mask_to_county(_ITEM01, manifest, dest) is True
+    with rasterio.open(dest / _ITEM01.derived) as ds:
+        after = ds.read(1)
+        assert ds.nodata == -1 and ds.profile["tiled"] and ds.res == (10.0, 10.0)
+    inside = np.zeros((100, 100), bool)
+    inside[:, :50] = True
+    inside[10:30, 60:80] = True
+    np.testing.assert_array_equal(after[inside], before[inside])
+    assert (after[~inside] == -1).all()
+    rec = manifest["derived"][_ITEM01.derived]
+    assert rec["county_mask"]["sources"] == {"grunddata/omdrev2/volym_01.tif": "g" * 64,
+                                             "markfukt/markfukt_01.tif": "m" * 64}
+    assert "pending_rewrite" not in rec
+    assert rec["county_mask"]["cleared_cells"] == 4600 and rec["county_mask"]["cleared_heights"] == 400
+    assert rec["sha256"] == st.sha256_of(dest / _ITEM01.derived) and rec["valid_cells"] == 5400
+    assert (rec["value_min_dm"], rec["value_max_dm"]) == (120, 150) and rec["verified"]
+    assert st.mask_to_county(_ITEM01, manifest, dest) is False              # once per raster
+    assert not list((dest / "tradhojd").glob("*.masked.tif"))
+
+
+def test_masking_refuses_a_county_without_a_mask(tmp_path):
+    dest, manifest, _ = _masked_dest(tmp_path, masks=False)
+    sha = st.sha256_of(dest / _ITEM01.derived)
+    with pytest.raises(ValueError, match="county mask incomplete for county 01"):
+        st.mask_to_county(_ITEM01, manifest, dest)
+    assert st.sha256_of(dest / _ITEM01.derived) == sha and "county_mask" not in manifest["derived"][_ITEM01.derived]
+
+
+def test_masking_needs_both_mask_sources(tmp_path):
+    """Codex's #96 reproduction: with markfukt's record missing, masking against grunddata alone
+    cleared the 400 heights only markfukt places inside, and county_mask then kept the loss."""
+    import rasterio
+
+    dest, manifest, before = _masked_dest(tmp_path)
+    sha = st.sha256_of(dest / _ITEM01.derived)
+    mf = manifest["derived"].pop("markfukt/markfukt_01.tif")
+    with pytest.raises(ValueError, match="markfukt/markfukt_01.tif"):
+        st.mask_to_county(_ITEM01, manifest, dest)
+    assert st.sha256_of(dest / _ITEM01.derived) == sha and "county_mask" not in manifest["derived"][_ITEM01.derived]
+    manifest["derived"]["markfukt/markfukt_01.tif"] = mf
+    assert st.mask_to_county(_ITEM01, manifest, dest)
+    with rasterio.open(dest / _ITEM01.derived) as ds:
+        assert (ds.read(1)[10:30, 60:80] == before[10:30, 60:80]).all()      # markfukt-only heights kept
+
+
+def test_a_failed_mask_leaves_the_raster_and_its_record(monkeypatch, tmp_path):
+    dest, manifest, _ = _masked_dest(tmp_path)
+    sha = st.sha256_of(dest / _ITEM01.derived)
+
+    def fail(out, expected):
+        raise ValueError("verification failed")
+
+    monkeypatch.setattr(st, "verify_tradhojd_10m", fail)
+    with pytest.raises(ValueError, match="verification failed"):
+        st.mask_to_county(_ITEM01, manifest, dest)
+    assert st.sha256_of(dest / _ITEM01.derived) == sha and "county_mask" not in manifest["derived"][_ITEM01.derived]
+    assert not list((dest / "tradhojd").glob("*.masked.tif"))
+
+
+def test_main_masks_a_county_staged_before_the_mask(monkeypatch, tmp_path):
+    real = st.mask_to_county
+    calls, snaps = _staging(monkeypatch, tmp_path)
+    monkeypatch.setattr(st, "mask_to_county", real)
+    dest, _, _ = _masked_dest(tmp_path)
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    assert calls == []                                              # nothing downloaded or derived again
+    assert snaps[-1]["derived"][_ITEM01.derived]["county_mask"]["cleared_cells"] == 4600
+
+
+def test_a_fresh_derivation_is_masked_before_the_raw_zip_goes(monkeypatch, tmp_path):
+    calls, snaps = _staging(monkeypatch, tmp_path)
+
+    def mask(item, manifest, dest):
+        calls.append(("mask", item.name))
+        manifest["derived"][item.derived]["county_mask"] = {"cleared_cells": 0}
+        st.save_manifest(dest, manifest)                            # as the real mask does
+        return True
+
+    monkeypatch.setattr(st, "mask_to_county", mask)
+    assert st.main(["--dest", str(tmp_path / "m"), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    assert calls == [("download", "sksTradhojd01.zip"), ("convert", "sksTradhojd01.zip"), ("mask", "sksTradhojd01.zip")]
+    deleted = next(i for i, m in enumerate(snaps) if m["files"].get("sksTradhojd01.zip", {}).get("raw_deleted_at"))
+    assert "county_mask" in snaps[deleted - 1]["derived"][_ITEM01.derived]
+
+
+
+def _crash_on_save(monkeypatch, nth: int):
+    """save_manifest that raises on its nth call, as if the pod were killed there."""
+    real, n = st.save_manifest, [0]
+
+    def save(dest, manifest):
+        n[0] += 1
+        if n[0] == nth:
+            raise KeyboardInterrupt("killed")
+        real(dest, manifest)
+
+    monkeypatch.setattr(st, "save_manifest", save)
+    return real
+
+
+def _retain_raw(dest: Path) -> Path:
+    """A fresh derivation with --drop-raw that has not dropped its raw zip yet."""
+    m = json.loads((dest / "MANIFEST.json").read_text())
+    del m["files"][_ITEM01.name]["raw_deleted_at"]
+    (dest / "MANIFEST.json").write_text(json.dumps(m))
+    raw = dest / "raw" / _ITEM01.name
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes(b"zip")
+    return raw
+
+
+def test_a_mask_interrupted_after_the_replace_is_finished_on_restart(monkeypatch, tmp_path):
+    """The raster is replaced, the manifest's last save never happens: the restart finishes the
+    record before the raw-deletion check, which then passes and drops the raw zip."""
+    real_mask = st.mask_to_county
+    dest, manifest, _ = _masked_dest(tmp_path)
+    (dest / "MANIFEST.json").write_text(json.dumps(manifest))
+    raw = _retain_raw(dest)
+    manifest = json.loads((dest / "MANIFEST.json").read_text())
+    real_save = _crash_on_save(monkeypatch, 2)                      # 1: pending saved, 2: killed
+    with pytest.raises(KeyboardInterrupt):
+        st.mask_to_county(_ITEM01, manifest, dest)
+    on_disk = json.loads((dest / "MANIFEST.json").read_text())["derived"][_ITEM01.derived]
+    assert "pending_rewrite" in on_disk and st.sha256_of(dest / _ITEM01.derived) == on_disk["pending_rewrite"]["to_sha256"]
+    monkeypatch.setattr(st, "save_manifest", real_save)
+
+    calls, snaps = _staging(monkeypatch, tmp_path / "s")
+    monkeypatch.setattr(st, "mask_to_county", real_mask)
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    rec = snaps[-1]["derived"][_ITEM01.derived]
+    assert "pending_rewrite" not in rec and rec["county_mask"]["cleared_cells"] == 4600
+    assert rec["sha256"] == st.sha256_of(dest / _ITEM01.derived) and not raw.exists() and calls == []
+
+
+def test_a_mask_interrupted_before_the_replace_is_finished_on_restart(monkeypatch, tmp_path):
+    dest, manifest, _ = _masked_dest(tmp_path)
+    sha = st.sha256_of(dest / _ITEM01.derived)
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if str(src).endswith(".masked.tif"):
+            raise KeyboardInterrupt("killed")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(st.os, "replace", replace)
+    with pytest.raises(KeyboardInterrupt):
+        st.mask_to_county(_ITEM01, manifest, dest)
+    monkeypatch.setattr(st.os, "replace", real_replace)
+    manifest = json.loads((dest / "MANIFEST.json").read_text())
+    assert st.sha256_of(dest / _ITEM01.derived) == sha                    # not replaced yet
+    assert st.finish_pending_rewrite(_ITEM01, manifest, dest) is True
+    rec = manifest["derived"][_ITEM01.derived]
+    assert "pending_rewrite" not in rec and rec["county_mask"]["cleared_cells"] == 4600
+    assert rec["sha256"] == st.sha256_of(dest / _ITEM01.derived) != sha
+    assert not list((dest / "tradhojd").glob("*.masked.tif"))
+
+
+def test_an_interrupted_mask_on_a_foreign_raster_is_refused(monkeypatch, tmp_path):
+    dest, manifest, _ = _masked_dest(tmp_path)
+    _crash_on_save(monkeypatch, 2)
+    with pytest.raises(KeyboardInterrupt):
+        st.mask_to_county(_ITEM01, manifest, dest)
+    manifest = json.loads((dest / "MANIFEST.json").read_text())
+    (dest / _ITEM01.derived).write_bytes(b"something else")
+    with pytest.raises(RuntimeError, match="neither side of the interrupted county_mask"):
+        st.finish_pending_rewrite(_ITEM01, manifest, dest)
+
+
+
+
+def test_a_county_derived_under_the_retired_rule_is_derived_again(monkeypatch, tmp_path):
+    """County 24 (run r2) was derived with all_zero_cells_nodata: its -1 mixes treeless cells
+    with source nodata, so it is not done; the run downloads its zip again and re-derives it."""
+    calls, snaps = _staging(monkeypatch, tmp_path)
+    dest, manifest, _ = _masked_dest(tmp_path)
+    manifest["derived"][_ITEM01.derived]["all_zero_cells_nodata"] = True
+    manifest["files"][_ITEM01.name]["sha256"] = hashlib.sha256(b"zip").hexdigest()   # the same zip again
+    (dest / "MANIFEST.json").write_text(json.dumps(manifest))
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    assert calls == [("download", "sksTradhojd01.zip"), ("convert", "sksTradhojd01.zip")]
+    assert "all_zero_cells_nodata" not in snaps[-1]["derived"][_ITEM01.derived]
+
+
+def test_a_rederivation_interrupted_after_its_download_reuses_the_zip(monkeypatch, tmp_path):
+    """Codex's #101 finding: the zip was downloaded again for a rule-derived county and the run
+    stopped before deriving. On restart the raw-deletion recovery must not take the stale raster
+    for the zip's derivation and delete the zip; the zip is reused, no second ~40 GB download."""
+    calls, snaps = _staging(monkeypatch, tmp_path)
+    dest, manifest, _ = _masked_dest(tmp_path)
+    der = manifest["derived"][_ITEM01.derived]
+    der["all_zero_cells_nodata"] = True
+    rec = manifest["files"][_ITEM01.name]
+    rec["sha256"] = hashlib.sha256(b"zip").hexdigest()
+    del rec["raw_deleted_at"]                                 # downloaded again, not yet derived
+    (dest / "raw").mkdir()
+    (dest / "raw" / _ITEM01.name).write_bytes(b"zip")
+    (dest / "MANIFEST.json").write_text(json.dumps(manifest))
+    assert st.main(["--dest", str(dest), "--products", "tradhojd", "--counties", "01", "--drop-raw"]) == 0
+    assert calls == [("convert", "sksTradhojd01.zip")]          # no download: the zip was reused
+    last = snaps[-1]
+    assert "all_zero_cells_nodata" not in last["derived"][_ITEM01.derived]
+    assert last["files"][_ITEM01.name]["raw_deleted_at"] and not (dest / "raw" / _ITEM01.name).exists()

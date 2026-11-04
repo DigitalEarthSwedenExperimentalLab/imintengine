@@ -1,0 +1,336 @@
+"""Tests for the WEkEO HR-VPP fallback (imint.data.wekeo_vpp).
+
+Endpoint-independent: no WEkEO network access. The HDA download path
+(prefetch_vpp_cogs) is exercised by the k8s job verify-wekeo-vpp; here
+we test the filename parser, the overlap test, and the local COG reader
+(fetch_vpp_tiles_local) against synthetic GeoTIFFs.
+"""
+import json
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from imint.data import wekeo_vpp
+
+
+# ── filename parser ──────────────────────────────────────────────────────
+
+class TestParseVppFilename:
+
+    def test_parses_valid_name(self):
+        meta = wekeo_vpp._parse_vpp_filename(
+            "VPP_2021_S2_33VWJ-010m_V101_s1_SOSD.tif"
+        )
+        assert meta == {
+            "metric": "SOSD", "tileId": "33VWJ", "year": 2021, "season": 1,
+        }
+
+    def test_parses_season_2_and_length(self):
+        meta = wekeo_vpp._parse_vpp_filename(
+            "VPP_2019_S2_32TPN-010m_V102_s2_LENGTH.tif"
+        )
+        assert meta["metric"] == "LENGTH"
+        assert meta["season"] == 2
+        assert meta["year"] == 2019
+
+    def test_parses_id_form_without_extension(self):
+        # hda result `id` carries the stem without the .tif extension.
+        meta = wekeo_vpp._parse_vpp_filename(
+            "VPP_2021_S2_T33VWJ-010m_V101_s1_SOSD"
+        )
+        assert meta is not None
+        assert meta["metric"] == "SOSD"
+        assert meta["year"] == 2021
+
+    def test_rejects_garbage(self):
+        assert wekeo_vpp._parse_vpp_filename("not_a_vpp_file.tif") is None
+        assert wekeo_vpp._parse_vpp_filename("VPP_2021_S2_33VWJ.txt") is None
+
+
+class _StubResult:
+    """Stand-in for an iterated hda SearchResults item."""
+
+    def __init__(self, results):
+        self.results = results
+
+
+class TestResultFilename:
+
+    def test_extracts_basename_from_location(self):
+        r = _StubResult([{
+            "id": "VPP_2021_S2_T33VWJ-010m_V101_s1_SOSD",
+            "properties": {
+                "location": "s3://hr-vpp-products-vpp-v01-2021/CLMS/"
+                            "Pan-European/Biophysical/VPP/v01/2021/s1/"
+                            "VPP_2021_S2_T33VWJ-010m_V101_s1_SOSD.tif",
+            },
+        }])
+        assert wekeo_vpp._result_filename(r) == (
+            "VPP_2021_S2_T33VWJ-010m_V101_s1_SOSD.tif"
+        )
+
+    def test_falls_back_to_id_when_no_location(self):
+        r = _StubResult([{
+            "id": "VPP_2021_S2_T33VWJ-010m_V101_s1_SOSD",
+            "properties": {},
+        }])
+        assert wekeo_vpp._result_filename(r) == (
+            "VPP_2021_S2_T33VWJ-010m_V101_s1_SOSD"
+        )
+
+
+# ── bounds overlap ───────────────────────────────────────────────────────
+
+class TestBoundsOverlap:
+
+    def test_overlapping(self):
+        assert wekeo_vpp._bounds_overlap([0, 0, 10, 10], (5, 5, 15, 15))
+
+    def test_disjoint(self):
+        assert not wekeo_vpp._bounds_overlap([0, 0, 10, 10], (20, 20, 30, 30))
+
+    def test_edge_touch_is_not_overlap(self):
+        assert not wekeo_vpp._bounds_overlap([0, 0, 10, 10], (10, 0, 20, 10))
+
+
+# ── local COG reader ─────────────────────────────────────────────────────
+
+def _write_cog(path: Path, value: float, *, utm_bounds, crs="EPSG:32633"):
+    """Write a constant-valued single-band GeoTIFF (synthetic VPP COG)."""
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    h = w = 200
+    w0, s0, e0, n0 = utm_bounds
+    with rasterio.open(
+        path, "w", driver="GTiff", height=h, width=w, count=1,
+        dtype="float32", crs=crs, transform=from_bounds(w0, s0, e0, n0, w, h),
+        nodata=0,
+    ) as dst:
+        dst.write(np.full((h, w), value, dtype=np.float32), 1)
+
+
+class TestFetchVppTilesLocal:
+
+    # Synthetic VPP product values — chosen so the scaling is observable.
+    _VALUES = {
+        "SOSD": 120.0, "EOSD": 280.0, "LENGTH": 160.0,
+        "MAXV": 12000.0, "MINV": 3000.0,
+    }
+
+    def _build_cache(self, tmp: Path):
+        """Populate tmp with 5 synthetic COGs + index.json; return bbox_3006."""
+        import rasterio
+        from rasterio.warp import transform_bounds
+
+        # UTM 33N extent in Sweden (~lon 15, lat 59.5).
+        utm_bounds = (500_000.0, 6_600_000.0, 520_000.0, 6_620_000.0)
+        index = {}
+        for metric, value in self._VALUES.items():
+            fname = f"VPP_2021_S2_33VWJ-010m_V101_s1_{metric}.tif"
+            _write_cog(tmp / fname, value, utm_bounds=utm_bounds)
+            with rasterio.open(tmp / fname) as src:
+                b4326 = list(transform_bounds(src.crs, "EPSG:4326", *src.bounds))
+            index[fname] = {
+                "metric": metric, "tileId": "33VWJ", "year": 2021,
+                "season": 1, "bounds_4326": b4326,
+            }
+        (tmp / "index.json").write_text(json.dumps(index))
+
+        # A 3006 bbox well inside the COG footprint.
+        bbox_3006 = transform_bounds(
+            "EPSG:32633", "EPSG:3006",
+            505_000, 6_605_000, 515_000, 6_615_000,
+        )
+        return bbox_3006
+
+    def test_contract_and_scaling(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            w, s, e, n = self._build_cache(tmp)
+            out = wekeo_vpp.fetch_vpp_tiles_local(
+                w, s, e, n, size_px=64, vpp_cog_dir=tmp, year=2021,
+            )
+            assert set(out) == {"sosd", "eosd", "length", "maxv", "minv"}
+            for band, arr in out.items():
+                assert arr.shape == (64, 64), band
+                assert arr.dtype == np.float32, band
+
+            # DOY/day bands unscaled; PPI bands scaled by 0.0001.
+            assert np.allclose(out["sosd"], 120.0)
+            assert np.allclose(out["length"], 160.0)
+            assert np.allclose(out["maxv"], 1.2)     # 12000 * 0.0001
+            assert np.allclose(out["minv"], 0.3)     # 3000 * 0.0001
+
+    def test_missing_index_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(FileNotFoundError):
+                wekeo_vpp.fetch_vpp_tiles_local(
+                    0, 0, 1, 1, size_px=32, vpp_cog_dir=d, year=2021,
+                )
+
+    def test_disjoint_bbox_returns_zeros(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._build_cache(tmp)
+            # A 3006 bbox far from the COG footprint → no overlap → zeros.
+            out = wekeo_vpp.fetch_vpp_tiles_local(
+                0.0, 0.0, 1000.0, 1000.0,
+                size_px=32, vpp_cog_dir=tmp, year=2021,
+            )
+            for arr in out.values():
+                assert np.all(arr == 0.0)
+
+
+# ── CDSE fallback wiring ─────────────────────────────────────────────────
+
+class TestFallbackWiring:
+
+    def test_read_wekeo_returns_none_without_cache(self, monkeypatch):
+        """_read_wekeo_vpp returns None (not raise) when no cache is present.
+
+        That None is the cue for the auto router to fall through to CDSE,
+        and for VPP_SOURCE=wekeo to raise a clear "no cache" error.
+        """
+        from imint.data import cdse_vpp
+
+        with tempfile.TemporaryDirectory() as d:
+            monkeypatch.setenv("VPP_WEKEO_DIR", d)  # empty — no index.json
+            assert cdse_vpp._read_wekeo_vpp(
+                0, 0, 1, 1, (32, 32), 2021) is None
+
+    def test_vpp_source_wekeo_skips_cdse(self, monkeypatch):
+        """VPP_SOURCE=wekeo routes fetch_vpp_tiles straight to WEkEO.
+
+        With no cache present the forced-WEkEO path raises a clear
+        "no WEkEO cache" error — reaching it proves CDSE was skipped
+        entirely (no CDSE credentials are set, so a CDSE attempt would
+        fail with a different message).
+        """
+        from imint.data import cdse_vpp
+
+        with tempfile.TemporaryDirectory() as d:
+            monkeypatch.setenv("VPP_SOURCE", "wekeo")
+            monkeypatch.setenv("VPP_WEKEO_DIR", d)  # empty — no index.json
+            with pytest.raises(RuntimeError, match="no covering WEkEO cache"):
+                cdse_vpp.fetch_vpp_tiles(0.0, 0.0, 1.0, 1.0, size_px=32)
+
+
+# ── download completeness ────────────────────────────────────────────────
+
+_FNAME = "VPP_2019_S2_T33VWG-010m_V101_s1_SOSD.tif"
+
+
+class _Result:
+    """An hda search result whose download writes ``payload`` into the directory."""
+
+    def __init__(self, payload: bytes):
+        self.results = [{"properties": {"location": f"s3://bucket/{_FNAME}"}}]
+        self.payload = payload
+        self.downloads: list[str] = []
+
+    def download(self, directory: str) -> None:
+        self.downloads.append(directory)
+        Path(directory, _FNAME).write_bytes(self.payload)
+
+
+class _Client:
+    def __init__(self, result: _Result):
+        self.result = result
+
+    def search(self, query: dict) -> list:
+        return [self.result] if query["productType"] == "SOSD" else []
+
+
+class TestDownloadCompleteness:
+    """A cut-short COG keeps a readable header, so existence is no proof.
+
+    2026-11-02: T33VWG/2019 SOSD held 17 of 117 MB for three days and
+    stopped the LCLU campaign the first time a window read its tail.
+    """
+
+    @pytest.fixture
+    def cog(self, tmp_path) -> bytes:
+        """A real tiled COG with overviews, as HR-VPP ships them.
+
+        Small blocks give a block table of several kilobytes, so a cut can
+        land inside the metadata as well as inside the pixel data.
+        """
+        import rasterio
+        from rasterio.transform import from_origin
+
+        data = np.random.default_rng(0).integers(1, 365, (2048, 2048)).astype(np.int16)
+        path = tmp_path / "source.tif"
+        with rasterio.open(path, "w", driver="COG", height=2048, width=2048, count=1,
+                           dtype="int16", crs="EPSG:32633", blocksize=128,
+                           compress="deflate",
+                           transform=from_origin(500_000, 6_700_000, 10, 10)) as dst:
+            dst.write(data, 1)
+        return path.read_bytes()
+
+    @staticmethod
+    def payload_start(path: Path) -> int:
+        """Offset of the first pixel block: everything before it is metadata."""
+        import rasterio
+
+        with rasterio.open(path) as src:
+            levels = [{}] + [{"overview_level": i} for i in range(len(src.overviews(1)))]
+        offsets = []
+        for options in levels:
+            with rasterio.open(path, **options) as src:
+                offsets.append(int(src.get_tag_item("BLOCK_OFFSET_0_0", "TIFF", bidx=1)))
+        return min(offsets)
+
+    @staticmethod
+    def prefetch(dest: Path, result: _Result, index: dict | None = None) -> tuple[dict, list]:
+        index, missing = ({} if index is None else index), []
+        wekeo_vpp._prefetch_one_tile(_Client(result), "T33VWG", ["SOSD"], {2019}, 1,
+                                     dest, index, missing)
+        return index, missing
+
+    def test_block_table_finds_truncation(self, tmp_path, cog):
+        whole = tmp_path / "whole.tif"
+        whole.write_bytes(cog)
+        assert wekeo_vpp._cog_complete(whole)
+        start = self.payload_start(whole)
+        # Inside the metadata (Codex review of #123: 1,232 of 7.5 MB passed),
+        # at its end, and inside the pixel data; the shortest stops GDAL opening.
+        cuts = (64, 600, 1232, start // 2, start - 1, start + 1, len(cog) * 2 // 3)
+        assert 1232 < start
+        for cut in cuts:
+            path = tmp_path / f"cut_{cut}.tif"
+            path.write_bytes(cog[:cut])
+            assert not wekeo_vpp._cog_complete(path), cut
+
+    def test_index_entry_dies_with_a_rejected_cog(self, tmp_path, cog):
+        """A cached COG that is set aside and not replaced leaves no index entry."""
+        cached, replacement = cog[: len(cog) * 2 // 3], cog[: len(cog) // 2]
+        (tmp_path / _FNAME).write_bytes(cached)
+        index = {_FNAME: {"metric": "SOSD", "tileId": "T33VWG", "year": 2019, "season": 1,
+                          "bounds_4326": [0.0, 0.0, 1.0, 1.0]}}
+        index, missing = self.prefetch(tmp_path, _Result(replacement), index)
+        assert missing == [_FNAME] and _FNAME not in index
+        assert not (tmp_path / _FNAME).exists()
+        assert (tmp_path / f"{_FNAME}.incomplete").read_bytes() == cached
+
+    def test_truncated_download_never_enters_the_cache(self, tmp_path, cog):
+        index, missing = self.prefetch(tmp_path, _Result(cog[: len(cog) // 2]))
+        assert missing == [_FNAME] and index == {}
+        assert not (tmp_path / _FNAME).exists()
+
+    def test_truncated_cached_cog_is_fetched_again(self, tmp_path, cog):
+        (tmp_path / _FNAME).write_bytes(cog[: len(cog) // 3])
+        result = _Result(cog)
+        index, missing = self.prefetch(tmp_path, result)
+        assert missing == [] and len(result.downloads) == 1
+        assert (tmp_path / _FNAME).read_bytes() == cog
+        assert (tmp_path / f"{_FNAME}.incomplete").stat().st_size == len(cog) // 3
+        assert (index[_FNAME]["year"], index[_FNAME]["metric"]) == (2019, "SOSD")
+
+    def test_complete_cached_cog_is_not_fetched(self, tmp_path, cog):
+        (tmp_path / _FNAME).write_bytes(cog)
+        result = _Result(cog)
+        _, missing = self.prefetch(tmp_path, result)
+        assert missing == [] and result.downloads == []

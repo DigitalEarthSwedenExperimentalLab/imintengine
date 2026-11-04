@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""Backfill HR-VPP phenology into ``_recoreg`` tiles missing it.
+
+~36% of the tiles in ``unified_v2_512_recoreg`` carry empty/missing VPP —
+the five channels ``vpp_{sosd,eosd,length,maxv,minv}`` are absent or all
+zero, inherited from the original dataset (the re-coreg refetch preserves
+aux but never fetches VPP). Root cause: VPP via the CDSE Sentinel Hub
+Process API hit PU exhaustion (HTTP 403); only partially backfilled in the
+2026-05-08 audit. This script fills the gap via WEkEO (PU-free), CDSE only
+as a last-resort fallback.
+
+What it does, per tile:
+  1. Skip tiles that already carry non-empty VPP (idempotent / resumable).
+  2. Resolve the EPSG:3006 bbox (``bbox_3006`` key) and the tile year
+     (canonical ``tile_fetch.infer_tile_year``: ``year`` → ``lpis_year``
+     → modal year across ``dates``).
+  3. Fetch the five VPP bands via ``imint.data.cdse_vpp.fetch_vpp_tiles``
+     for that bbox + year. Source routing is the function's own
+     ``$VPP_SOURCE`` env switch (NOT a kwarg): we force ``wekeo`` first —
+     PU-free — and only fall back to ``cdse`` on a WEkEO miss. A "miss" is
+     either a hard ``RuntimeError`` (no WEkEO ``index.json`` cache at all) or
+     a covered-but-empty read (coverage gap — caught via the same
+     ``_has_sufficient_coverage`` floor the auto-router uses).
+  4. Write ``vpp_*`` into the .npz ATOMICALLY (temp + ``os.replace``),
+     preserving every other field byte-for-byte.
+
+NEVER zero-fill: if BOTH WEkEO and CDSE miss, the tile's VPP is left absent
+and the tile name is recorded in a ``vpp_known_empty.json`` sidecar with a
+reason — genuinely no-phenology tiles (water / urban) and true coverage
+gaps are catalogued, not fabricated (see
+``memory/feedback_no_zerofills_reuse_downloaded``).
+
+Fetched COGs/arrays are cached to disk under ``--cache-dir`` (default
+``<data-dir>/.vpp_cache``) by ``fetch_vpp_tiles`` itself, so re-runs and
+neighbouring tiles don't re-download.
+
+Usage (build/unit-test only — DO NOT run against the cluster yet):
+    python scripts/backfill_vpp.py --data-dir /data/unified_v2_512_recoreg \\
+        --workers 2 --dry-run
+    python scripts/backfill_vpp.py --data-dir /data/unified_v2_512_recoreg \\
+        --workers 2
+
+Credentials:
+    WEkEO  — WEKEO_USERNAME / WEKEO_PASSWORD (or ~/.hdarc); the COG cache
+             dir is ``$VPP_WEKEO_DIR`` (default /data/vpp_wekeo).
+    CDSE   — CDSE_CLIENT_ID / CDSE_CLIENT_SECRET (or .cdse_credentials),
+             fallback only.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from imint.data.cdse_vpp import _has_sufficient_coverage, fetch_vpp_tiles
+from imint.training.tile_bbox import resolve_fetch_bbox
+from imint.training.tile_fetch import infer_tile_year
+from scripts.atomic_npz import (
+    FileIdentity,
+    capture_npz,
+    default_dataset_lock,
+    durable_atomic_savez,
+    exclusive_dataset_lock,
+)
+
+# The five HR-VPP channels stored per tile. ``fetch_vpp_tiles`` returns the
+# bare metric names (sosd, eosd, …); the .npz key is ``vpp_<name>`` — the
+# exact mapping used by scripts/prefetch_aux.py + scripts/submit_vpp_jobs.py.
+_VPP_RAW_NAMES = ("sosd", "eosd", "length", "maxv", "minv")
+_VPP_CHANNEL_NAMES = tuple(f"vpp_{n}" for n in _VPP_RAW_NAMES)
+
+
+_KNOWN_EMPTY_SIDECAR = "vpp_known_empty.json"
+
+
+# ── VPP presence / emptiness ─────────────────────────────────────────────
+
+def _vpp_is_empty(data) -> bool:
+    """True if the tile needs VPP — any of the 5 channels absent OR all-zero.
+
+    An all-zero band is the empty signature: ``fetch_vpp_tiles`` writes 0 for
+    nodata, so a band that never had a real fetch is uniformly 0. We treat the
+    VPP block as present only when EVERY channel exists and at least one
+    carries a non-zero pixel (phenology is never identically zero for a tile
+    with real vegetation).
+    """
+    for ch in _VPP_CHANNEL_NAMES:
+        if ch not in data:
+            return True
+    return not any(bool(np.any(np.asarray(data[ch]))) for ch in _VPP_CHANNEL_NAMES)
+
+
+# ── Tile metadata resolution ─────────────────────────────────────────────
+
+def _tile_year(data) -> int | None:
+    """Resolve the tile's VPP product year (**year-0**).
+
+    Delegates to the canonical ``tile_fetch.infer_tile_year``
+    (``year`` -> ``lpis_year`` -> modal year across ``dates``) so the label
+    builder, both aux enrichers and this backfill cannot drift apart.
+
+    Previously this consulted ``tessera_year`` FIRST. That key is written by
+    the TESSERA enricher and is a *clamped* value, not a label year — and
+    before the year-0 fix it held year-1 for every tile without ``lpis_year``.
+    Reading it here made the VPP backfill inherit that error wholesale, so
+    phenology would have been fetched for the season *before* the labels.
+
+    Returns None when nothing is resolvable (caller treats as a hard skip —
+    we will not guess a year for a VPP fetch).
+    """
+    return infer_tile_year(data)
+
+
+# ── Fetch: WEkEO first (PU-free), CDSE fallback ──────────────────────────
+
+# fetch_vpp_tiles routes its source via the process-global $VPP_SOURCE env var, so
+# the wekeo→cdse switch below MUST be serialized: under ThreadPoolExecutor two
+# threads interleaving the env mutation could make one read "cdse" when it meant
+# "wekeo" → silent CDSE-PU spend, the exact 403 this campaign exists to avoid.
+_VPP_SOURCE_LOCK = threading.Lock()
+
+
+def _fetch_vpp_wekeo_then_cdse(
+    west: float, south: float, east: float, north: float,
+    *, size_px: tuple[int, int], year: int, cache_dir: Path | None,
+) -> tuple[dict[str, np.ndarray] | None, str]:
+    """Fetch the 5 VPP bands, WEkEO first then CDSE. Never fabricates data.
+
+    ``fetch_vpp_tiles`` has no ``src=`` kwarg — source is its ``$VPP_SOURCE``
+    env switch. We force ``wekeo`` (PU-free), and on a miss force ``cdse``.
+
+    A WEkEO miss is either:
+      * RuntimeError — no WEkEO COG cache (``index.json``) at all; or
+      * a covered-but-insufficient read (coverage gap) — detected with the
+        same ``_has_sufficient_coverage`` floor the auto-router uses.
+
+    Returns ``(bands, source)`` where ``source`` is "wekeo" or "cdse"; or
+    ``(None, reason)`` when BOTH miss — the caller records the reason in the
+    known-empty sidecar and writes NOTHING (no zero-fill).
+    """
+    # Serialize the whole set→fetch→restore (see _VPP_SOURCE_LOCK above). returns
+    # release the lock cleanly; the finally restores the env while still held.
+    with _VPP_SOURCE_LOCK:
+        prev = os.environ.get("VPP_SOURCE")
+        try:
+            # ── WEkEO (forced, PU-free) ──
+            os.environ["VPP_SOURCE"] = "wekeo"
+            wk: dict[str, np.ndarray] | None = None
+            try:
+                wk = fetch_vpp_tiles(
+                    west, south, east, north,
+                    size_px=size_px, year=year, cache_dir=cache_dir,
+                )
+            except RuntimeError:
+                wk = None  # no WEkEO cache → treat as a miss, try CDSE
+            if wk is not None and _has_sufficient_coverage(wk):
+                return wk, "wekeo"
+
+            # ── CDSE (forced, metered fallback) ──
+            os.environ["VPP_SOURCE"] = "cdse"
+            try:
+                cd = fetch_vpp_tiles(
+                    west, south, east, north,
+                    size_px=size_px, year=year, cache_dir=cache_dir,
+                )
+            except RuntimeError as exc:
+                return None, f"wekeo_miss+cdse_error:{str(exc)[:120]}"
+            if _has_sufficient_coverage(cd):
+                return cd, "cdse"
+
+            # Both sources returned but neither covers the tile → genuine gap /
+            # no-phenology (water, urban). Do NOT zero-fill; catalogue it.
+            return None, "no_coverage_wekeo_or_cdse"
+        finally:
+            if prev is None:
+                os.environ.pop("VPP_SOURCE", None)
+            else:
+                os.environ["VPP_SOURCE"] = prev
+
+
+# ── Atomic write (temp in same dir + os.replace) ─────────────────────────
+
+def _atomic_savez(
+    dest: str,
+    data: dict,
+    *,
+    expected: FileIdentity | None = None,
+) -> None:
+    """Write ``data`` to ``dest`` atomically (temp in same dir + os.replace).
+
+    A file handle (not a path) is passed to savez_compressed so numpy does not
+    append a second ``.npz`` to the temp name. Same pattern as
+    scripts/fill_tiles_l2a.py — an interrupted/evicted pod can never leave a
+    half-written .npz (the BadZipFile failure mode of plain savez).
+
+    Replacements retain the destination's owner, group, and permission bits. ``fchown``
+    deliberately runs before ``fchmod`` because ownership changes may clear
+    set-ID bits. If either metadata operation fails, the temporary file is
+    removed and the original is left untouched. A new destination keeps
+    ``mkstemp``'s secure ``0600`` default and the filesystem-selected group.
+    """
+    durable_atomic_savez(dest, data, expected=expected)
+
+
+# ── Per-tile worker ──────────────────────────────────────────────────────
+
+def backfill_one_tile(
+    tile_path: str,
+    *,
+    cache_dir: Path | None,
+    dry_run: bool = False,
+    force: bool = False,
+    dataset_lock: str | None = None,
+    _lock_held: bool = False,
+) -> dict:
+    """Backfill VPP into one tile. Returns a status dict (never raises).
+
+    Statuses: ``skipped`` (already non-empty / no year / no bbox),
+    ``filled`` (VPP written, or would-be in dry-run), ``empty`` (both
+    sources missed — recorded in the known-empty sidecar by the caller),
+    ``failed`` (load/write error). The tile is rewritten only on ``filled``.
+
+    With ``force`` the ``vpp_present`` skip is bypassed — every tile's VPP is
+    re-fetched and overwritten (corrects already-stored-but-wrong VPP, e.g. the
+    256/512 aux-misalignment).
+    """
+    if not dry_run and not _lock_held:
+        lock_path = (
+            Path(dataset_lock)
+            if dataset_lock is not None
+            else default_dataset_lock(Path(tile_path).parent)
+        )
+        with exclusive_dataset_lock(lock_path):
+            return backfill_one_tile(
+                tile_path,
+                cache_dir=cache_dir,
+                dry_run=dry_run,
+                force=force,
+                dataset_lock=dataset_lock,
+                _lock_held=True,
+            )
+
+    name = Path(tile_path).stem
+    try:
+        data, initial_identity = capture_npz(tile_path)
+    except Exception as e:  # noqa: BLE001 — a corrupt .npz must not kill the run
+        return {"name": name, "status": "failed", "reason": f"load:{type(e).__name__}"}
+
+    # Year-aware skip: VPP being *present* is not enough — it must be present
+    # for the RIGHT year. Tiles written before the year-0 fix carry 2021
+    # phenology (the old fetch-time default) yet look complete to
+    # _vpp_is_empty, so a presence-only check would keep them wrong forever.
+    # A tile with no vpp_year stamp predates the fix, so it is re-fetched.
+    if not force and not _vpp_is_empty(data):
+        have = data.get("vpp_year")
+        want = _tile_year(data)
+        if have is not None and want is not None and int(have) == int(want):
+            return {"name": name, "status": "skipped", "reason": "vpp_present"}
+
+    # bbox + size via the shared SSOT resolver (extent coupled to the tile's own
+    # pixel grid at 10 m GSD) — the ONE place tile-aligned fetch geometry lives.
+    bbox, size = resolve_fetch_bbox(name=name, npz_data=data)
+    if bbox is None:
+        return {"name": name, "status": "skipped", "reason": "no_bbox"}
+
+    year = _tile_year(data)
+    if year is None:
+        return {"name": name, "status": "skipped", "reason": "no_year"}
+
+    west = bbox["west"]; south = bbox["south"]
+    east = bbox["east"]; north = bbox["north"]
+
+    bands, source = _fetch_vpp_wekeo_then_cdse(
+        west, south, east, north,
+        size_px=(size, size), year=year, cache_dir=cache_dir,
+    )
+    if bands is None:
+        # NEVER zero-fill — leave VPP absent, record for the known-empty set.
+        return {"name": name, "status": "empty", "reason": source, "year": year}
+
+    if dry_run:
+        return {"name": name, "status": "filled", "source": source,
+                "year": year, "dry_run": True}
+
+    # Write the 5 channels under their vpp_<name> keys; preserve everything else.
+    for raw_name in _VPP_RAW_NAMES:
+        data[f"vpp_{raw_name}"] = np.asarray(bands[raw_name], np.float32)
+    # Stamp WHICH year the phenology came from. Without this marker there was
+    # no way to tell a correctly-dated tile from one carrying the old
+    # fetch-time default of 2021, which is why that bug stayed invisible: the
+    # channels were present and non-zero, so every emptiness check passed.
+    # Also lets a later run skip year-correct tiles instead of needing --force.
+    data["vpp_year"] = np.int32(year)
+    try:
+        _atomic_savez(tile_path, data, expected=initial_identity)
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "status": "failed", "reason": f"write:{type(e).__name__}:{e}"}
+
+    return {"name": name, "status": "filled", "source": source, "year": year}
+
+
+# ── Known-empty sidecar (atomic JSON) ────────────────────────────────────
+
+def _load_known_empty(path: Path) -> dict[str, str]:
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+    return {}
+
+
+def _save_known_empty(path: Path, mapping: dict[str, str]) -> None:
+    """Atomically write the ``{tile: reason}`` known-empty catalogue."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(mapping, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+# ── Driver ───────────────────────────────────────────────────────────────
+
+def _run_under_dataset_lock(
+    data_dir: str,
+    *,
+    workers: int = 2,
+    dry_run: bool = False,
+    cache_dir: str | None = None,
+    max_tiles: int | None = None,
+    force: bool = False,
+) -> dict:
+    """Backfill VPP across every ``*.npz`` under ``data_dir``.
+
+    Returns the aggregate stats dict. The known-empty sidecar
+    (``vpp_known_empty.json``) is updated under ``data_dir`` for every tile
+    that both sources missed (skipped in dry-run — measure first).
+    """
+    tiles = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+    if max_tiles is not None:
+        tiles = tiles[:max_tiles]
+
+    cdir = Path(cache_dir) if cache_dir else Path(data_dir) / ".vpp_cache"
+
+    print(f"=== VPP backfill ===  tiles={len(tiles)}  workers={workers}  "
+          f"dry_run={dry_run}  cache={cdir}", flush=True)
+
+    stats = {"filled": 0, "skipped": 0, "empty": 0, "failed": 0}
+    by_source = {"wekeo": 0, "cdse": 0}
+    known_empty_new: dict[str, str] = {}
+    lock = threading.Lock()
+    done = 0
+    t0 = time.time()
+
+    def _run_one(path: str) -> None:
+        nonlocal done
+        r = backfill_one_tile(
+            path,
+            cache_dir=cdir,
+            dry_run=dry_run,
+            force=force,
+            _lock_held=True,
+        )
+        with lock:
+            done += 1
+            stats[r["status"]] = stats.get(r["status"], 0) + 1
+            if r["status"] == "filled" and r.get("source"):
+                by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+            if r["status"] == "empty":
+                known_empty_new[r["name"]] = r.get("reason", "unknown")
+            rate = done / (time.time() - t0) * 3600 if time.time() > t0 else 0.0
+            tail = (f" src={r.get('source', '-')}" if r["status"] == "filled"
+                    else f" {r.get('reason', '')}")
+            print(f"  [{done}/{len(tiles)}] {r['name']}: {r['status']}{tail} "
+                  f"| {rate:.0f}/h", flush=True)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_run_one, t): t for t in tiles}
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception as e:  # noqa: BLE001
+                print(f"  worker error: {type(e).__name__}: {e}", flush=True)
+
+    # Persist the known-empty catalogue (merge with any prior run). Skipped in
+    # dry-run — a dry-run only measures, it must not mutate the dataset dir.
+    if known_empty_new and not dry_run:
+        sidecar = Path(data_dir) / _KNOWN_EMPTY_SIDECAR
+        merged = _load_known_empty(sidecar)
+        merged.update(known_empty_new)
+        _save_known_empty(sidecar, merged)
+        print(f"  recorded {len(known_empty_new)} known-empty tile(s) → "
+              f"{sidecar}", flush=True)
+
+    print(f"\n=== Done in {(time.time() - t0) / 60:.1f} min ===", flush=True)
+    print(f"  filled={stats['filled']} (wekeo={by_source['wekeo']} "
+          f"cdse={by_source['cdse']})  skipped={stats['skipped']}  "
+          f"empty={stats['empty']}  failed={stats['failed']}", flush=True)
+    return stats
+
+
+def run(
+    data_dir: str,
+    *,
+    workers: int = 2,
+    dry_run: bool = False,
+    cache_dir: str | None = None,
+    max_tiles: int | None = None,
+    force: bool = False,
+    dataset_lock: str | None = None,
+) -> dict:
+    """Backfill VPP while excluding source-access plan/apply operations.
+
+    The default lock resolves inside the same PVC root as ``data_dir``.  The
+    source-access Jobs mount that exact backing file, so a future VPP rewrite
+    cannot race the inventory or its metadata-only repair.
+    """
+    lock_path = (
+        Path(dataset_lock)
+        if dataset_lock is not None
+        else default_dataset_lock(data_dir)
+    )
+    with exclusive_dataset_lock(lock_path):
+        return _run_under_dataset_lock(
+            data_dir,
+            workers=workers,
+            dry_run=dry_run,
+            cache_dir=cache_dir,
+            max_tiles=max_tiles,
+            force=force,
+        )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Backfill HR-VPP phenology into _recoreg tiles via WEkEO "
+                    "(CDSE fallback). Never zero-fills.")
+    ap.add_argument("--data-dir", required=True,
+                    help="Directory globbed as <dir>/*.npz (the _recoreg dir)")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="Parallel worker threads (default: 2)")
+    ap.add_argument("--cache-dir", default=None,
+                    help="VPP COG/array cache dir (default: <data-dir>/.vpp_cache)")
+    ap.add_argument("--max-tiles", type=int, default=None,
+                    help="Cap tiles processed (smoke/dry-run subset)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Measure only — fetch + report, write nothing")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-fetch and OVERWRITE VPP even if already present "
+                         "(corrects wrong-grid VPP). Atomic per-tile.")
+    ap.add_argument(
+        "--dataset-lock",
+        default=None,
+        help=(
+            "Shared source-access lock (default: "
+            "<data-dir-parent>/ops/crop-distill/source-access/locks/dataset.lock)"
+        ),
+    )
+    args = ap.parse_args()
+
+    stats = run(
+        args.data_dir,
+        workers=args.workers,
+        dry_run=args.dry_run,
+        cache_dir=args.cache_dir,
+        max_tiles=args.max_tiles,
+        force=args.force,
+        dataset_lock=args.dataset_lock,
+    )
+    if stats["failed"]:
+        return 1
+
+    # Exit 0 used to mean "nothing raised", which is not the same as "the run
+    # did something". On 2026-08-25 a rerun meant to repair 2,229 VPP-less
+    # tiles returned filled=0 empty=2234 — byte-identical to the run it was
+    # repairing, because a stale bbox-keyed cache short-circuited the fetch
+    # (fixed in 8475b4d) — and exited 0. Every precondition check passed; none
+    # of them asked whether the pass had any effect. A run that found tiles
+    # needing VPP and filled none of them achieved nothing, and that must be
+    # visible to the caller, not just legible in the log.
+    if stats["empty"] and not stats["filled"] and not args.dry_run:
+        print(
+            f"\nFAILED — {stats['empty']} tile(s) still lack VPP and none were "
+            f"filled. The run had work to do and did none of it: suspect a "
+            f"stale {args.cache_dir or '<data-dir>/.vpp_cache'} entry, or a "
+            f"WEkEO cache that does not cover these (MGRS, year) pairs.",
+            flush=True,
+        )
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

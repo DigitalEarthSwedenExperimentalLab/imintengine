@@ -1,0 +1,150 @@
+#!/bin/bash
+# download_training_data.sh — Download all raw data for crop classification training
+#
+# Sources:
+#   LUCAS Copernicus 2018: Figshare (CC BY 4.0)
+#   LUCAS Eurostat 2022:   Eurostat (open data)
+#   LPIS 2022-2024:        Jordbruksverket WFS (CC BY 4.0)
+#   LPIS 2025:             Jordbruksverket INSPIRE Atom (CC BY 4.0)
+#
+# Usage:
+#   bash scripts/download_training_data.sh
+#
+# Total download: ~5 GB
+# Time: ~15-30 min depending on connection
+
+set -e
+
+DATA_DIR="$(cd "$(dirname "$0")/.." && pwd)/data"
+LUCAS_DIR="$DATA_DIR/lucas"
+LPIS_DIR="$DATA_DIR/lpis"
+
+echo "=== ImintEngine — Download Training Data ==="
+echo "Output: $DATA_DIR"
+echo ""
+
+mkdir -p "$LUCAS_DIR" "$LPIS_DIR"
+
+# ── LUCAS Copernicus 2018 ────────────────────────────────────────────────
+echo "[1/6] LUCAS Copernicus 2018 (Figshare, 12 MB)..."
+if [ -f "$LUCAS_DIR/LUCAS_2018_Copernicus_attributes.csv" ]; then
+    echo "  SKIP (already exists)"
+else
+    curl -L -o "$LUCAS_DIR/lucas_2018_copernicus.zip" \
+        "https://ndownloader.figshare.com/files/26404922"
+    unzip -o "$LUCAS_DIR/lucas_2018_copernicus.zip" \
+        LUCAS_2018_Copernicus_attributes.csv -d "$LUCAS_DIR"
+    echo "  OK: $(wc -l < "$LUCAS_DIR/LUCAS_2018_Copernicus_attributes.csv") rows"
+fi
+
+# ── LUCAS Eurostat 2022 ──────────────────────────────────────────────────
+echo "[2/6] LUCAS Eurostat 2022 (Eurostat, 28 MB)..."
+if [ -f "$LUCAS_DIR/EU_LUCAS_2022.csv" ]; then
+    echo "  SKIP (already exists)"
+else
+    curl -L -o "$LUCAS_DIR/lucas_2022_eu.zip" \
+        "https://ec.europa.eu/eurostat/documents/205002/17561401/EU_LUCAS_2022.zip"
+    unzip -o "$LUCAS_DIR/lucas_2022_eu.zip" EU_LUCAS_2022.csv -d "$LUCAS_DIR"
+    echo "  OK: $(wc -l < "$LUCAS_DIR/EU_LUCAS_2022.csv") rows"
+fi
+
+# ── LPIS (Jordbruksverket WFS) ──────────────────────────────────────────
+# ⚠ AXELORDNING: WFS:ens shape-zip levererar EPSG:3006 i OFFICIELL
+# axelordning (Northing, Easting). Konvertera ALDRIG zip→parquet ad hoc —
+# använd scripts/convert_lpis_wfs_zip.py som bounds-gatar och swappar
+# axlarna. Oswappad parquet ⇒ 0 parceller i varje tile-query (tyst).
+# Historik: ae5fe17/ff0d51f (apr 2026), återupptäckt 2026-07-20 (2021).
+
+# ── LPIS 2022 (Jordbruksverket WFS) ─────────────────────────────────────
+echo "[3/6] LPIS 2022 — Jordbruksskiften (SJV WFS, ~300 MB)..."
+if [ -f "$LPIS_DIR/jordbruksskiften_2022.zip" ] && unzip -t "$LPIS_DIR/jordbruksskiften_2022.zip" > /dev/null 2>&1; then
+    echo "  SKIP (already exists and valid)"
+else
+    curl -L -o "$LPIS_DIR/jordbruksskiften_2022.zip" \
+        "http://epub.sjv.se/inspire/inspire/wfs?service=WFS&version=2.0.0&request=GetFeature&typeName=inspire:arslager_skifte&outputFormat=shape-zip&CQL_FILTER=arslager%3D2022"
+    echo "  OK: $(ls -lh "$LPIS_DIR/jordbruksskiften_2022.zip" | awk '{print $5}')"
+fi
+
+# ── LPIS 2023 ────────────────────────────────────────────────────────────
+echo "[4/6] LPIS 2023 — Jordbruksskiften (SJV WFS, ~300 MB)..."
+if [ -f "$LPIS_DIR/jordbruksskiften_2023.zip" ] && unzip -t "$LPIS_DIR/jordbruksskiften_2023.zip" > /dev/null 2>&1; then
+    echo "  SKIP (already exists and valid)"
+else
+    curl -L -o "$LPIS_DIR/jordbruksskiften_2023.zip" \
+        "http://epub.sjv.se/inspire/inspire/wfs?service=WFS&version=2.0.0&request=GetFeature&typeName=inspire:arslager_skifte&outputFormat=shape-zip&CQL_FILTER=arslager%3D2023"
+    echo "  OK: $(ls -lh "$LPIS_DIR/jordbruksskiften_2023.zip" | awk '{print $5}')"
+fi
+
+# ── LPIS 2024 ────────────────────────────────────────────────────────────
+echo "[5/6] LPIS 2024 — Jordbruksskiften (SJV WFS, ~300 MB)..."
+if [ -f "$LPIS_DIR/jordbruksskiften_2024.zip" ] && unzip -t "$LPIS_DIR/jordbruksskiften_2024.zip" > /dev/null 2>&1; then
+    echo "  SKIP (already exists and valid)"
+else
+    curl -L -o "$LPIS_DIR/jordbruksskiften_2024.zip" \
+        "http://epub.sjv.se/inspire/inspire/wfs?service=WFS&version=2.0.0&request=GetFeature&typeName=inspire:arslager_skifte&outputFormat=shape-zip&CQL_FILTER=arslager%3D2024"
+    echo "  OK: $(ls -lh "$LPIS_DIR/jordbruksskiften_2024.zip" | awk '{print $5}')"
+fi
+
+# ── LPIS 2025 (INSPIRE Atom) ────────────────────────────────────────────
+echo "[6/6] LPIS 2025 — Jordbruksskiften (INSPIRE Atom, 3.7 GB GML)..."
+EXPECTED_SIZE=3700000000  # bytes from Atom feed length attribute
+if [ -f "$LPIS_DIR/jordbruksskiften_2025.gml.zip" ]; then
+    ACTUAL_SIZE=$(stat -f%z "$LPIS_DIR/jordbruksskiften_2025.gml.zip" 2>/dev/null || stat -c%s "$LPIS_DIR/jordbruksskiften_2025.gml.zip" 2>/dev/null || echo 0)
+    if [ "$ACTUAL_SIZE" -ge "$EXPECTED_SIZE" ]; then
+        echo "  SKIP (already exists, $ACTUAL_SIZE bytes >= expected $EXPECTED_SIZE)"
+    else
+        echo "  Incomplete ($ACTUAL_SIZE / $EXPECTED_SIZE bytes), re-downloading..."
+        curl -L -C - -o "$LPIS_DIR/jordbruksskiften_2025.gml.zip" \
+            "https://cdn.jordbruksverket.se/inspire/atom/jordbruksskiften/20250326/jordbruksskiften.gml.zip"
+        echo "  OK: $(ls -lh "$LPIS_DIR/jordbruksskiften_2025.gml.zip" | awk '{print $5}')"
+    fi
+else
+    curl -L -o "$LPIS_DIR/jordbruksskiften_2025.gml.zip" \
+        "https://cdn.jordbruksverket.se/inspire/atom/jordbruksskiften/20250326/jordbruksskiften.gml.zip"
+    echo "  OK: $(ls -lh "$LPIS_DIR/jordbruksskiften_2025.gml.zip" | awk '{print $5}')"
+fi
+
+# ── Convert LPIS zip → GeoParquet (axis-corrected) ──────────────────────
+# The WFS shape-zip is (Northing, Easting); convert_lpis_wfs_zip.py bounds-
+# gates and swaps to (Easting, Northing) so every consumer sees correct axes.
+# Doing it HERE (not ad hoc later) is the fix for the axis-swap that recurred
+# twice — see the script's header. Idempotent: skips a parquet that already
+# exists and reads as (E, N).
+echo ""
+echo "=== Convert LPIS → parquet (axis-corrected) ==="
+LPIS_REF=""
+for yr in 2022 2023 2024; do
+    zip="$LPIS_DIR/jordbruksskiften_${yr}.zip"
+    out="$LPIS_DIR/jordbruksskiften_${yr}.parquet"
+    [ -f "$zip" ] || continue
+    if python3 -c "import geopandas as g,sys; b=g.read_parquet('$out').total_bounds; sys.exit(0 if 200000<b[0]<1000000 and 6000000<b[1]<7800000 else 1)" 2>/dev/null; then
+        echo "  ${yr}: parquet exists and axes OK — skip"
+    else
+        python3 "$(dirname "$0")/convert_lpis_wfs_zip.py" --zip "$zip" \
+            ${LPIS_REF:+--ref-parquet "$LPIS_REF"} --out "$out"
+    fi
+    [ -z "$LPIS_REF" ] && [ -f "$out" ] && LPIS_REF="$out"
+done
+
+# ── Verify ───────────────────────────────────────────────────────────────
+echo ""
+echo "=== Verification ==="
+echo "LUCAS:"
+for f in "$LUCAS_DIR"/*.csv; do
+    echo "  $(basename "$f"): $(wc -l < "$f") rows"
+done
+echo "LPIS:"
+for f in "$LPIS_DIR"/jordbruksskiften_*.zip "$LPIS_DIR"/jordbruksskiften_*.gml.zip; do
+    [ -f "$f" ] && echo "  $(basename "$f"): $(ls -lh "$f" | awk '{print $5}')"
+done
+
+echo ""
+echo "=== Next steps (unified 23-class pipeline) ==="
+echo "1. Fetch 4-frame spectral tiles:  kubectl apply -f k8s/fetch-tiles-job.yaml"
+echo "                                  (local: scripts/fetch_unified_tiles.py)"
+echo "2. Build unified labels (NMD+LPIS+SKS): kubectl apply -f k8s/build-labels-job.yaml"
+echo "                                  (local: scripts/build_labels.py)"
+echo "3. Train on H100:                 kubectl apply -f k8s/unified-training-job.yaml"
+echo ""
+echo "(LUCAS data under data/lucas/ is now validation reference only — the"
+echo " crop-only training pipeline was retired in favour of LPIS labels.)"

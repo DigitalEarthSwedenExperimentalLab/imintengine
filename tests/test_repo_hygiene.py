@@ -1,0 +1,520 @@
+"""Repo-hygien-tester — håller Docker-pipelines reproducerbara.
+
+Bakgrund: commit 52d19ae committade 9 PNG-resultat utan att Dockerfile
+eller run-skript versionerades. Detta blockerade replikering 6 månader
+senare. docs/governance/avoiding_docker_repo_skew.md §3 specificerar reglerna;
+det här testet håller dem self-enforcing.
+
+Två tester:
+  1. ``test_every_docker_run_has_a_dockerfile`` — varje image som
+     refereras via ``docker run X`` i Python/shell/Makefile måste ha
+     Dockerfile under ``docker/<namn>/`` eller på annan känd plats.
+  2. ``test_no_latest_tag_in_dockerfiles`` — Dockerfiles får inte
+     använda ``FROM x:latest`` (driver mot reproducerbarhet).
+
+Båda körs lokalt via pytest och i CI på varje PR.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+import tomllib
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Filer som scannas för ``docker run`` references.
+SCAN_GLOBS = ("*.py", "*.sh", "Makefile", "*.yaml", "*.yml")
+
+# Kataloger som hoppas över (genererad kod, externa beroenden, .git, etc.)
+# Inkluderar notebooks-checkpoints och anteckningsboksformat med stora cellsträngar
+# som regex-matchen blir kvadratisk på.
+SKIP_PARTS = (
+    ".venv", ".venv-sr", "node_modules", ".git", "site-packages",
+    ".ipynb_checkpoints", "outputs/", "docs/showcase/",
+    ".pytest_cache", "__pycache__",
+)
+
+# Imagi som har Dockerfile i repot — håll synkad med faktiska Dockerfiles.
+# Ny pipeline-image → lägg till här samtidigt som du committar Dockerfile.
+KNOWN_LOCAL_IMAGES = {
+    "imint-engine",        # Dockerfile (root)
+    "imint-engine-cuda",   # Dockerfile.cuda
+    "imint-engine-api",    # Dockerfile.api
+    "imint/cloud-models",  # docker/cloud-models/Dockerfile
+    "imint-snap-c2rcc",    # docker/c2rcc-snap/Dockerfile
+}
+
+# Allowlist för upstream/registry-images vi inte bygger själva. Gränsa till
+# images vi medvetet använder utan att versionera build-receptet (typiskt
+# stable upstream som postgres). Om en image är i pipeline och vi vill ha
+# kontroll — flytta den till KNOWN_LOCAL_IMAGES och skriv en Dockerfile.
+ALLOWED_UPSTREAM = {
+    "postgres", "redis", "minio/minio",
+    "python", "debian", "ubuntu", "alpine",  # base-images i CI-skript
+    "busybox",
+}
+
+
+# Image-tag-regel: lowercase, digit/dash/dot/slash, måste innehålla
+# minst en av {/, -, .} eller ett digit för att accepteras (annars
+# är det troligen ett vanligt engelskt/svenskt ord från en kommentar
+# där "docker run" nämns i prosa).
+_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/\-]*(:[a-zA-Z0-9._\-]+)?$")
+
+
+def _looks_like_docker_image(tok: str) -> bool:
+    if not tok or len(tok) < 3:
+        return False
+    if tok.startswith(("-", "/", "$", ".", "&&", ";", "\\")):
+        return False
+    if not _IMAGE_RE.match(tok):
+        return False
+    # Reject pure lowercase words without digit/slash/dash — sannolikt
+    # ett vanligt ord från en kommentar.
+    if all(c.isalpha() or c == "_" for c in tok.split(":")[0]):
+        return False
+    if tok in {"true", "false", "echo", "bash", "sh",
+               "python", "python3"}:
+        return False
+    return True
+
+
+def _iter_repo_files() -> list[Path]:
+    """Iterera över versionerade filer av relevant typ.
+
+    Använder ``git ls-files`` istället för ``Path.rglob`` så vi inte
+    spenderar 100+ sekunder på att vandra `.venv-sr/`-trädet (~500k
+    Python-stdlib-filer). Faller tillbaka på rglob om vi inte är i en
+    git-repo.
+    """
+    import subprocess
+    suffixes = {".py", ".sh", ".yaml", ".yml"}
+    basenames = {"Makefile"}
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        paths = [REPO / line for line in result.stdout.splitlines() if line]
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError):
+        # Fallback — ej git eller git saknas. Lite långsammare.
+        paths = []
+        for ext in SCAN_GLOBS:
+            for f in REPO.rglob(ext):
+                if any(part in str(f) for part in SKIP_PARTS):
+                    continue
+                paths.append(f)
+        return paths
+
+    files: list[Path] = []
+    for p in paths:
+        if any(part in str(p) for part in SKIP_PARTS):
+            continue
+        if p.suffix in suffixes or p.name in basenames:
+            files.append(p)
+    return files
+
+
+def _extract_docker_run_images() -> set[str]:
+    """Find image names referenced via ``docker run`` in repo scripts.
+
+    Skannar bara filer som troligen innehåller ``docker run``-anrop
+    (Dockerfile är inte intressant — där letar vi FROM separat).
+    Använder enkel rad-för-rad-tokenisering istället för regex som
+    kan bli kvadratisk på stora notebook-cellsträngar.
+
+    Returns image names with optional registry prefix (without tag).
+    """
+    images: set[str] = set()
+    for f in _iter_repo_files():
+        try:
+            content = f.read_text(errors="ignore")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "docker run" not in content:
+            continue
+        # Sammanslå backslash-line-continuations (`docker run \\\n  X` blir
+        # `docker run   X`) så multi-line shell-anrop tokeniseras korrekt.
+        content = re.sub(r"\\\s*\n\s*", " ", content)
+        for line in content.splitlines():
+            # Hitta token "docker run" och plocka första non-flag-arg som
+            # följer. Tokenisering är medvetet enkel — täcker shell- och
+            # subprocess-anrop men kan missa rader med komplex quoting.
+            line_low = line.replace('"', " ").replace("'", " ").replace(",", " ")
+            tokens = line_low.split()
+            if "docker" not in tokens:
+                continue
+            try:
+                idx = tokens.index("docker")
+            except ValueError:
+                continue
+            if idx + 1 >= len(tokens) or tokens[idx + 1] != "run":
+                continue
+            # Skip flags och deras värden tills vi hittar image
+            i = idx + 2
+            while i < len(tokens):
+                tok = tokens[i]
+                if tok.startswith("-"):
+                    # Flagga; om = i token är värdet inkluderat, annars hoppa över nästa
+                    if "=" not in tok and tok in {
+                        "-v", "--volume", "-e", "--env", "-p", "--publish",
+                        "-w", "--workdir", "--name", "--user", "-u",
+                        "--platform", "--network", "--mount",
+                    }:
+                        i += 2
+                        continue
+                    i += 1
+                    continue
+                # Första non-flag-token är image — validera att det
+                # ser ut som en Docker-image-tag och inte ett vanligt
+                # ord från en kommentar/dokumentation.
+                tag = tok
+                if not _looks_like_docker_image(tag):
+                    break
+                images.add(tag)
+                break
+    return images
+
+
+def test_every_docker_run_has_a_dockerfile() -> None:
+    """Every image used in a ``docker run`` must be buildable from this repo.
+
+    If a CI/dev script invokes a Docker image, the recipe to build that
+    image must live in this repo (typically under ``docker/<name>/``) or
+    be an explicit upstream allowed in :data:`ALLOWED_UPSTREAM`.
+
+    To resolve a failure:
+      1. Add ``docker/<name>/Dockerfile`` for the image, OR
+      2. Append the image basename to :data:`KNOWN_LOCAL_IMAGES` if a
+         Dockerfile already exists elsewhere in the repo, OR
+      3. Append the image basename to :data:`ALLOWED_UPSTREAM` if it is a
+         well-known upstream you intentionally don't fork.
+    """
+    referenced = _extract_docker_run_images()
+    # Image basenames (strip path/tag): "imint/cloud-models:1.0" → "imint/cloud-models"
+    bases = {img.split(":")[0] for img in referenced}
+    missing = bases - KNOWN_LOCAL_IMAGES - ALLOWED_UPSTREAM
+
+    assert not missing, (
+        f"docker run-anrop refererar till {sorted(missing)}, men ingen "
+        f"Dockerfile hittades i repot. Antingen lägg till Dockerfile under "
+        f"docker/<namn>/, uppdatera KNOWN_LOCAL_IMAGES, eller lägg till i "
+        f"ALLOWED_UPSTREAM om det är en avsiktlig upstream-image."
+    )
+
+
+def _tracked_dockerfiles() -> list[Path]:
+    """Git-tracked Dockerfiles; not rglob (walking .venv-sr/ costs 15+ s)."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files", "*Dockerfile*", "**/Dockerfile*"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        dockerfiles = [REPO / line for line in result.stdout.splitlines() if line]
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError):
+        dockerfiles = list(REPO.rglob("Dockerfile*"))
+    return [f for f in dockerfiles if not any(part in str(f) for part in SKIP_PARTS)]
+
+
+def test_no_latest_tag_in_dockerfiles() -> None:
+    """Dockerfiles must not use ``FROM x:latest`` — pin to explicit version.
+
+    ``:latest`` makes builds non-reproducible: the same Dockerfile produces
+    different images on different days. Pin to ``FROM mundialis/esa-snap:13.0.0``,
+    ``FROM python:3.11.9-slim-bookworm``, etc.
+    """
+    violations: list[tuple[Path, int, str]] = []
+    for f in _tracked_dockerfiles():
+        try:
+            for lineno, line in enumerate(f.read_text().splitlines(), start=1):
+                if line.strip().upper().startswith("FROM ") and ":latest" in line:
+                    violations.append((f.relative_to(REPO), lineno, line.strip()))
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    assert not violations, (
+        "Dockerfile FROM-rader använder :latest — ej reproducerbart:\n"
+        + "\n".join(f"  {f}:{ln}  {src}" for f, ln, src in violations)
+    )
+
+
+def test_pipeline_images_have_run_script() -> None:
+    """Each pipeline image directory should ship a runner (run.sh / Makefile).
+
+    The cloud-models reference uses an ENTRYPOINT in the Dockerfile +
+    a host-side Python driver. Either pattern is acceptable, but the
+    docker/<name>/ directory must contain at least one of:
+      - run.sh
+      - Makefile
+      - <name>.py with a __main__ block
+      - README.md that documents docker run invocation
+    """
+    docker_root = REPO / "docker"
+    if not docker_root.is_dir():
+        pytest.skip("no docker/ directory")
+
+    missing: list[str] = []
+    for sub in sorted(docker_root.iterdir()):
+        if not sub.is_dir() or not (sub / "Dockerfile").is_file():
+            continue
+        candidates = [
+            sub / "run.sh",
+            sub / "Makefile",
+            sub / "README.md",
+        ]
+        candidates += list(sub.glob("*.py"))
+        if not any(c.exists() for c in candidates):
+            missing.append(str(sub.relative_to(REPO)))
+
+    assert not missing, (
+        f"Pipeline-image-kataloger saknar run-skript/README/Python-driver: "
+        f"{missing}. Lägg till minst en av: run.sh, Makefile, README.md, "
+        f"eller en *.py-fil med entry-point."
+    )
+
+
+#: Where data received under SLU's confidentiality agreement belongs.
+_PERMANENT_NFI_DIR = "data/nfi_permanent/"
+#: A data file whose name says it holds permanent NFI plots.
+_PERMANENT_NFI_NAME = re.compile(r"permanent[_-]?(?:nfi|plots?)|permanenta[_-]?provytor", re.IGNORECASE)
+_DATA_SUFFIXES = {".parquet", ".csv", ".xlsx", ".xls", ".json", ".geojson", ".gpkg",
+                  ".shp", ".npz", ".npy", ".txt"}
+
+
+def _is_permanent_nfi_data(rel: str) -> bool:
+    path = Path(rel)
+    return rel.startswith(_PERMANENT_NFI_DIR) or (
+        path.suffix.lower() in _DATA_SUFFIXES and bool(_PERMANENT_NFI_NAME.search(path.name))
+    )
+
+
+def test_no_permanent_nfi_plot_data_tracked() -> None:
+    """Permanent NFI plot data must never enter this (public) repo.
+
+    SLU keeps the exact coordinates of Riksskogstaxeringen's permanent plots
+    confidential and releases them only under a confidentiality agreement.
+    This repo uses SLU's open calibration subset instead: temporary plots,
+    positions included, published under CC0 1.0 (``swe_nfi_plotdata2.xlsx``,
+    see ``docs/data/nfi_plotdata_DATA_CARD.md``). Its plot ids, coordinates
+    and tile names may therefore appear here. Agreement data belongs under
+    ``data/nfi_permanent/``, which ``.gitignore`` covers; ``git add -f``
+    bypasses ignores, so this test is the guard.
+    """
+    import subprocess
+
+    tracked = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    offenders = [rel for rel in tracked if _is_permanent_nfi_data(rel)]
+    assert not offenders, (
+        f"Permanent NFI plot data tracked in a public repo: {offenders}. "
+        f"SLU releases these coordinates only under agreement; keep them "
+        f"under {_PERMANENT_NFI_DIR}."
+    )
+
+
+@pytest.mark.parametrize("rel, found", [
+    ("data/nfi_permanent/plots.parquet", True),
+    ("data/nfi_permanent/README.md", True),           # anything in the agreement directory
+    ("docs/data/permanent_plots_2024.csv", True),
+    ("data/permanenta_provytor.xlsx", True),
+    ("data/Permanent-NFI.json", True),
+    ("scripts/load_permanent_nfi.py", False),         # code that reads it is not the data
+    ("data/nfi/swe_nfi_plotdata2.xlsx", False),       # SLU's CC0 calibration subset
+    ("data/distill/distill_split.json", False),
+    ("docs/data/nfi_plotdata_DATA_CARD.md", False),
+    ("imint/schema/crop_schema.py", False),
+])
+def test_permanent_nfi_data_pattern(rel: str, found: bool) -> None:
+    assert _is_permanent_nfi_data(rel) is found
+
+
+# ── manifest-writing skg Jobs forward SIGTERM to their script ──────────────
+# scripts/stage_skg_open.py and scripts/drop_skg_open_raw.py hold
+# /data/skg_open/MANIFEST.lock and release it on SIGTERM. Under
+# `command: [bash, -c]` bash is PID 1: Kubernetes signals only PID 1, and
+# bash as PID 1 neither dies from SIGTERM nor forwards it, so the pod is
+# SIGKILLed after the grace period and the lock stays (review 5571119554).
+
+_LOCKED_SCRIPT = re.compile(r"\bpython3?\s+scripts/(stage_skg_open|drop_skg_open_raw)\.py\b")
+
+
+def _lock_writing_jobs():
+    import yaml
+
+    for path in sorted((REPO / "k8s").glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text()):
+            if not doc or doc.get("kind") != "Job":
+                continue
+            pod = doc["spec"]["template"]["spec"]
+            for c in pod["containers"]:
+                script = "\n".join(c.get("args", []) + c.get("command", []))
+                if _LOCKED_SCRIPT.search(script):
+                    yield path.name, pod, script
+
+
+def _forward_term_body(script: str) -> str:
+    start = script.index("forward_term() {")
+    return script[start:script.index("\n}", start) + 2]
+
+
+def test_every_lock_writing_job_forwards_sigterm_to_its_script() -> None:
+    jobs = list(_lock_writing_jobs())
+    assert {n for n, _, _ in jobs} >= {"skg-open-stage-job.yaml", "skg-open-stage-tradhojd-job.yaml",
+                                       "skg-open-drop-raw-job.yaml"}
+    for name, pod, script in jobs:
+        assert pod.get("terminationGracePeriodSeconds", 0) >= 60, name
+        body = _forward_term_body(script)
+        assert "trap 'kill -TERM" in body and 'wait "${CHILD}"' in body, name
+        for line in script.splitlines():
+            if _LOCKED_SCRIPT.search(line):
+                assert line.strip().startswith("forward_term python"), (name, line.strip())
+
+
+def test_forward_term_releases_the_lock_when_bash_gets_sigterm(tmp_path) -> None:
+    """Run each Job's forward_term bytes in bash around a lock holder, SIGTERM bash."""
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    holder = ("import sys, time; from pathlib import Path; from scripts import stage_skg_open as st\n"
+              "with st.manifest_lock(Path(sys.argv[1]), 'stage_skg_open'):\n    time.sleep(60)\n")
+    for name, _, script in _lock_writing_jobs():
+        dest = tmp_path / name
+        program = ("set -euo pipefail\n" + _forward_term_body(script) + "\n"
+                   f'forward_term "{sys.executable}" -c "$HOLDER" "{dest}"\necho "survived TERM"\n')
+        proc = subprocess.Popen(["bash", "-c", program], cwd=REPO, env={"HOLDER": holder, "PATH": "/usr/bin:/bin"},
+                                stdout=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 30
+        while not (dest / "MANIFEST.lock").exists():
+            assert time.monotonic() < deadline and proc.poll() is None, name
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+        assert proc.returncode == 143, (name, proc.returncode)
+        assert "survived TERM" not in out, name
+        assert not (dest / "MANIFEST.lock").exists(), name
+
+
+def _containers(node):
+    """Every container (and init container) anywhere in a parsed k8s document."""
+    if isinstance(node, dict):
+        for key in ("containers", "initContainers"):
+            if isinstance(node.get(key), list):
+                yield from node[key]
+        for value in node.values():
+            yield from _containers(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _containers(value)
+
+
+def test_no_container_sets_an_env_variable_twice() -> None:
+    """A repeated env name is silently "last one wins" in Kubernetes. d4b42db
+    added a second GDAL_CACHEMAX to the Trädhöjd Job, unseen because its check
+    turned env into a dict; here env is read as the list it is."""
+    import yaml
+
+    found = []
+    for path in sorted((REPO / "k8s").glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text()):
+            for c in _containers(doc):
+                names = [e["name"] for e in c.get("env") or []]
+                found += [(path.name, c.get("name"), n) for n in sorted({n for n in names if names.count(n) > 1})]
+    assert not found, f"env names set twice: {found}"
+
+
+def test_every_aux_pass_job_refuses_a_reader_blind_to_recorded_gaps() -> None:
+    """A Job running skg_aux_pass.py pinned to a commit whose skg_open predates
+    recorded gaps (#94) writes Trädhöjd height 0 over a truncated upstream
+    tile (nfi-topup-aux-pass was pinned to eded310). Its preflight must call
+    skg_open.tradhojd_gaps, which fails on such a pin, and require every
+    county masked (#96), and the Job must state its --max-missing-share."""
+    import yaml
+
+    jobs = []
+    for path in sorted((REPO / "k8s").glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text()):
+            for c in _containers(doc):
+                script = "\n".join(c.get("args", []) + c.get("command", []))
+                if "scripts/skg_aux_pass.py" in script:
+                    jobs.append((path.name, "skg_open.tradhojd_gaps(" in script and "county_mask" in script
+                                 and "--max-missing-share" in script))
+    assert jobs and all(ok for _, ok in jobs), jobs
+
+
+# ── Licensing: code Apache-2.0, data CC0 (#136) ─────────────────────────────
+
+# sha256 of https://www.apache.org/licenses/LICENSE-2.0.txt, unmodified. The
+# copyright statement lives in NOTICE and README, not in the appendix.
+_APACHE_2_0_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+_OCI_LICENSES = re.compile(r"org\.opencontainers\.image\.licenses\s*=\s*([^\s\"']+)")
+
+
+def _project() -> dict:
+    return tomllib.loads((REPO / "pyproject.toml").read_text())["project"]
+
+
+def _copy_sources_by_stage(dockerfile: Path) -> list[set[str]]:
+    """Build-context paths each stage COPYs; ``COPY --from`` is not context."""
+    text = re.sub(r"\\[ \t]*\n", " ", dockerfile.read_text())
+    stages: list[set[str]] = [set()]
+    for words in (line.split() for line in text.splitlines()):
+        if not words:
+            continue
+        if words[0].upper() == "FROM":
+            stages.append(set())
+        elif words[0].upper() == "COPY" and not any(w.startswith("--from") for w in words):
+            stages[-1].update(w.removeprefix("./") for w in words[1:-1] if not w.startswith("--"))
+    return stages
+
+
+def test_license_is_the_canonical_apache_2_0_text() -> None:
+    digest = hashlib.sha256((REPO / "LICENSE").read_bytes()).hexdigest()
+    assert digest == _APACHE_2_0_SHA256, (
+        f"LICENSE sha256 {digest} is not the canonical Apache License 2.0 "
+        "text; restore it verbatim and keep the copyright line in NOTICE."
+    )
+
+
+def test_pyproject_license_is_apache_2_0() -> None:
+    assert _project()["license"] == "Apache-2.0"
+
+
+def test_oci_image_license_labels_are_apache_2_0() -> None:
+    labels = [
+        (path.name, value)
+        for path in sorted((REPO / ".github" / "workflows").iterdir())
+        if path.suffix in {".yml", ".yaml"}
+        for value in _OCI_LICENSES.findall(path.read_text())
+    ]
+    assert labels and all(value == "Apache-2.0" for _, value in labels), labels
+
+
+def test_every_pyproject_license_file_exists() -> None:
+    missing = [name for name in _project()["license-files"] if not (REPO / name).is_file()]
+    assert not missing, f"pyproject license-files missing from the repo: {missing}"
+
+
+def test_dockerfile_stages_copying_license_copy_every_license_file() -> None:
+    """The images pip-install the package from a minimal COPYed context, and
+    setuptools fails on any license-files entry absent from it. A stage that
+    COPYs LICENSE must COPY every license-files entry."""
+    required = set(_project()["license-files"])
+    checked, gaps = 0, []
+    for dockerfile in _tracked_dockerfiles():
+        for stage, sources in enumerate(_copy_sources_by_stage(dockerfile)):
+            if "LICENSE" in sources:
+                checked += 1
+                if not required <= sources:
+                    gaps.append((str(dockerfile.relative_to(REPO)), stage, sorted(required - sources)))
+    assert checked, "no Dockerfile stage COPYs LICENSE; the guard checks nothing"
+    assert not gaps, f"(Dockerfile, FROM-stage, missing license-files): {gaps}"

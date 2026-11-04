@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""Prefetch auxiliary raster channels for training tiles.
+
+Scans an existing tile directory (data/lulc_full/tiles/) and adds
+auxiliary channels to every .npz tile that doesn't already have them.
+
+Supported channels:
+  height      — tree height in meters (Skogsstyrelsen trädhöjd)
+  volume      — timber volume in m³sk/ha (Skogliga grunddata)
+  basal_area  — basal area / grundyta in m²/ha (Skogliga grunddata)
+  diameter    — mean stem diameter / medeldiameter in cm (Skogliga grunddata)
+  dem         — terrain elevation in meters (Copernicus DEM GLO-30)
+  vpp         — HR-VPP vegetation phenology (5 bands: sosd, eosd, length,
+                maxv, minv) via CDSE Sentinel Hub Process API
+
+Runs independently of the main training pipeline so data can be
+downloaded in the background while training continues.
+
+Usage:
+    # Fetch all standard channels
+    python scripts/prefetch_aux.py --channels height volume basal_area diameter dem
+
+    # Fetch VPP phenology channels
+    python scripts/prefetch_aux.py --channels vpp
+
+    # Fetch everything including VPP
+    python scripts/prefetch_aux.py --channels height volume basal_area diameter dem vpp
+
+    # Backward compatible: height only (same as prefetch_height.py)
+    python scripts/prefetch_aux.py --channels height
+
+The script is fully resumable — tiles that already contain the
+requested channels are skipped, and progress is printed every 50 tiles.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from threading import Lock
+
+import numpy as np
+
+# Allow running from repo root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import threading as _threading
+
+from imint.training.skg_grunddata import (
+    fetch_volume_tile,
+    fetch_basal_area_tile,
+    fetch_diameter_tile,
+    fetch_tree_height_tile,
+)
+from imint.training.copernicus_dem import fetch_dem_tile
+from imint.data.cdse_vpp import fetch_vpp_tiles
+from imint.training.slu_markfukt import fetch_markfukt_tile
+from imint.training.tile_bbox import resolve_fetch_bbox
+
+
+# ── Global CDSE rate limiter ─────────────────────────────────────────────
+# Sliding-window cap on the number of CDSE Process API fetches per hour.
+# Same pattern as enrich_tiles_rededge.py / add_background_frame.py. Used
+# to spread VPP PU consumption over time when the total fetch count
+# exceeds the monthly free-tier budget. ONLY VPP fetches go through this
+# gate — SKG/DEM/markfukt are free and not throttled.
+_RATE_LOCK = _threading.Lock()
+_RATE_TIMES: list = []
+_RATE_MAX_PER_HOUR = 0  # 0 = unlimited
+
+
+def _set_rate_limit(max_per_hour: int) -> None:
+    global _RATE_MAX_PER_HOUR
+    _RATE_MAX_PER_HOUR = int(max_per_hour)
+
+
+def _wait_for_rate_limit() -> None:
+    if _RATE_MAX_PER_HOUR <= 0:
+        return
+    while True:
+        with _RATE_LOCK:
+            now = time.time()
+            cutoff = now - 3600.0
+            i = 0
+            while i < len(_RATE_TIMES) and _RATE_TIMES[i] <= cutoff:
+                i += 1
+            if i:
+                del _RATE_TIMES[:i]
+            if len(_RATE_TIMES) < _RATE_MAX_PER_HOUR:
+                _RATE_TIMES.append(now)
+                return
+            wait_s = _RATE_TIMES[0] + 3600.0 - now
+        time.sleep(max(1.0, min(wait_s + 0.5, 60.0)))
+
+# ── Channel registry ──────────────────────────────────────────────────────
+# Standard channels: each fetcher returns a single (H, W) float32 array.
+
+def _fetch_markfukt_float(
+    west: float, south: float, east: float, north: float,
+    *,
+    size_px,
+    cache_dir=None,
+) -> np.ndarray:
+    """Wrap ``fetch_markfukt_tile`` so the .npz stores float32 like every
+    other aux channel (height, dem, basal_area, …).
+
+    Encoding in the resulting float32 array:
+        NaN   — nodata / outside Sweden       (raw 0)
+        0–1   — soil moisture probability     (raw 1–100, divided by 100)
+        1.01  — saturated water / lake fill   (raw 101, sentinel above 1.0)
+
+    Keeping water as a >1 sentinel rather than another NaN preserves the
+    "this pixel is water" signal for the model — it's not missing data,
+    it's a definite class. The dataset loader can split the channel into
+    a moisture float plus a water bit if needed.
+    """
+    raw = fetch_markfukt_tile(
+        west, south, east, north,
+        size_px=size_px,
+        cache_dir=cache_dir,
+    )
+    arr = raw.astype(np.float32)
+    arr[(raw == 0) | (raw > 101)] = np.nan   # nodata (incl. 255) → NaN
+    valid = (raw >= 1) & (raw <= 100)
+    arr[valid] = arr[valid] / 100.0   # 1–100 → 0.01–1.00
+    arr[raw == 101] = 1.01           # water → sentinel above moisture range
+    return arr
+
+
+_CHANNEL_FETCHERS = {
+    "height": fetch_tree_height_tile,
+    "volume": fetch_volume_tile,
+    "basal_area": fetch_basal_area_tile,
+    "diameter": fetch_diameter_tile,
+    "dem": fetch_dem_tile,
+    # SLU Markfuktighetskarta (Pirinen 2023) — wrapped to float32 for
+    # consistency with the other aux channels. NaN=nodata, 0-1=moisture,
+    # 1.01=water. See _fetch_markfukt_float docstring.
+    "markfukt": _fetch_markfukt_float,
+}
+
+# VPP is a multi-band channel: one fetch returns 5 bands stored as
+# vpp_sosd, vpp_eosd, vpp_length, vpp_maxv, vpp_minv in the .npz.
+_VPP_BAND_NAMES = ["vpp_sosd", "vpp_eosd", "vpp_length", "vpp_maxv", "vpp_minv"]
+
+ALL_CHANNELS = list(_CHANNEL_FETCHERS.keys()) + ["vpp"]
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+# Straggler years lumped to the nearest enriched year (decided 2026-05-19)
+# — too few tiles (≈8 across both datasets) to warrant their own WEkEO
+# prefetch pass.
+_LUMP_YEAR = {2019: 2018, 2023: 2022}
+
+
+def _tile_year(tile_path: Path) -> int | None:
+    """Return the tile's VPP year — the latest year in its ``dates``,
+    with straggler years lumped to the nearest enriched year.
+
+    ``dates`` holds the multitemporal frame dates; the latest is the
+    growing-season (label) year. Returns None if no date is parseable.
+    """
+    try:
+        with np.load(tile_path, allow_pickle=True) as d:
+            if "dates" not in d.files:
+                return None
+            years = [
+                int(str(s)[:4])
+                for s in np.asarray(d["dates"]).ravel()
+                if len(str(s)) >= 4 and str(s)[:4].isdigit()
+            ]
+    except Exception:
+        return None
+    if not years:
+        return None
+    y = max(years)
+    return _LUMP_YEAR.get(y, y)
+
+
+def _tile_missing_channels(
+    tile_path: Path, channels: list[str], *, force_vpp: bool = False,
+    force: bool = False,
+) -> list[str]:
+    """Return list of requested channels missing from the tile.
+
+    For "vpp", checks whether all 5 VPP sub-bands are present. With
+    ``force_vpp`` "vpp" is always reported missing — for year-matched
+    re-enrichment that must overwrite an existing (wrong-year) VPP.
+
+    With ``force`` EVERY requested channel is reported missing regardless of
+    presence — used to OVERWRITE already-stored-but-wrong channels (e.g. the
+    256/512 aux-misalignment), re-fetching them at the now-correct bbox. The
+    per-tile rewrite stays atomic (tmp + rename).
+    """
+    if force:
+        return list(channels)
+    try:
+        with np.load(tile_path, allow_pickle=True) as d:
+            missing = []
+            for ch in channels:
+                if ch == "vpp":
+                    # VPP is present only if all 5 sub-bands exist
+                    if force_vpp or not all(
+                            b in d for b in _VPP_BAND_NAMES):
+                        missing.append("vpp")
+                elif ch not in d:
+                    missing.append(ch)
+            return missing
+    except Exception:
+        return channels
+
+
+def _add_channels_to_tile(
+    tile_path: Path,
+    channels: list[str],
+    cache_dirs: dict[str, Path | None],
+    *,
+    year: int | None = None,
+    force: bool = False,
+) -> dict:
+    """Fetch missing channels and write them into an existing .npz tile.
+
+    The tile is rewritten atomically (tmp → rename) to avoid corruption.
+    With ``force`` the requested channels are re-fetched and overwritten even
+    if already present (corrects wrong-grid aux).
+    """
+    # Load existing tile data
+    with np.load(tile_path, allow_pickle=True) as d:
+        # Re-check which channels are actually missing (or all, when overwriting)
+        missing = list(channels) if force else [ch for ch in channels if ch not in d]
+        if not missing:
+            return {"status": "skip", "tile": tile_path.name}
+        existing = dict(d)
+
+    # Output size + bbox — via the shared SSOT resolver. resolve_fetch_bbox
+    # derives size_px from the tile's own spectral grid and rebuilds the bbox
+    # extent to match it (10 m GSD), so ground extent is ALWAYS coupled to output
+    # pixels. This is the ONE place tile-aligned aux geometry is resolved — no
+    # local --patch-size-m / _bbox_from_tile math (that decoupling rendered the
+    # central 2560 m of each 512 px tile at 5 m/px — the 256/512 aux-misalignment).
+    bbox, size_px = resolve_fetch_bbox(name=tile_path.stem, npz_data=existing)
+    if bbox is None:
+        return {"status": "fail", "tile": tile_path.name,
+                "error": "could not resolve tile bbox"}
+    h_px = w_px = size_px
+    west, south, east, north = (
+        bbox["west"], bbox["south"], bbox["east"], bbox["north"])
+
+    # Fetch each missing channel
+    fetched = {}
+    for ch_name in missing:
+        if ch_name == "vpp":
+            # VPP: multi-band fetch → 5 sub-bands. CDSE-billed, gate
+            # through the global rate limiter so total PU spending
+            # stays under --max-per-hour. SKG/DEM/markfukt are free
+            # and bypass this gate.
+            _wait_for_rate_limit()
+            vpp_kwargs: dict = {
+                "size_px": (h_px, w_px),
+                "cache_dir": cache_dirs.get("vpp"),
+            }
+            if year is not None:
+                vpp_kwargs["year"] = year
+            vpp_data = fetch_vpp_tiles(
+                west, south, east, north, **vpp_kwargs,
+            )
+            for raw_name, arr in vpp_data.items():
+                key = f"vpp_{raw_name}"
+                existing[key] = arr
+                fetched[key] = {
+                    "mean": float(arr.mean()),
+                    "max": float(arr.max()),
+                    "nonzero_pct": float((arr > 0).mean() * 100),
+                }
+        else:
+            # Standard single-band channel
+            fetcher = _CHANNEL_FETCHERS[ch_name]
+            data = fetcher(
+                west, south, east, north,
+                size_px=(h_px, w_px),
+                cache_dir=cache_dirs.get(ch_name),
+            )
+            existing[ch_name] = data
+            # nan-aware stats — markfukt encodes nodata as NaN, which
+            # would poison plain mean()/max(). Other channels are
+            # NaN-free so this is a safe drop-in.
+            fetched[ch_name] = {
+                "mean": float(np.nanmean(data)) if data.size else 0.0,
+                "max": float(np.nanmax(data)) if data.size else 0.0,
+                "nonzero_pct": float((data > 0).mean() * 100),
+            }
+
+    # Atomic rewrite
+    tmp = tile_path.parent / (tile_path.stem + "_tmp.npz")
+    np.savez_compressed(tmp, **existing)
+    tmp.rename(tile_path)
+
+    return {
+        "status": "ok",
+        "tile": tile_path.name,
+        "channels": fetched,
+    }
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Prefetch auxiliary channels for training tiles",
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default="data/lulc_full",
+        help="Training data directory (default: data/lulc_full)",
+    )
+    parser.add_argument(
+        "--channels", nargs="+", default=ALL_CHANNELS,
+        choices=ALL_CHANNELS,
+        help=f"Channels to prefetch (default: all = {' '.join(ALL_CHANNELS)})",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Number of parallel download threads (default: 4)",
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable tile caching",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Re-fetch and OVERWRITE the requested channels even if already "
+             "present. Use to correct already-stored-but-wrong channels (e.g. "
+             "the 256/512 aux-misalignment). Per-tile rewrite stays atomic.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Only count tiles needing channels, don't fetch",
+    )
+    parser.add_argument(
+        "--max-per-hour", type=int, default=0,
+        help="Global cap on CDSE Process API fetches per hour (sliding "
+             "window across all workers). 0 (default) = no cap. Only "
+             "affects VPP — SKG/DEM/markfukt are free and bypass.",
+    )
+    parser.add_argument(
+        "--year", type=int, default=None,
+        help="Year-matched VPP mode: process only tiles whose `dates` "
+             "year equals this (stragglers lumped), fetch VPP for this "
+             "year, and overwrite any existing (wrong-year) VPP.",
+    )
+    args = parser.parse_args()
+
+    _set_rate_limit(args.max_per_hour)
+
+    channels = args.channels
+    data_dir = Path(args.data_dir)
+    # Support both layouts:
+    #   1. legacy "lulc_full/tiles/<tile>.npz" (data_dir = data/lulc_full)
+    #   2. unified "unified_v2/<tile>.npz"     (data_dir = data/unified_v2)
+    # Pick whichever has .npz files. The cache dir always lives under
+    # data_dir.
+    tiles_dir = data_dir / "tiles"
+    if not tiles_dir.exists() or not any(tiles_dir.glob("*.npz")):
+        # Fall back to data_dir itself — the unified layout.
+        tiles_dir = data_dir
+
+    # Build per-channel cache dirs (always under data_dir, not tiles_dir,
+    # so caches are shared across crop_/urban_/tile_ naming conventions).
+    cache_dirs: dict[str, Path | None] = {}
+    for ch in channels:
+        if args.no_cache:
+            cache_dirs[ch] = None
+        else:
+            cache_dirs[ch] = data_dir / "cache" / ch
+
+    if not tiles_dir.exists():
+        print(f"ERROR: Tiles directory not found: {tiles_dir}")
+        sys.exit(1)
+
+    # ── Scan tiles ──
+    # Match all naming conventions: tile_*, crop_*, urban_*, plus legacy
+    # numeric-only names (e.g. "43963942.npz" from the original 256 dataset).
+    all_tiles = sorted(tiles_dir.glob("*.npz"))
+    print(f"Found {len(all_tiles)} tiles in {tiles_dir}")
+    print(f"Channels: {', '.join(channels)}")
+
+    # Year-matched mode: keep only tiles of the requested year.
+    if args.year is not None:
+        all_tiles = [
+            tp for tp in all_tiles if _tile_year(tp) == args.year
+        ]
+        print(f"  --year {args.year}: {len(all_tiles)} matching tiles")
+
+    # Filter to tiles missing at least one requested channel
+    print("Scanning for tiles with missing channels...")
+    todo: list[tuple[Path, list[str]]] = []
+    already = 0
+    for tp in all_tiles:
+        missing = _tile_missing_channels(
+            tp, channels, force_vpp=(args.year is not None), force=args.force)
+        if missing:
+            todo.append((tp, missing))
+        else:
+            already += 1
+
+    print(f"  Already complete: {already}")
+    print(f"  Need fetching:    {len(todo)}")
+
+    if todo:
+        # Show breakdown by channel
+        ch_counts: dict[str, int] = {ch: 0 for ch in channels}
+        for _, missing in todo:
+            for ch in missing:
+                ch_counts[ch] += 1
+        for ch, count in ch_counts.items():
+            print(f"    {ch}: {count} tiles")
+
+    if not todo:
+        print(f"\nAll tiles already have all requested channels. Nothing to do!")
+        return
+
+    if args.dry_run:
+        print(f"\n[dry-run] Would fetch channels for {len(todo)} tiles.")
+        return
+
+    # ── Progress tracking ──
+    progress_file = data_dir / "aux_prefetch_progress.json"
+    progress_lock = Lock()
+    stats = {"ok": 0, "skip": 0, "fail": 0, "total": len(todo)}
+    t_start = time.time()
+
+    def _save_progress():
+        elapsed = time.time() - t_start
+        done = stats["ok"] + stats["skip"]
+        rate = done / max(elapsed, 0.01)
+        remaining = (len(todo) - done) / max(rate, 0.001)
+        with open(progress_file, "w") as f:
+            json.dump({
+                **stats,
+                "channels": channels,
+                "elapsed_s": round(elapsed, 1),
+                "rate_tiles_per_s": round(rate, 2),
+                "eta_s": round(remaining, 0),
+            }, f, indent=2)
+
+    # ── Parallel fetch ──
+    print(f"\nFetching {', '.join(channels)} for {len(todo)} tiles "
+          f"({args.workers} workers)...")
+    for ch in channels:
+        print(f"  {ch} cache: {cache_dirs[ch] or 'disabled'}")
+    print()
+
+    def _worker(item):
+        tile_path, missing = item
+        try:
+            return _add_channels_to_tile(
+                tile_path, missing, cache_dirs, year=args.year,
+                force=args.force)
+        except Exception as e:
+            return {
+                "status": "fail",
+                "tile": tile_path.name,
+                "error": f"{type(e).__name__}: {e}",
+            }
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_worker, item): item for item in todo}
+
+        for i, future in enumerate(as_completed(futures), 1):
+            result = future.result()
+            status = result["status"]
+
+            with progress_lock:
+                stats[status] = stats.get(status, 0) + 1
+
+            if status == "fail":
+                print(f"  ✗ {result['tile']}: {result.get('error', '?')}")
+            elif status == "ok" and i <= 5:
+                # Show first few successes
+                ch_info = result.get("channels", {})
+                parts = []
+                for ch_name, ch_stats in ch_info.items():
+                    parts.append(
+                        f"{ch_name}={ch_stats['mean']:.1f}"
+                        f"(nz={ch_stats['nonzero_pct']:.0f}%)"
+                    )
+                print(f"  ✓ {result['tile']}: {', '.join(parts)}")
+
+            # Progress every 50 tiles
+            if i % 50 == 0 or i == len(todo):
+                elapsed = time.time() - t_start
+                rate = i / max(elapsed, 0.01)
+                eta = (len(todo) - i) / max(rate, 0.001)
+                print(f"  [{i}/{len(todo)}] "
+                      f"{stats['ok']} ok, {stats['fail']} fail — "
+                      f"{rate:.1f} tiles/s, "
+                      f"ETA {eta/60:.0f}min")
+                _save_progress()
+
+    # ── Summary ──
+    elapsed = time.time() - t_start
+    _save_progress()
+    print(f"\n{'='*60}")
+    print(f"  Aux channel prefetch complete!")
+    print(f"  Channels: {', '.join(channels)}")
+    print(f"  OK:       {stats['ok']}")
+    print(f"  Skipped:  {stats['skip']}")
+    print(f"  Failed:   {stats['fail']}")
+    print(f"  Time:     {elapsed/60:.1f} min ({elapsed:.0f}s)")
+    print(f"  Rate:     {stats['ok']/max(elapsed, 1):.1f} tiles/s")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

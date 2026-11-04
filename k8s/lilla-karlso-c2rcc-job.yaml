@@ -1,0 +1,140 @@
+---
+# Job: lilla-karlso-c2rcc — Steg 3 av pipelinen.
+#
+# Kör ESA SNAP c2rcc.msi på varje SAFE-arkiv och producerar BEAM-DIMAP.
+# Använder den signerade GHCR-imagen ghcr.io/tobiasedman/imint-c2rcc-snap.
+#
+# Strategi: en init-container klonar repot för att få graph-XML +
+# wrapper-skriptet i container-filsystemet, sedan kör main containern
+# SNAP-graphen direkt utan docker-i-docker.
+#
+# Output på training-data-cephfs:
+#   /data/lilla_karlso_birds/c2rcc_runs/<date>.dim
+#   /data/lilla_karlso_birds/c2rcc_runs/<date>.data/<band>.{img,hdr}
+#
+# Estimerad runtime: 3 scener × ~5 min på native amd64 = ~15 min
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lilla-karlso-c2rcc
+  namespace: prithvi-training-default
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 7200    # 2h
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        # Klona repot till en delad volym så SNAP-imagen får tag i
+        # graph-XML utan att behöva git-klient i SNAP-imagen.
+        - name: fetch-repo
+          image: alpine/git:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              cd /workspace
+              git clone --depth 1 https://github.com/TobiasEdman/imintengine.git imintengine
+              ls imintengine/docker/c2rcc-snap/
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests: {cpu: "100m", memory: "256Mi"}
+            limits:   {cpu: "100m", memory: "256Mi"}
+
+        # Extrahera AOI-WKT från config.py (single source of truth).
+        # Skriver POLYGON-strängen till /workspace/aoi.wkt som main container
+        # läser. Undviker AOI-hardcoding i k8s-yaml som dirfter från Python-config.
+        - name: extract-aoi
+          image: python:3.11.9-slim-bookworm
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              cd /workspace/imintengine
+              python -c "
+              from demos.lilla_karlso_birds.config import BBOX_WGS84 as b
+              w, s, e, n = b['west'], b['south'], b['east'], b['north']
+              wkt = f'POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))'
+              print(wkt)
+              open('/workspace/aoi.wkt', 'w').write(wkt + chr(10))
+              "
+              echo "AOI WKT: $(cat /workspace/aoi.wkt)"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits:   {cpu: "100m", memory: "128Mi"}
+      containers:
+        - name: c2rcc
+          # Pin till digest — :latest är inte trovärdig (SNAP 9-rebuild 2026-05-07,
+          # plus feature-branches tag:as inte som :latest). Pinnat till CI-byggd
+          # image från commit f5337a9, verifierad i k8s mot Lilla Karlsö-SAFE.
+          image: ghcr.io/tobiasedman/imint-c2rcc-snap@sha256:4a2c3217d156a69adddf371eee5511747551911f1cb40fbddf2764a13c0e1aef
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              GRAPH=/workspace/imintengine/docker/c2rcc-snap/c2rcc_msi_graph.xml
+              SAFE_DIR=/data/lilla_karlso_birds/l1c_safes
+              OUT_DIR=/data/lilla_karlso_birds/c2rcc_runs
+              mkdir -p "$OUT_DIR"
+
+              # AOI-WKT extraherad från demos/lilla_karlso_birds/config.py av
+              # extract-aoi-initcontainer. Single source of truth, ingen drift.
+              GEO_REGION=$(cat /workspace/aoi.wkt)
+              echo "[c2rcc] AOI: $GEO_REGION"
+
+              for safe in "$SAFE_DIR"/*.SAFE; do
+                if [ ! -d "$safe" ]; then continue; fi
+                # Extrahera datum från SAFE-namn: S2A_MSIL1C_20250429T100031_*
+                date=$(basename "$safe" | sed -E 's/^S2._MSIL1C_([0-9]{4})([0-9]{2})([0-9]{2}).*$/\1-\2-\3/')
+                out="$OUT_DIR/${date}.dim"
+
+                if [ -f "$out" ]; then
+                  echo "[skip] $date — $out finns redan"
+                  continue
+                fi
+
+                echo ""
+                echo "=== $(date '+%H:%M:%S')  c2rcc.msi → $date ==="
+                /opt/snap/bin/gpt "$GRAPH" \
+                    -PinputSafe="$safe" \
+                    -PgeoRegion="$GEO_REGION" \
+                    -PoutputDim="$out" \
+                    -e || {
+                  echo "ERR vid $date — fortsätter med nästa"
+                  continue
+                }
+
+                echo "[ok] $date — $(du -sh "$OUT_DIR/${date}.data" 2>/dev/null | cut -f1)"
+              done
+
+              echo ""
+              echo "=== Inventory ==="
+              ls -lh "$OUT_DIR"/*.dim 2>/dev/null
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "5Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "5Gi"
+          volumeMounts:
+            - name: training-data
+              mountPath: /data
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: training-data-cephfs
+        - name: workspace
+          emptyDir: {}

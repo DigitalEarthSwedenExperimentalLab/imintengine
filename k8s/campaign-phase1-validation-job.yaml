@@ -1,0 +1,150 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: campaign-phase1-validation
+  namespace: prithvi-training-default
+  labels:
+    app: ensemble-prep
+    purpose: campaign-phase1-validation
+spec:
+  backoffLimit: 0
+  # VALIDATION batch (NOT the full run) for the campaign Phase-1 --no-pre2018
+  # path: re-fetch a few real tiles des-only into a DEBUG dir (the real _recoreg
+  # is untouched). Runs on python:3.11-slim — NO L2A_Process, so l1c_sen2cor is
+  # auto-dead and Phase 1 is STRICTLY des (no sen2cor on >=2018 des-gaps either).
+  # Confirms slim deps import + run on real tiles + cluster before the ~6-7 day
+  # full run: >=2018 slots filled + M2-coreg'd, NO frame_2016, anchor present.
+  # 2018-labelled tiles → temporal_mask [0,1,1,1] (2017 autumn dropped);
+  # 2019+ tiles → [1,1,1,1]. Either way has_frame_2016 == 0.
+  activeDeadlineSeconds: 7200
+  template:
+    metadata:
+      labels:
+        app: ensemble-prep
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-push
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["p02r09srv04", "p02r09srv06"]
+      containers:
+        - name: recoreg
+          # python:3.11-slim (not the sen2cor image): no L2A_Process ⇒
+          # l1c_sen2cor auto-dead ⇒ strictly des-only Phase 1.
+          image: python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              export PYTHONUNBUFFERED=1
+              echo "=== campaign Phase-1 VALIDATION (5 tiles, --no-pre2018, slim) ==="
+              echo "Started: $(date)"
+              apt-get update -qq && apt-get install -y -qq \
+                git python3 python3-pip libgdal-dev gdal-bin > /dev/null 2>&1
+              pip3 install --quiet --no-cache-dir \
+                numpy scipy rasterio pyproj requests Pillow \
+                pystac-client openeo shapely 2>&1 | tail -2
+
+              mkdir -p /workspace && cd /workspace
+              git clone --depth 1 --branch main \
+                https://github.com/TobiasEdman/ImintEngine.git imintengine
+              cd /workspace/imintengine
+              export PYTHONPATH=/workspace/imintengine:${PYTHONPATH:-}
+              echo "CLONED main HEAD: $(git rev-parse --short HEAD)  $(git log --oneline -1)"
+
+              OUT=/data/debug/campaign_phase1_validation
+              rm -rf "$OUT" && mkdir -p "$OUT"
+              echo ""
+              echo "=== refetch 5 tiles, des-only, --no-pre2018, --workers 2 → $OUT ==="
+              python3 scripts/fetch_unified_tiles.py \
+                --mode refetch \
+                --from-existing /data/unified_v2_512 \
+                --output-dir "$OUT" \
+                --tile-size-px 512 \
+                --workers 2 \
+                --fetch-sources des \
+                --no-pre2018 \
+                --force \
+                --max-tiles 5 \
+                2>&1 | tee /tmp/p1val.log
+
+              echo ""
+              echo "=== strict-des check: l1c_sen2cor must NOT have fired ==="
+              if grep -q "l1c_sen2cor" /tmp/p1val.log; then
+                echo "WARN: l1c_sen2cor referenced in log — NOT strictly des:"
+                grep "l1c_sen2cor" /tmp/p1val.log | head
+              else
+                echo "OK — no l1c_sen2cor activity (strictly des on slim)"
+              fi
+
+              echo ""
+              echo "=== VALIDATE Phase-1 layout (all output tiles) ==="
+              python3 - <<'PYEOF'
+              import glob, numpy as np
+              outs = sorted(glob.glob("/data/debug/campaign_phase1_validation/*.npz"))
+              print(f"output tiles: {len(outs)}")
+              assert outs, "no output tiles written!"
+              for p in outs:
+                  d = np.load(p, allow_pickle=True)
+                  assert d["spectral"].shape == (24, 512, 512), (p, d["spectral"].shape)
+                  assert int(d.get("has_frame_2016", 0)) == 0, f"{p} HAS frame_2016!"
+                  assert "coreg_ref_frame" in d.files, f"{p} missing anchor"
+                  ge2018 = sum(1 for s in d["dates"] if str(s)[:4] >= "2018")
+                  assert int(d["temporal_mask"].sum()) == ge2018, (
+                      p, list(d["dates"]), list(d["temporal_mask"]))
+                  print(f"  {p.split('/')[-1]}: mask={list(d['temporal_mask'])} "
+                        f"dates={[str(s)[:7] for s in d['dates']]} "
+                        f"coreg_m2={int(d.get('coreg_m2', 0))}")
+              print("VALIDATION PASS — des-only --no-pre2018: (24,512,512), "
+                    "no frame_2016, anchor present, only >=2018 slots filled")
+              PYEOF
+              echo ""
+              echo "=== validation complete: $(date) ==="
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: CDSE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cdse-credentials
+                  key: client_id
+                  optional: true
+            - name: CDSE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cdse-credentials
+                  key: client_secret
+                  optional: true
+            - name: DES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: des-credentials
+                  key: user
+                  optional: true
+            - name: DES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: des-credentials
+                  key: password
+                  optional: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: training-data
+              mountPath: /data
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: training-data-cephfs

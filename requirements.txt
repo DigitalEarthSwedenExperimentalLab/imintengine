@@ -1,0 +1,3 @@
+# Full developer environment. Minimal consumers install .[fetch] or .[api].
+# Dependency definitions live in pyproject.toml.
+-e .[training,api,viz]

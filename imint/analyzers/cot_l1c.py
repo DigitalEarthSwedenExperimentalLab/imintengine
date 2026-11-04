@@ -1,0 +1,250 @@
+"""
+imint/analyzers/cot_l1c.py — Cloud Optical Thickness on L1C TOA reflectance
+
+12-band variant of imint/analyzers/cot.py. The original analyzer uses the
+Swedish-Forest-Agency (SFA) 11-band model which drops B01 AND B10 — that
+model is intended for L2A surface reflectance (ESA removes B10 when
+producing L2A).
+
+This module uses the **12-band** Pirinen COT model — all 13 standard
+Sentinel-2 bands EXCEPT B01. It keeps B10 (cirrus), so it operates on
+**L1C top-of-atmosphere reflectance** directly. That makes it usable for
+scene-quality ranking BEFORE sen2cor.
+
+torch-optional
+--------------
+The MLP5 is five Linear layers — trivial to evaluate in numpy, so the
+default ``device="cpu"`` path is pure numpy and never imports torch
+(a CPU-only sen2cor runner pod stays free of the ~200 MB torch wheel).
+A ``device="cuda"`` path is available for GPU runner pods: torch is
+imported lazily, only when a CUDA device is requested. On an RTX
+2080 Ti the COT inference is ~113x faster per tile than one CPU core
+(measured 2026-05-19), which collapses the COT-gate wall-time of the
+sen2cor back-fill from hours to minutes.
+The .pt ensemble was converted once (2026-05-17) to a single numpy
+archive ``cot_mlp5_12band_ensemble.npz`` (548 KB) via:
+
+    for mi, p in enumerate(sorted(glob('cot_mlp5_12band_*.pt'))):
+        sd = torch.load(p)
+        for k, v in sd.items():
+            out[f'm{mi}_{k.replace(".","_")}'] = v.numpy()
+    np.savez('cot_mlp5_12band_ensemble.npz', **out)
+
+Provenance:
+    Pirinen et al. "Creating and Leveraging a Synthetic Dataset of Cloud
+    Optical Thickness Measures for Cloud Detection in MSI", Remote Sensing
+    2024. https://github.com/aleksispi/ml-cloud-opt-thick
+    Paper §: synthetic dataset simulates *top-of-atmosphere radiances*,
+    confirming the 12-band model is the TOA/L1C one.
+
+Normalization: the upstream eval script computes input mean/std from
+``trainset_smhi.npy`` at runtime and divides the COT regressor target by
+``gt_max``. Those constants were computed once (2026-05-16) from the SMHI
+synthetic trainset — see COT_MEANS_12 / COT_STDS_12 / COT_GT_MAX.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+# Band order for the 12-band model: all 13 standard S2 bands except B01.
+# B10 (cirrus) is KEPT — it only exists in L1C, which is exactly what we
+# want to score.
+COT_L1C_BAND_ORDER = [
+    "B02", "B03", "B04", "B05", "B06", "B07",
+    "B08", "B8A", "B09", "B10", "B11", "B12",
+]
+
+# Input normalization — computed 2026-05-16 from trainset_smhi.npy
+# (160 000 rows), columns 2..13 (B01 skipped). See module docstring.
+COT_MEANS_12 = np.array([
+    0.49675034, 0.47293043, 0.56490300, 0.52927473, 0.65845986,
+    0.93623101, 0.90515048, 0.99451205, 0.45604575, 0.07375108,
+    0.53309616, 0.43224668,
+], dtype=np.float32)
+COT_STDS_12 = np.array([
+    0.28274442, 0.27778134, 0.28483809, 0.31573642, 0.28173209,
+    0.31942519, 0.32981911, 0.36159493, 0.29364748, 0.11409170,
+    0.41934613, 0.33355380,
+], dtype=np.float32)
+
+# COT regressor target was normalized by this during training; multiply
+# the raw model output by it to get COT back in physical units.
+COT_GT_MAX = 50.0
+
+# COT thresholds (same as the 11-band analyzer — physical COT units).
+DEFAULT_THICK_CLOUD_THRESH = 0.025 * COT_GT_MAX   # ≈ 1.25
+DEFAULT_THIN_CLOUD_THRESH = 0.015 * COT_GT_MAX    # ≈ 0.75
+
+_FM_DIR = Path(__file__).resolve().parent.parent / "fm" / "cot_models_l1c"
+_ENSEMBLE_NPZ = _FM_DIR / "cot_mlp5_12band_ensemble.npz"
+
+
+def load_ensemble_l1c(
+    npz_path: Path | None = None,
+    *,
+    device: str = "cpu",
+) -> list[dict]:
+    """Load the 10-MLP 12-band ensemble as per-model weight dicts.
+
+    Each returned dict has keys ``lin1_weight``/``lin1_bias`` …
+    ``lin5_weight``/``lin5_bias`` — ready for the forward pass in
+    :func:`cot_inference_l1c`.
+
+    With ``device="cpu"`` (default) the weights are float32 numpy arrays
+    and torch is never imported. With a CUDA device string ("cuda",
+    "cuda:0") the weights are returned as torch tensors resident on that
+    device, for the GPU path of :func:`cot_inference_l1c`.
+    """
+    path = npz_path if npz_path is not None else _ENSEMBLE_NPZ
+    if not path.exists():
+        raise FileNotFoundError(
+            f"COT ensemble archive not found: {path}. Regenerate from the "
+            f"cot_mlp5_12band_*.pt weights (see module docstring)."
+        )
+    arch = np.load(path)
+    # Discover model count from the m<N>_ key prefixes.
+    n_models = 1 + max(
+        int(k.split("_", 1)[0][1:]) for k in arch.files
+    )
+    models: list[dict] = []
+    for mi in range(n_models):
+        models.append({
+            layer: arch[f"m{mi}_{layer}"]
+            for layer in (
+                "lin1_weight", "lin1_bias", "lin2_weight", "lin2_bias",
+                "lin3_weight", "lin3_bias", "lin4_weight", "lin4_bias",
+                "lin5_weight", "lin5_bias",
+            )
+        })
+    if device == "cpu":
+        return models
+
+    import torch
+    return [
+        {k: torch.from_numpy(np.ascontiguousarray(v)).to(device)
+         for k, v in m.items()}
+        for m in models
+    ]
+
+
+def _mlp5_forward(x: np.ndarray, m: dict) -> np.ndarray:
+    """Numpy forward pass for one MLP5. x is (N, 12) → returns (N,).
+
+    Mirrors imint.analyzers.cot.MLP5.forward: four ReLU hidden layers,
+    a linear output, then a final ReLU on the single output column.
+    Linear layer: ``y = x @ W.T + b`` (W is (out, in), torch convention).
+    """
+    h = x
+    for i in (1, 2, 3, 4):
+        h = h @ m[f"lin{i}_weight"].T + m[f"lin{i}_bias"]
+        np.maximum(h, 0.0, out=h)
+    out = h @ m["lin5_weight"].T + m["lin5_bias"]   # (N, 1)
+    out = out[:, 0]
+    return np.maximum(out, 0.0)                      # apply_relu on output
+
+
+def _cot_inference_torch(
+    bands: dict[str, np.ndarray],
+    models: list,
+    device: str,
+) -> np.ndarray:
+    """GPU forward — bit-for-bit mirror of the numpy path's arithmetic.
+
+    ``models`` must hold torch tensors already on ``device`` (load via
+    ``load_ensemble_l1c(device=...)``). Returns a numpy COT map so the
+    caller stays device-agnostic.
+    """
+    import torch
+
+    h, w = bands[COT_L1C_BAND_ORDER[0]].shape
+    img = np.stack([bands[b] for b in COT_L1C_BAND_ORDER], axis=-1)
+    x = torch.from_numpy(img.reshape(-1, 12).astype(np.float32)).to(device)
+    means = torch.from_numpy(COT_MEANS_12).to(device)
+    stds = torch.from_numpy(COT_STDS_12).to(device)
+    x = (x - means) / stds
+
+    pred = torch.zeros(x.shape[0], device=device)
+    inv_models = 1.0 / len(models)
+    for m in models:
+        hidden = x
+        for i in (1, 2, 3, 4):
+            hidden = torch.relu(
+                hidden @ m[f"lin{i}_weight"].T + m[f"lin{i}_bias"])
+        out = (hidden @ m["lin5_weight"].T + m["lin5_bias"])[:, 0]
+        pred = pred + torch.relu(out) * inv_models
+
+    cot = (pred * COT_GT_MAX).reshape(h, w)
+    return cot.cpu().numpy().astype(np.float32)
+
+
+def cot_inference_l1c(
+    bands: dict[str, np.ndarray],
+    models: list,
+    *,
+    device: str = "cpu",
+    batch_size: int = 262144,
+) -> np.ndarray:
+    """Run 12-band COT inference on an L1C TOA-reflectance image.
+
+    Args:
+        bands: Dict keyed by COT_L1C_BAND_ORDER, each (H, W) float32 in
+            TOA reflectance [0, 1] (raw L1C DN / 10000).
+        models: Ensemble from ``load_ensemble_l1c`` — numpy weights for
+            ``device="cpu"``, torch tensors for a CUDA device.
+        device: "cpu" for the numpy path, or a torch device string
+            ("cuda", "cuda:0") for the GPU path. Must match the device
+            ``models`` was loaded with.
+        batch_size: Pixels per batch (numpy CPU path only).
+
+    Returns:
+        COT map (H, W) float32 in physical units (denormalized by
+        COT_GT_MAX).
+    """
+    missing = [b for b in COT_L1C_BAND_ORDER if b not in bands]
+    if missing:
+        raise KeyError(f"cot_inference_l1c: missing bands {missing}")
+
+    if device != "cpu":
+        return _cot_inference_torch(bands, models, device)
+
+    h, w = bands[COT_L1C_BAND_ORDER[0]].shape
+    img = np.stack([bands[b] for b in COT_L1C_BAND_ORDER], axis=-1)  # (H,W,12)
+    pixels = img.reshape(-1, 12).astype(np.float32)
+    pixels = (pixels - COT_MEANS_12) / COT_STDS_12
+
+    n = h * w
+    pred_sum = np.zeros(n, dtype=np.float32)
+    inv_models = 1.0 / len(models)
+    for model in models:
+        for i in range(0, n, batch_size):
+            chunk = pixels[i:i + batch_size]
+            pred_sum[i:i + batch_size] += _mlp5_forward(chunk, model) * inv_models
+
+    # Denormalize: training divided the COT target by COT_GT_MAX.
+    return (pred_sum * COT_GT_MAX).reshape(h, w).astype(np.float32)
+
+
+def cloud_score_l1c(
+    bands: dict[str, np.ndarray],
+    models: list,
+    *,
+    device: str = "cpu",
+    thresh: float = DEFAULT_THIN_CLOUD_THRESH,
+) -> dict[str, float]:
+    """Per-tile cloud score for ranking / gating candidate L1C scenes.
+
+    Returns a dict with:
+        mean_cot   — mean COT over the tile. Threshold-free and strictly
+                     monotonic in cloudiness; the value the runner gates
+                     on (lower = cleaner).
+        cloud_frac — fraction of pixels above ``thresh``. Secondary
+                     diagnostic; the absolute threshold is only roughly
+                     calibrated, so prefer mean_cot for decisions.
+    """
+    cot = cot_inference_l1c(bands, models, device=device)
+    return {
+        "mean_cot": float(cot.mean()),
+        "cloud_frac": float((cot > thresh).mean()),
+    }

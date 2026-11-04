@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Build-time, offline smoke for the exact crop-distill model surface."""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import gc
+import importlib.metadata
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+def _release_memory() -> None:
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
+
+
+def _load_script(path: Path) -> None:
+    module_name = f"_smoke_{path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load smoke target {path}")
+    module = importlib.util.module_from_spec(spec)
+    # Dataclasses and some import helpers consult sys.modules while the module
+    # body executes. Mirror normal import machinery, then leave no synthetic
+    # smoke module behind for the next entrypoint check.
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            del sys.modules[module_name]
+        else:
+            sys.modules[module_name] = previous
+
+
+def smoke_nmd_sampler(source_root: Path = Path("/opt/imintengine")) -> None:
+    """Exercise CPU raster sampling on synthetic pixels, with no field data."""
+    import tempfile
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+    from scripts.compare_nmd2023_nfi import sample_nmd_unified
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "synthetic-nmd.tif"
+        with rasterio.open(path, "w", driver="GTiff", height=1, width=2,
+                           count=1, dtype="uint16", crs="EPSG:3006",
+                           transform=from_origin(100000, 6500000, 10, 10), nodata=0) as dst:
+            dst.write(np.array([[111, 112]], dtype=np.uint16), 1)
+        classes, raw = sample_nmd_unified(str(path), [100005, 100015], [6499995, 6499995])
+        assert raw.tolist() == [111, 112]
+        assert classes.tolist() == [1, 2]
+        import json
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, str(source_root / "scripts/nfi_nmd_coverage.py")],
+            input=json.dumps({"baselines": {"NMD2023": str(path)},
+                              "coordinates": [[100005,6499995], [100015,6499995], [0,0]]}),
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
+        assert json.loads(result.stdout) == {"NMD2023": [True, True, False]}
+    print({"status": "ok", "environment": "nmd-sampler", "pixels": 2})
+
+
+def smoke_checkpoint_metadata(source_root: Path = Path("/opt/imintengine")) -> None:
+    """Exercise safe CPU meta loading in the real model environment."""
+    import json
+    import subprocess
+    import tempfile
+    import torch
+    from imint.eval.fieldtruth import sha256_file
+
+    with tempfile.TemporaryDirectory() as directory:
+        private = Path(directory) / "private"
+        private.mkdir(mode=0o700)
+        checkpoint = Path(directory) / "synthetic.pt"
+        torch.save({"config": {"enabled_aux_names": ["dem"], "n_aux_channels": 1},
+                    "model_state_dict": {"lidar_branch.net.0.conv.weight": torch.ones(2, 1, 3, 3)}}, checkpoint)
+        cells = {"clay_r1": {"checkpoint": {"path": str(checkpoint),
+                 "bytes": checkpoint.stat().st_size, "sha256": sha256_file(checkpoint)}}}
+        result = subprocess.run(
+            [sys.executable, str(source_root / "scripts/nfi_checkpoint_inputs.py")],
+            input=json.dumps(cells), text=True, capture_output=True, check=True,
+            env={**os.environ, "TMPDIR": str(private), "CUDA_VISIBLE_DEVICES": ""})
+        contract = json.loads(result.stdout)["cells"]["clay_r1"]
+        assert contract["enabled_aux_names"] == ["dem"] and contract["n_aux_channels"] == 1
+    print({"status": "ok", "environment": "checkpoint-metadata", "device": "meta"})
+
+
+def smoke_model() -> None:
+    import numpy
+    import terratorch
+    import timm
+    import torch
+    import torchgeo
+    import torchvision
+
+    # Lock/install parity for the CVE gate: the built venv must carry the
+    # patched torch (GHSA-53q9-r3pm-6pq6 <=2.5.1, GHSA-63cw-57p8-fm3p
+    # <=2.9.1) — a rebuilt image with a stale lock fails here, at build.
+    assert torch.__version__.startswith("2.10."), (
+        f"patched torch >=2.10 required, venv has {torch.__version__}")
+    from claymodel.module import ClayMAEModule  # noqa: F401
+    from use_croma import PretrainedCROMA  # noqa: F401
+
+    from imint.fm.loaders.clay import load_clay
+    from imint.fm.loaders.croma import load_croma
+    from imint.fm.loaders.terramind import load_terramind
+
+    expected_versions = {
+        "numpy": "2.2.6",
+        "terratorch": "1.2.11",
+        "timm": "1.0.15",
+        "torch": "2.10.0+cu126",
+        "torchgeo": "0.8.1",
+        "torchvision": "0.25.0+cu126",
+    }
+    actual_versions = {
+        package: importlib.metadata.version(package)
+        for package in expected_versions
+    }
+    assert actual_versions == expected_versions, actual_versions
+    assert numpy.__version__ == "2.2.6"
+    assert all(
+        module is not None
+        for module in (terratorch, timm, torchgeo, torchvision)
+    )
+
+    # This is the reconstruction path used immediately before the exact rung
+    # checkpoint is restored. It must build the upstream graph without making
+    # a hidden network call for upstream pretraining weights.
+    croma = load_croma(pretrained=False, img_size=120)
+    assert croma.modality == "both"
+    assert croma.num_patches == 225
+    for attribute in ("s1_encoder", "s2_encoder", "cross_encoder"):
+        assert hasattr(croma, attribute), attribute
+    del croma
+    _release_memory()
+
+    terramind = load_terramind(pretrained=False, img_size=16)
+    assert isinstance(terramind, torch.nn.Module)
+    del terramind
+    _release_memory()
+
+    clay = load_clay(pretrained=False, img_size=16)
+    assert hasattr(clay, "encoder")
+    assert getattr(clay.encoder, "mask_ratio", None) == 0.0
+    del clay
+    _release_memory()
+
+    source_root = Path("/opt/imintengine")
+    for relative in (
+        "scripts/crop_distill_protocol.py",
+        "scripts/crop_distill_provenance.py",
+        "scripts/extract_plot_features.py",
+        "scripts/run_crop_distill_job.py",
+    ):
+        path = source_root / relative
+        compile(path.read_text(encoding="utf-8"), relative, "exec")
+
+    smoke_nmd_sampler()
+    smoke_checkpoint_metadata()
+    print({"status": "ok", "environment": "model", **actual_versions})
+
+
+def smoke_scoring() -> None:
+    # Do not let a transitive import blur the environment boundary: this
+    # runtime is intentionally CPU-only and contains no model framework.
+    assert "torch" not in sys.modules
+    import numpy
+    import pandas
+    import pyarrow
+    import scipy
+    import sklearn
+
+    expected_versions = {
+        "numpy": "1.26.4",
+        "pandas": "2.2.2",
+        "pyarrow": "17.0.0",
+        "scikit-learn": "1.5.1",
+        "scipy": "1.15.2",
+    }
+    actual_versions = {
+        package: importlib.metadata.version(package)
+        for package in expected_versions
+    }
+    assert actual_versions == expected_versions, actual_versions
+    assert numpy.__version__ == "1.26.4"
+    assert all(
+        module is not None for module in (pandas, pyarrow, scipy, sklearn)
+    )
+
+    source_root = Path("/opt/imintengine")
+    sys.path.insert(0, str(source_root / "scripts"))
+    for relative in (
+        "scripts/atomic_npz.py",
+        "scripts/build_lucas_crop_split.py",
+        "scripts/crop_distill_protocol.py",
+        "scripts/crop_distill_provenance.py",
+        "scripts/crop_source_access.py",
+        "scripts/nfi_head_cv.py",
+        "scripts/run_lucas_crop_split_job.py",
+        "scripts/validate_against_nfi.py",
+        "scripts/prepare_nfi_holdout.py",
+        "scripts/ladder_fieldtruth_standings.py",
+    ):
+        _load_script(source_root / relative)
+    assert "torch" not in sys.modules
+    print({"status": "ok", "environment": "scoring", **actual_versions})
+
+
+def smoke_preparation(source_git_sha: str) -> None:
+    """Verify the actual sealed CPU runtime without reading field data."""
+    from scripts.prepare_nfi_holdout import preparation_runtime
+
+    result = preparation_runtime(
+        Path("/opt/imintengine"), Path("/opt/provenance/runtime.json"),
+        source_git_sha, "local-build@sha256:" + "0" * 64)
+    assert result["source"]["git_sha"] == source_git_sha
+    assert "torch" not in sys.modules
+    print({"status": "ok", "environment": "nfi-preparation",
+           "source_git_sha": source_git_sha})
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("environment", choices=("model", "scoring", "preparation"))
+    parser.add_argument("--source-git-sha")
+    args = parser.parse_args()
+    if args.environment == "preparation" and not args.source_git_sha:
+        parser.error("preparation requires --source-git-sha")
+    if args.environment == "model":
+        smoke_model()
+    elif args.environment == "scoring":
+        smoke_scoring()
+    else:
+        smoke_preparation(args.source_git_sha)
+
+
+if __name__ == "__main__":
+    main()

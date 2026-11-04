@@ -1,0 +1,141 @@
+---
+# Aux pass for the 230 NFI top-up tiles (task 0105, IM-022 follow-up).
+#
+# The 230 top-up tiles in /data/unified_v2_512_nfi{2018,2019,2021,2022}_staging
+# are marked aux_complete=0 by k8s/nfi-topup-enrich-job.yaml (Tobias
+# 2026-10-12, option a: never zero-fill). Read-only probe 2026-10-19: height
+# is absent on all 230 (Trädhöjd was not yet in the mirror); markfukt is
+# absent on 4 and grunddata on 1, where the mirror has no valid pixel; the
+# other channels are present. Trädhöjd is now staged county by county
+# (#85). Per root, scripts/skg_aux_pass.py reads every absent or
+# empty channel from the mirror on the tile's own grid, writes it, records
+# aux_provenance (county rasters, their sha256 and source dates, omdrev per
+# pixel, git sha) and sets the flags in the same atomic rewrite:
+# aux_complete=1 when all five are present, otherwise aux_complete=0 with
+# aux_missing and a dated aux_gap_reason naming each genuine gap. Nothing is
+# zero-filled. Per-tile outcomes: /data/manifests/nfi<Y>_topup_aux_pass.json.
+#
+# This replaces the "rerun nfi-topup-enrich" plan in that Job's header: it is
+# pinned to d4d24f9, which predates the mirror, and its marking step would
+# stamp remaining gaps "pending_IM-022". S1 there is already done.
+#
+# Run only after skg-open-stage-tradhojd has finished: a county not yet in
+# the Trädhöjd mosaic is recorded as a height gap. The log prints the staged
+# counties first. The mirror is only read (no MANIFEST.lock); tiles are
+# written. The tile count per root must not change. Re-running is safe:
+# complete tiles are left byte-identical, and a later run fills recorded
+# gaps once their county is staged. Afterwards run the census
+# (k8s/nfi-topup-census-job.yaml, under a new name).
+#
+# Code pin: IMINT_COMMIT (full sha) and IMINT_SCRIPT_SHA256 (sha256 of
+# scripts/skg_aux_pass.py at that commit); the pod refuses to run if either
+# check fails.
+#
+# 2026-10-21: repinned from eded310 to 1eb8492 (#94, #95). Trädhöjd county
+# 24's tile 720_76 is truncated upstream (~39 km² unreadable). Its gaps are
+# recorded on the county's manifest record, and from #94 read_tradhojd
+# refuses a window touching them. eded310's reader predates that and would
+# have written height 0 there. The preflight below refuses to run unless the
+# pinned reader knows recorded gaps (skg_open.tradhojd_gaps) and county 24's
+# gaps are on record: apply the Trädhöjd Job once after its run, which
+# backfills them, before this one.
+#
+# 2026-10-22: repinned to a9ee558. Height nodata is NaN, not 0 (Tobias:
+# NaN where data is missing, outside the county masks too, no water class).
+# --max-missing-share 0.25 (Tobias 2026-10-22) makes height a gap when more
+# than a quarter of its in-county cells are NaN. That separates county 25's
+# coverage gaps (9 top-up tiles at 100 %, 1 at 61 %) from coastal tiles whose
+# county polygon includes sea (12-16 %). NaN at sea or abroad outside every
+# county never counts.
+# 0f3fd26 (Codex review of #101): a valid all-0 height (no trees) is written,
+# not dropped as empty; only a window without a finite height is a gap. The preflight also requires every staged Trädhöjd county to be
+# masked to its county (#96: county 23's zeros covered 20-22) and county 24's
+# re-derived without the retired all-zero rule, which the Trädhöjd Job does on
+# its next apply.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nfi-topup-aux-pass
+  namespace: prithvi-training-default
+  labels: {app: fieldtruth-prep, purpose: nfi-topup}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 28800
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: fieldtruth-prep}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # p02r09srv04 + srv06 fail pod-sandbox creation (runc bug)
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["p02r09srv04", "p02r09srv06"]
+      containers:
+        - name: aux
+          image: python:3.11-slim@sha256:5be45dbade29bebd6886af6b438fd7e0b4eb7b611f39ba62b430263f82de36d2
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              export PYTHONUNBUFFERED=1
+              echo "=== nfi-topup-aux-pass — $(date -u) ==="
+              apt-get update -qq && apt-get install -y -qq git libexpat1 >/dev/null 2>&1
+              pip install -q --no-cache-dir numpy rasterio pyproj
+              mkdir -p /workspace && cd /workspace
+              git init -q ie && cd ie
+              git fetch -q --depth 1 https://github.com/TobiasEdman/ImintEngine.git "${IMINT_COMMIT}"
+              git checkout -q FETCH_HEAD
+              export IMINT_GIT_SHA="$(git rev-parse HEAD)"
+              test "${IMINT_GIT_SHA}" = "${IMINT_COMMIT}"
+              echo "${IMINT_SCRIPT_SHA256}  scripts/skg_aux_pass.py" | sha256sum -c -
+              echo "HEAD: ${IMINT_GIT_SHA}"
+              python - <<'PY'
+              import json
+              from imint.training import skg_open
+              m = json.load(open("/data/skg_open/MANIFEST.json"))
+              print(f"Trädhöjd counties staged: {sorted(skg_open.staged_tradhojd_counties(m))}")
+              gaps = skg_open.tradhojd_gaps(m)     # a reader without it returns a gap as height 0
+              print(f"Trädhöjd upstream gaps on record: {gaps}")
+              assert any(c == "24" for c, _ in gaps), \
+                  "county 24's upstream gaps are not on record: apply the Trädhöjd Job (backfill) first"
+              th = {k: v for k, v in m["derived"].items() if k.startswith("tradhojd/tradhojd_10m_") and k.endswith(".tif")}
+              unmasked = sorted(k for k, v in th.items() if "county_mask" not in v)
+              assert not unmasked, f"not masked to their county: {unmasked}; apply the Trädhöjd Job first"
+              assert not th["tradhojd/tradhojd_10m_24.tif"].get("all_zero_cells_nodata"), \
+                  "county 24 is still derived under the retired all-zero rule: apply the Trädhöjd Job (re-derives it) first"
+              print(f"Trädhöjd counties masked: {len(th)}; county 24 re-derived")
+              PY
+              RC=0
+              for Y in ${YEARS}; do
+                ROOT=/data/unified_v2_512_nfi${Y}_staging
+                [ -d "${ROOT}" ] || { echo "${Y}: no staging root"; RC=1; continue; }
+                BEFORE=$(find "${ROOT}" -maxdepth 1 -type f -name '*.npz' | wc -l)
+                echo ""; echo "######## ${Y}: ${BEFORE} tiles ########"
+                python scripts/skg_aux_pass.py --data-dir "${ROOT}" \
+                  --report "/data/manifests/nfi${Y}_topup_aux_pass.json" --workers 8 \
+                  --max-missing-share 0.25 || RC=1
+                AFTER=$(find "${ROOT}" -maxdepth 1 -type f -name '*.npz' | wc -l)
+                [ "${BEFORE}" = "${AFTER}" ] || { echo "FAIL: tile count changed in ${ROOT}"; RC=1; }
+              done
+              echo "=== done (exit ${RC}): $(date -u) ==="
+              exit ${RC}
+          env:
+            - {name: IMINT_COMMIT, value: "0f3fd26147c0b0546865f4b796bdd1576a714fdd"}
+            - {name: IMINT_SCRIPT_SHA256, value: "793f67648455571873b7d4afecee581238de9067c464ba0bbe8d0cb9f1e89330"}
+            - {name: YEARS, value: "2018 2019 2021 2022"}
+            - {name: GDAL_CACHEMAX, value: "512"}
+          resources:
+            requests: {cpu: "8", memory: "16Gi"}
+            limits: {cpu: "8", memory: "16Gi"}
+          volumeMounts:
+            - {name: d, mountPath: /data}
+      volumes:
+        - name: d
+          persistentVolumeClaim: {claimName: training-data-cephfs}

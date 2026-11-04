@@ -1,0 +1,158 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: refetch-late-autumn-512
+  namespace: prithvi-training-default
+  labels:
+    app: ensemble-prep
+    purpose: refetch-vpp-bug-affected-tiles
+spec:
+  # 2026-05-26: bumped 1 → 10 after h2hz9 evicted by TaintManager when
+  # training-dashboard re-scheduled to same node (srv01). With nodeSelector
+  # pinning us to srv01 (training-checkpoints RWO) and no priorityClass,
+  # any RWO-bound workload that lands on srv01 can evict us. backoffLimit
+  # of 10 means the Job survives ~10 such evictions before declaring
+  # FAILED. See also: priorityClass + RWX audit migration (next iteration).
+  backoffLimit: 10
+  # Re-fetches the 4136 tiles in 512-set that have a growing-season
+  # frame with DOY > 244 (pre-PR#15 VPP-window bug). Uses the now-
+  # capped compute_growing_season_windows so the new fetches stay
+  # within DOY 88-244 per tile.
+  #
+  # IMPORTANT: must run AFTER enrich-b08 completes — both modify the
+  # same /cephfs/unified_v2_512 tiles via atomic-replace, race
+  # condition possible if concurrent.
+  # activeDeadlineSeconds intentionally omitted — let job run to completion.
+  # Empirical rate ~64 ok/h via 6 workers projects ~60h for 4136 tiles.
+  # Backstop is backoffLimit=1; if pod crashes, Job won't keep retrying forever.
+  template:
+    metadata:
+      labels:
+        app: ensemble-prep
+    spec:
+      restartPolicy: Never
+      # 2026-05-26: nodeSelector removed. Was pinned to srv01 because
+      # training-checkpoints (RWO, rook-ceph-rbd) is mounted there, which
+      # made us subject to TaintManager eviction whenever training-dashboard
+      # re-scheduled to same node. Audit JSON is now read from /cephfs
+      # (RWX, rook-ceph-fs) so we can land on any node with the cephfs
+      # CSI driver. Avoids the Multi-Attach issue noted in the old
+      # comment — checkpoints is no longer mounted at all.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["p02r09srv04", "p02r09srv06"]
+      containers:
+        - name: refetch
+          image: python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              export PYTHONUNBUFFERED=1
+              echo "=== Re-fetch late-autumn-affected 512-tiles ==="
+              apt-get update -qq && apt-get install -y -qq git libgdal-dev gdal-bin > /dev/null 2>&1
+              pip install --quiet --no-cache-dir \
+                numpy scipy rasterio requests pyproj pyyaml Pillow httpx openeo \
+                xarray netCDF4
+
+              mkdir -p /workspace && cd /workspace
+              git clone --depth 1 --branch fix/refetch-late-autumn-frames \
+                https://github.com/TobiasEdman/ImintEngine.git imintengine
+              cd /workspace/imintengine
+              pip install --no-cache-dir -e . --no-deps 2>/dev/null || true
+
+              # Audit JSON: read from /cephfs/audits/ (RWX) so this pod
+              # can run on any node. The canonical /checkpoints/audits/
+              # location (RWO, srv01-bound) is no longer mounted here —
+              # see init-container in /scripts/copy-audit-to-cephfs.sh
+              # for the one-shot copy, or just exec the copy manually
+              # before submitting.
+              AUDIT=$(ls -t /cephfs/audits/frame_audit_512_*.json 2>/dev/null | head -1)
+              if [ -z "$AUDIT" ]; then
+                echo "FATAL: no audit JSON found under /cephfs/audits/"
+                echo "Run: kubectl exec <pod with both mounts> -- cp /checkpoints/audits/frame_audit_512_*.json /cephfs/audits/"
+                exit 1
+              fi
+              ls -lh "$AUDIT"
+              echo ""
+
+              # 2026-05-25: switched primary source DES → CDSE openEO
+              # after DES openEO backend degraded for hours (HTTP-frontend
+              # green, process-graph stalled). CDSE openEO uses a separate
+              # monthly credit pool from the SH Process PU pool and is on
+              # an independent backend. DES kept in race as opportunistic
+              # secondary; race-bug fix (commit bbea8af) prevents DES hangs
+              # from blocking tile completion.
+              # 2026-05-26b: workers back to 6 with DES semaphore raised
+              # to 6 concurrent (commit applied). CDSE openEO stays at
+              # single-flight (hard cap), so 5 of 6 workers will block
+              # briefly on the CDSE slot but their parallel DES attempt
+              # still runs — net effect is ~6× DES parallelism + 1 CDSE
+              # slot, with race-bug fix preventing DES hangs from
+              # blocking tile completion.
+              python3 scripts/refetch_affected_tiles.py \
+                --audit-json "$AUDIT" \
+                --output-dir /cephfs/unified_v2_512 \
+                --tile-size-px 512 \
+                --workers 6 \
+                --sources des \
+                --cloud-max 30.0
+              # 2026-05-26d: cdse-openeo back in --sources with new
+              # session-scoped 402-guard (credit_guard module). First
+              # PaymentRequired in this pod marks CDSE dead for the rest
+              # of the pod lifetime; all subsequent dispatch falls
+              # straight through to DES with no HTTP roundtrip wasted.
+              # On next pod restart (eviction, fresh deploy, monthly
+              # credit reset window) we retry CDSE and stay on it as
+              # long as it works — no scheduled cron-swap needed.
+
+              echo ""
+              echo "=== done ==="
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # 2026-06-02: service account sh-e…920e is dead (token endpoint
+            # returns 401 invalid_client — secret rotated/revoked on CDSE
+            # side). _connect_cdse() now tries client_credentials first and
+            # falls through to the account password flow (cdse-public) on
+            # failure. client_id/secret kept so fix #1 (regenerate the
+            # service account) is a pure value-update of these two keys.
+            - name: CDSE_CLIENT_ID
+              valueFrom:
+                secretKeyRef: {name: cdse-credentials, key: client_id, optional: true}
+            - name: CDSE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: cdse-credentials, key: client_secret, optional: true}
+            # CDSE account login (resource-owner password) — active auth path
+            # until the service account is restored.
+            - name: CDSE_USER
+              valueFrom:
+                secretKeyRef: {name: cdse-credentials, key: user, optional: true}
+            - name: CDSE_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: cdse-credentials, key: password, optional: true}
+            # DES creds needed by optimal_fetch_dates -> SCL stack fetch
+            - name: DES_USER
+              valueFrom:
+                secretKeyRef: {name: des-credentials, key: user, optional: true}
+            - name: DES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: des-credentials, key: password, optional: true}
+          resources:
+            # 6 workers + DES semaphore raised to 6 → back to 6cpu/12Gi.
+            # 12 Gi accommodates leaked threads from race-bug fix's
+            # shutdown(wait=False) — each hung DES thread holds ~MB
+            # until socket-level timeout.
+            requests: {cpu: "6", memory: "12Gi"}
+            limits:   {cpu: "6", memory: "12Gi"}
+          volumeMounts:
+            - {name: cephfs, mountPath: /cephfs}
+      volumes:
+        - name: cephfs
+          persistentVolumeClaim: {claimName: training-data-cephfs}

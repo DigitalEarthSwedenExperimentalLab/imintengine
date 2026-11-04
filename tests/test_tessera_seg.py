@@ -1,0 +1,343 @@
+"""Tests for imint.fm.tessera_seg.TesseraSegmentationModel and
+imint.fm.loaders.tessera.load_tessera.
+
+TESSERA has no encoder at our train time — the "loader" is just a
+learnable-scale passthrough. The head consumes the pre-baked
+(B, 128, H, W) embedding tensor directly.
+"""
+from __future__ import annotations
+
+import pytest
+import torch
+
+from imint.fm.loaders.tessera import load_tessera, _TesseraPassthrough
+from imint.fm.tessera_seg import TesseraSegmentationModel
+
+
+class TestLoadTessera:
+    def test_returns_passthrough(self):
+        enc = load_tessera()
+        assert isinstance(enc, _TesseraPassthrough)
+
+    def test_passthrough_preserves_shape(self):
+        enc = load_tessera()
+        x = torch.randn(2, 128, 32, 32)
+        y = enc(x)
+        assert y.shape == x.shape
+
+    def test_passthrough_is_learnable(self):
+        enc = load_tessera()
+        params = list(enc.parameters())
+        assert len(params) == 1  # the scale param
+        assert params[0].requires_grad
+
+    def test_num_frames_must_be_1(self):
+        with pytest.raises(ValueError, match="annual"):
+            load_tessera(num_frames=4)
+
+
+class TestTesseraSegmentationForward:
+    def test_output_shape(self):
+        enc = load_tessera()
+        model = TesseraSegmentationModel(
+            encoder=enc, num_classes=23, embed_dim=128,
+        )
+        emb = torch.randn(2, 128, 512, 512)
+        out = model(emb)
+        assert out.shape == (2, 23, 512, 512)
+
+    def test_accepts_fp16(self):
+        enc = load_tessera()
+        model = TesseraSegmentationModel(
+            encoder=enc, num_classes=23, embed_dim=128,
+        )
+        emb = torch.randn(1, 128, 64, 64, dtype=torch.float16)
+        out = model(emb)
+        assert out.shape == (1, 23, 64, 64)
+
+    def test_wrong_embed_dim_raises(self):
+        enc = load_tessera()
+        model = TesseraSegmentationModel(
+            encoder=enc, num_classes=23, embed_dim=128,
+        )
+        emb = torch.randn(1, 256, 32, 32)  # wrong channels
+        with pytest.raises(ValueError, match="128"):
+            model(emb)
+
+    def test_wrong_rank_raises(self):
+        enc = load_tessera()
+        model = TesseraSegmentationModel(
+            encoder=enc, num_classes=23, embed_dim=128,
+        )
+        emb = torch.randn(128, 32, 32)  # missing batch dim
+        with pytest.raises(ValueError):
+            model(emb)
+
+    def test_aux_wired(self):
+        enc = load_tessera()
+        model = TesseraSegmentationModel(
+            encoder=enc, num_classes=23, embed_dim=128,
+            n_aux_channels=5,
+        )
+        emb = torch.randn(1, 128, 64, 64)
+        aux = torch.randn(1, 5, 64, 64)
+        out = model(emb, aux=aux)
+        assert out.shape == (1, 23, 64, 64)
+
+    def test_no_aux(self):
+        enc = load_tessera()
+        model = TesseraSegmentationModel(
+            encoder=enc, num_classes=23, embed_dim=128,
+            n_aux_channels=0,
+        )
+        assert model.aux_proj is None
+        emb = torch.randn(1, 128, 64, 64)
+        out = model(emb)
+        assert out.shape == (1, 23, 64, 64)
+
+    @pytest.mark.parametrize("h,w", [(256, 256), (512, 512), (224, 224)])
+    def test_various_resolutions(self, h, w):
+        enc = load_tessera()
+        model = TesseraSegmentationModel(
+            encoder=enc, num_classes=23, embed_dim=128,
+        )
+        emb = torch.randn(1, 128, h, w)
+        out = model(emb)
+        assert out.shape == (1, 23, h, w)
+
+
+class TestTesseraFractionHead:
+    """Frac-head mirrors PrithviSegmentationModel: flag-gated Conv2d that
+    returns (B, num_tradslag, H, W) crown-cover logits aligned with the
+    class logits."""
+
+    def test_disabled_by_default(self):
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=28, embed_dim=128,
+        )
+        assert model.frac_head is None
+        # return_fractions on a headless model → (logits, None)
+        emb = torch.randn(1, 128, 64, 64)
+        logits, frac = model(emb, return_fractions=True)
+        assert logits.shape == (1, 28, 64, 64)
+        assert frac is None
+
+    def test_enabled_returns_fraction_logits(self):
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=28, embed_dim=128,
+            enable_tradslag_head=True, num_tradslag=4,
+        )
+        assert model.frac_head is not None
+        emb = torch.randn(2, 128, 64, 64)
+        logits, frac = model(emb, return_fractions=True)
+        assert logits.shape == (2, 28, 64, 64)
+        assert frac.shape == (2, 4, 64, 64)
+
+    def test_default_return_is_logits_only(self):
+        """Without return_fractions the signature stays a bare tensor —
+        byte-compatible with the pre-frac-head callers."""
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=28, embed_dim=128,
+            enable_tradslag_head=True,
+        )
+        out = model(torch.randn(1, 128, 32, 32))
+        assert isinstance(out, torch.Tensor)
+        assert out.shape == (1, 28, 32, 32)
+
+    def test_frac_head_aligns_with_logits_under_aux(self):
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=28, embed_dim=128,
+            n_aux_channels=10, enable_tradslag_head=True, num_tradslag=4,
+        )
+        emb = torch.randn(1, 128, 48, 48)
+        aux = torch.randn(1, 10, 48, 48)
+        logits, frac = model(emb, aux=aux, return_fractions=True)
+        assert logits.shape[2:] == frac.shape[2:] == (48, 48)
+
+    def test_ignores_tl_coords(self):
+        """Accepts temporal/location coords for call parity but ignores
+        them (annual embedding has no per-frame coords)."""
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=28, embed_dim=128,
+        )
+        emb = torch.randn(1, 128, 32, 32)
+        out = model(
+            emb,
+            temporal_coords=torch.randn(1, 1, 2),
+            location_coords=torch.randn(1, 2),
+        )
+        assert out.shape == (1, 28, 32, 32)
+
+    def test_backward_pass(self):
+        """Loss is finite and gradients flow to both heads + the scale."""
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=28, embed_dim=128,
+            enable_tradslag_head=True, num_tradslag=4,
+        )
+        emb = torch.randn(2, 128, 32, 32)
+        logits, frac = model(emb, return_fractions=True)
+        loss = logits.mean() + frac.mean()
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert model.classifier.weight.grad is not None
+        assert model.frac_head.weight.grad is not None
+
+
+def _param_count(m: torch.nn.Module) -> int:
+    return sum(p.numel() for p in m.parameters())
+
+
+class TestAuxFusionMode:
+    """The aux_fusion flag: 'concat' (default, unchanged) vs 'gated'."""
+
+    def test_concat_is_default_and_unchanged(self):
+        """Default aux_fusion='concat' reproduces the historical model:
+        same output shape and param count as passing no aux_fusion arg."""
+        torch.manual_seed(0)
+        ref = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=10,
+        )
+        torch.manual_seed(0)
+        explicit = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=10, aux_fusion="concat",
+        )
+        assert ref.aux_fusion == "concat"
+        assert ref.gated_fusion is None
+        assert _param_count(ref) == _param_count(explicit)
+        # classifier sees `hidden` (256) channels in concat mode.
+        assert ref.classifier.in_channels == 256
+        emb = torch.randn(1, 128, 64, 64)
+        aux = torch.randn(1, 10, 64, 64)
+        assert ref(emb, aux=aux).shape == (1, 23, 64, 64)
+
+    def test_gated_builds_and_forwards(self):
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=10, aux_fusion="gated",
+            enable_tradslag_head=True, num_tradslag=4,
+        )
+        assert model.gated_fusion is not None
+        emb = torch.randn(2, 128, 48, 48)
+        aux = torch.randn(2, 10, 48, 48)
+        logits, frac = model(emb, aux=aux, return_fractions=True)
+        assert logits.shape == (2, 23, 48, 48)
+        assert frac.shape == (2, 4, 48, 48)
+
+    def test_gated_backward_flows_through_gate_aux_smooth(self):
+        model = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=10, aux_fusion="gated",
+            enable_tradslag_head=True, num_tradslag=4,
+        )
+        emb = torch.randn(2, 128, 32, 32)
+        aux = torch.randn(2, 10, 32, 32)
+        logits, frac = model(emb, aux=aux, return_fractions=True)
+        loss = logits.mean() + frac.mean()
+        assert torch.isfinite(loss)
+        loss.backward()
+
+        def gnorm(mod):
+            g = [p.grad.norm().item() for p in mod.parameters()
+                 if p.grad is not None]
+            return sum(g)
+
+        # Gradients must reach the gate, the aux projection, and smooth.
+        assert gnorm(model.gated_fusion) > 0
+        assert gnorm(model.gated_fusion.gate) > 0
+        assert gnorm(model.aux_proj) > 0
+        assert gnorm(model.smooth) > 0
+
+    def test_gated_has_fewer_classifier_channels_than_concat(self):
+        concat = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=10, aux_fusion="concat",
+        )
+        gated = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=10, aux_fusion="gated",
+        )
+        # hidden//2 (128) for gated vs hidden (256) for concat.
+        assert gated.classifier.in_channels == 128
+        assert concat.classifier.in_channels == 256
+        assert gated.classifier.in_channels < concat.classifier.in_channels
+
+    def test_no_aux_identical_for_both_modes(self):
+        """With n_aux_channels=0 the fusion mode is inert — same params,
+        no gated_fusion, no aux_proj."""
+        torch.manual_seed(0)
+        m_concat = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=0, aux_fusion="concat",
+        )
+        torch.manual_seed(0)
+        m_gated = TesseraSegmentationModel(
+            encoder=load_tessera(), num_classes=23, embed_dim=128,
+            n_aux_channels=0, aux_fusion="gated",
+        )
+        assert m_concat.aux_proj is None and m_gated.aux_proj is None
+        assert m_concat.gated_fusion is None and m_gated.gated_fusion is None
+        assert _param_count(m_concat) == _param_count(m_gated)
+        assert m_concat.classifier.in_channels == m_gated.classifier.in_channels == 128
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValueError, match="aux_fusion"):
+            TesseraSegmentationModel(
+                encoder=load_tessera(), num_classes=23, embed_dim=128,
+                n_aux_channels=10, aux_fusion="bogus",
+            )
+
+    def test_build_from_spec_threads_aux_fusion(self):
+        from imint.fm.registry import build_backbone
+        from imint.fm.upernet import build_segmentation_from_spec
+        model, spec = build_backbone("tessera_v1", num_frames=1, pretrained=False)
+        seg = build_segmentation_from_spec(
+            spec, encoder=model, num_classes=23, img_size=512,
+            n_aux_channels=10, aux_fusion="gated",
+        )
+        assert seg.gated_fusion is not None
+        out = seg(torch.randn(1, 128, 64, 64), aux=torch.randn(1, 10, 64, 64))
+        assert out.shape == (1, 23, 64, 64)
+
+
+class TestRegistryIntegration:
+    def test_tessera_in_registry(self):
+        from imint.fm.registry import MODEL_CONFIGS
+        assert "tessera_v1" in MODEL_CONFIGS
+        spec = MODEL_CONFIGS["tessera_v1"]
+        assert spec.family == "tessera"
+        assert spec.embed_dim == 128
+
+    def test_tessera_build_backbone(self):
+        from imint.fm.registry import build_backbone
+        model, spec = build_backbone("tessera_v1", num_frames=1, pretrained=False)
+        assert isinstance(model, _TesseraPassthrough)
+        assert spec.embed_dim == 128
+
+    def test_tessera_build_segmentation(self):
+        from imint.fm.registry import build_backbone, MODEL_CONFIGS
+        from imint.fm.upernet import build_segmentation_from_spec
+        model, spec = build_backbone("tessera_v1", num_frames=1, pretrained=False)
+        seg = build_segmentation_from_spec(
+            spec, encoder=model, num_classes=23, img_size=512,
+        )
+        assert isinstance(seg, TesseraSegmentationModel)
+        emb = torch.randn(1, 128, 256, 256)
+        out = seg(emb)
+        assert out.shape == (1, 23, 256, 256)
+
+    def test_build_segmentation_threads_frac_head(self):
+        """build_segmentation_from_spec passes enable_tradslag_head/
+        num_tradslag into the tessera wrapper (was silently dropped)."""
+        from imint.fm.registry import build_backbone
+        from imint.fm.upernet import build_segmentation_from_spec
+        model, spec = build_backbone("tessera_v1", num_frames=1, pretrained=False)
+        seg = build_segmentation_from_spec(
+            spec, encoder=model, num_classes=28, img_size=512,
+            enable_tradslag_head=True, num_tradslag=4,
+        )
+        assert seg.frac_head is not None
+        logits, frac = seg(torch.randn(1, 128, 64, 64), return_fractions=True)
+        assert logits.shape == (1, 28, 64, 64)
+        assert frac.shape == (1, 4, 64, 64)

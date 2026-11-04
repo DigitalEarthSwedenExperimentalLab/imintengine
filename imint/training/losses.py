@@ -1,0 +1,416 @@
+"""
+imint/training/losses.py — Custom loss functions for LULC segmentation
+
+Provides FocalLoss as an alternative to standard CrossEntropyLoss,
+which focuses training on hard/rare examples by down-weighting
+easy, well-classified pixels.
+"""
+from __future__ import annotations
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+except ImportError:
+    raise ImportError("PyTorch is required. Install with: pip install torch")
+
+
+def parcel_area_to_pixel_weights(
+    area_ha: "torch.Tensor",
+    mmu_ha: float = 0.25,
+    max_weight: float = 4.0,
+) -> "torch.Tensor":
+    """Per-pixel loss weights derived from LPIS parcel area.
+
+    Ensures small parcels receive proportionally higher gradient so the model
+    learns to delineate sub-hectare field boundaries, not just bulk crop types.
+
+    Weight function:
+        area == 0  (NMD non-crop / background)  →  1.0  (uniform weight)
+        0 < area < mmu_ha  (sub-MMU crop)        →  max_weight  (highest emphasis)
+        area >= mmu_ha     (normal crop)          →  clip(1/√area, 1.0, max_weight)
+
+    NMD non-crop pixels (forest, water, urban, etc.) have area_ha==0 because
+    they carry no LPIS parcel. Defaulting to 1.0 ensures the model trains on
+    all 23 classes, not just LPIS crop classes.  The ignore_index in FocalLoss /
+    DiceLoss handles true background (label==0) independently of pixel_weight.
+
+    At 0.25 ha: w = 1/√0.25 = 2.0
+    At 1.00 ha: w = 1/√1.00 = 1.0  (floor — large parcels carry standard weight)
+    At 0.05 ha: w = max_weight = 4.0
+
+    Args:
+        area_ha:    (B, H, W) or (H, W) float32 tensor of parcel area per pixel.
+        mmu_ha:     Minimum Mapping Unit in hectares (default 0.25, matching NMD).
+        max_weight: Maximum weight cap for sub-MMU pixels (default 4.0).
+
+    Returns:
+        Float32 tensor of same shape as area_ha.
+    """
+    weight = torch.ones_like(area_ha)   # default 1.0 for NMD/non-LPIS pixels
+
+    crop_mask = area_ha > 0.0
+    sub_mmu   = crop_mask & (area_ha < mmu_ha)
+    normal    = area_ha >= mmu_ha
+
+    weight[sub_mmu] = max_weight
+    weight[normal]  = torch.clamp(
+        1.0 / torch.sqrt(area_ha[normal]),
+        min=1.0, max=max_weight,
+    )
+    return weight
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for multi-class segmentation.
+
+    Adds ``(1 - p_t)^gamma`` modulation to cross-entropy, focusing
+    training on hard/rare examples.  When ``gamma=0``, this reduces
+    to standard weighted cross-entropy.
+
+    Reference:
+        Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017.
+
+    Args:
+        weight: Optional per-class weight tensor (same semantics as
+            ``torch.nn.CrossEntropyLoss.weight``).
+        gamma: Focusing parameter.  Higher values focus more on hard
+            examples.  Typical range: 1.0 - 3.0.  Default: 2.0.
+        ignore_index: Class index to ignore in loss computation.
+    """
+
+    def __init__(
+        self,
+        weight: torch.Tensor | None = None,
+        gamma: float = 2.0,
+        ignore_index: int = 0,
+        label_smoothing: float = 0.05,
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.label_smoothing = label_smoothing
+        self.register_buffer("weight", weight)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        pixel_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute focal loss.
+
+        Args:
+            logits:       (B, C, H, W) raw class scores.
+            targets:      (B, H, W) integer class labels.
+            pixel_weight: Optional (B, H, W) float32 per-pixel weights.
+                          Use parcel_area_to_pixel_weights() to derive from
+                          parcel area so small parcels get higher emphasis.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        # Standard cross-entropy per pixel with label smoothing
+        ce_loss = F.cross_entropy(
+            logits, targets,
+            weight=self.weight,
+            ignore_index=self.ignore_index,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )  # (B, H, W)
+
+        # p_t = probability of the correct class
+        # Using the identity: p_t = exp(-ce_loss) for numerical stability
+        p_t = torch.exp(-ce_loss)
+
+        # Focal modulation: (1 - p_t)^gamma
+        focal_factor = torch.clamp(1.0 - p_t, min=1e-6) ** self.gamma
+
+        # Apply focal modulation
+        focal_loss = focal_factor * ce_loss
+
+        # Per-pixel area weighting (emphasises small parcels)
+        if pixel_weight is not None:
+            focal_loss = focal_loss * pixel_weight.to(focal_loss)
+
+        # Mask out ignored pixels
+        valid_mask = targets != self.ignore_index
+        if valid_mask.any():
+            return focal_loss[valid_mask].mean()
+        return focal_loss.mean()
+
+
+class DiceLoss(nn.Module):
+    """Soft Dice Loss for multi-class segmentation.
+
+    Computes per-class soft dice and averages across valid classes.
+    Particularly effective for classes with high inter-class confusion
+    (e.g. forest types) because it directly optimizes overlap.
+
+    Args:
+        ignore_index: Class index to exclude from loss computation.
+        smooth: Smoothing constant to avoid division by zero.
+    """
+
+    def __init__(self, ignore_index: int = 0, smooth: float = 1.0):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.smooth = smooth
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        pixel_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute soft dice loss.
+
+        Args:
+            logits:       (B, C, H, W) raw class scores.
+            targets:      (B, H, W) integer class labels.
+            pixel_weight: Optional (B, H, W) float32 per-pixel weights.
+
+        Returns:
+            Scalar loss tensor (1 - mean_dice).
+        """
+        num_classes = logits.shape[1]
+        probs = F.softmax(logits, dim=1)  # (B, C, H, W)
+
+        # One-hot encode targets: (B, H, W) → (B, C, H, W)
+        targets_oh = F.one_hot(
+            targets.clamp(0, num_classes - 1).long(), num_classes
+        ).permute(0, 3, 1, 2).float()  # (B, C, H, W)
+
+        # Combined mask: ignore_index pixels AND per-pixel area weights
+        valid_mask = (targets != self.ignore_index).float()
+        if pixel_weight is not None:
+            valid_mask = valid_mask * pixel_weight.to(valid_mask)
+        valid_mask = valid_mask.unsqueeze(1)   # (B, 1, H, W)
+        probs = probs * valid_mask
+        targets_oh = targets_oh * valid_mask
+
+        # Per-class dice
+        dims = (0, 2, 3)  # sum over batch, H, W
+        intersection = (probs * targets_oh).sum(dims)
+        cardinality = probs.sum(dims) + targets_oh.sum(dims)
+        dice_per_class = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+
+        # Average over non-ignored classes that have ground truth
+        valid_classes = []
+        for c in range(num_classes):
+            if c == self.ignore_index:
+                continue
+            if targets_oh[:, c].sum() > 0:
+                valid_classes.append(dice_per_class[c])
+
+        if valid_classes:
+            mean_dice = torch.stack(valid_classes).mean()
+        else:
+            mean_dice = dice_per_class[1:].mean()
+
+        return 1.0 - mean_dice
+
+
+# ── Lovász-softmax loss (Berman et al. 2018) ─────────────────────────────────
+
+
+def _lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
+    """Gradient of the Lovász extension for the submodular Jaccard loss.
+
+    Args:
+        gt_sorted: (P,) ground truth sorted by decreasing error.
+
+    Returns:
+        (P,) Lovász gradient weights.
+    """
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:
+        jaccard[1:] = jaccard[1:] - jaccard[:-1]
+    return jaccard
+
+
+class LovaszSoftmaxLoss(nn.Module):
+    """Multi-class Lovász-softmax loss (Berman et al. 2018).
+
+    Directly optimises the mean IoU, providing stronger boundary gradients
+    than cross-entropy or Dice loss. Complementary to Focal+Dice.
+
+    Args:
+        ignore_index: Class index to exclude (background).
+    """
+
+    def __init__(self, ignore_index: int = 0):
+        super().__init__()
+        self.ignore_index = ignore_index
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        pixel_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute mean Lovász-softmax loss over all active classes.
+
+        Args:
+            logits: (B, C, H, W) raw scores.
+            targets: (B, H, W) integer class labels.
+            pixel_weight: Ignored (interface compatibility).
+
+        Returns:
+            Scalar loss tensor.
+        """
+        num_classes = logits.shape[1]
+        probas = F.softmax(logits, dim=1)  # (B, C, H, W)
+
+        # Flatten spatial dims: (B*H*W,) and (B*H*W, C)
+        probas_flat = probas.permute(0, 2, 3, 1).reshape(-1, num_classes)
+        targets_flat = targets.reshape(-1)
+
+        # Mask out ignored pixels
+        valid = targets_flat != self.ignore_index
+        if not valid.any():
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        probas_flat = probas_flat[valid]
+        targets_flat = targets_flat[valid]
+
+        losses = []
+        for c in range(num_classes):
+            if c == self.ignore_index:
+                continue
+            fg = (targets_flat == c).float()
+            if fg.sum() == 0:
+                continue
+            errors = (1.0 - probas_flat[:, c]) * fg + probas_flat[:, c] * (1.0 - fg)
+            errors_sorted, perm = torch.sort(errors, descending=True)
+            fg_sorted = fg[perm]
+            grad = _lovasz_grad(fg_sorted)
+            losses.append(torch.dot(F.relu(errors_sorted), grad))
+
+        if not losses:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        return torch.stack(losses).mean()
+
+
+# ── Trädslag fraction loss (continuous crown-cover supervision) ──────────────
+
+
+class FractionLoss(nn.Module):
+    """Masked regression loss for the Trädslag fraction head.
+
+    Supervises the fraction head's ``sigmoid(logits)`` against the NMD2023
+    Trädslag crown-cover targets in [0, 1] (raw 0-100 rasters divided by 100).
+    The dataset supplies a positive supervision mask: 1 means reliable with
+    signal, 0 means excluded. Keep only those pixels, with an additional
+    no-signal check:
+
+        keep = frac_mask AND (any species fraction > 0)
+
+    An all-zero target means "no supervision here" (outside NMD2023 coverage,
+    ~5.5% of pixels), NOT "0% of every species is present" — supervising toward
+    zero there would teach the model that unlabelled land is treeless. Masking
+    is applied per-pixel (shared across the K channels): a pixel either
+    contributes for all species or for none.
+
+    Args:
+        loss_type: ``"l1"`` (default) or ``"smooth_l1"`` (Huber, beta=0.1).
+    """
+
+    def __init__(self, loss_type: str = "l1"):
+        super().__init__()
+        if loss_type not in ("l1", "smooth_l1"):
+            raise ValueError(f"loss_type must be l1|smooth_l1, got {loss_type!r}")
+        self.loss_type = loss_type
+
+    def forward(
+        self,
+        frac_logits: torch.Tensor,
+        frac_target: torch.Tensor,
+        frac_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the masked fraction loss.
+
+        Args:
+            frac_logits: (B, K, H, W) raw fraction-head logits.
+            frac_target: (B, K, H, W) target crown-cover in [0, 1].
+            frac_mask: (B, H, W) float/bool positive supervision mask from
+                UnifiedDataset — 1 = supervise, 0 = exclude. This is not the
+                raw sidecar's frac_unreliable mask.
+
+        Returns:
+            Scalar loss (mean over unmasked pixel-species entries). Returns a
+            differentiable 0 when no pixel is supervised in the batch.
+        """
+        pred = torch.sigmoid(frac_logits)
+        target = frac_target.to(pred)
+
+        # Per-pixel supervision mask (B, 1, H, W): keep where reliable AND at
+        # least one species is present.
+        supervised = frac_mask.to(pred).bool()               # (B, H, W)
+        has_signal = (target > 0).any(dim=1)                  # (B, H, W)
+        keep = supervised & has_signal                       # (B, H, W)
+        keep = keep.unsqueeze(1).to(pred)                     # (B, 1, H, W)
+
+        if self.loss_type == "smooth_l1":
+            per = F.smooth_l1_loss(pred, target, beta=0.1, reduction="none")
+        else:
+            per = torch.abs(pred - target)                    # (B, K, H, W)
+
+        per = per * keep
+        denom = keep.sum() * pred.shape[1]                    # unmasked entries
+        if denom > 0:
+            return per.sum() / denom
+        # Nothing to supervise this batch — return a differentiable 0 so the
+        # multi-task sum stays connected to the graph.
+        return (frac_logits.sum() * 0.0)
+
+
+# ── Combined loss ─────────────────────────────────────────────────────────────
+
+
+class CombinedLoss(nn.Module):
+    """Focal + Dice + optional Lovász combined loss.
+
+    Args:
+        focal: FocalLoss instance.
+        dice: DiceLoss instance.
+        lovasz: Optional LovaszSoftmaxLoss instance.
+        focal_weight: Weight for focal loss.
+        dice_weight: Weight for dice loss.
+        lovasz_weight: Weight for Lovász loss (0 = disabled).
+    """
+
+    def __init__(
+        self,
+        focal: FocalLoss,
+        dice: DiceLoss,
+        lovasz: LovaszSoftmaxLoss | None = None,
+        focal_weight: float = 0.5,
+        dice_weight: float = 0.5,
+        lovasz_weight: float = 0.0,
+    ):
+        super().__init__()
+        self.focal = focal
+        self.dice = dice
+        self.lovasz = lovasz
+        self.focal_weight = focal_weight
+        self.dice_weight = dice_weight
+        self.lovasz_weight = lovasz_weight
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        pixel_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        loss = (
+            self.focal_weight * self.focal(logits, targets, pixel_weight)
+            + self.dice_weight * self.dice(logits, targets, pixel_weight)
+        )
+        if self.lovasz is not None and self.lovasz_weight > 0:
+            loss = loss + self.lovasz_weight * self.lovasz(logits, targets)
+        return loss

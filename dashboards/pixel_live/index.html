@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>train-pixel-v1 — H100 Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg:       #f0f4f8;
+  --surface:  #ffffff;
+  --surface2: #f1f5f9;
+  --border:   #dde3ed;
+  --border2:  #c8d3e0;
+  --text:     #1e293b;
+  --dim:      #64748b;
+  --dim2:     #475569;
+  --accent:   #2563eb;
+  --green:    #16a34a;
+  --red:      #dc2626;
+  --amber:    #d97706;
+  --mono:     'Fira Code', 'Cascadia Code', 'Courier New', monospace;
+  --grid:     #e8edf4;
+  --tick:     #94a3b8;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ── Header ─────────────────────────────────────────────────── */
+.header {
+  background: #fff;
+  border-bottom: 1px solid var(--border);
+  padding: 0 28px;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  box-shadow: 0 1px 4px rgba(0,0,0,.06);
+}
+.header-left  { display: flex; align-items: center; gap: 12px; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+
+.job-name { font: 700 15px/1 var(--mono); color: var(--text); letter-spacing: -.02em; }
+.run-id   { font: 11px var(--mono); color: var(--dim); }
+
+.badge { font: 700 10px/1 var(--mono); letter-spacing: .07em; padding: 3px 8px; border-radius: 4px; white-space: nowrap; }
+.badge-gpu   { background: #ede9fe; color: #5b21b6; border: 1px solid #c4b5fd; }
+.badge-stage { background: var(--surface2); border: 1px solid var(--border2); color: var(--dim2); }
+.badge-amp   { background: #f0fdf4; border: 1px solid #86efac; color: #16a34a; }
+
+.status-badge { display: flex; align-items: center; gap: 6px; font: 11px var(--mono); color: var(--dim2); }
+.s-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border2); flex-shrink: 0; }
+.s-dot.training { background: var(--green); animation: pulse 2s infinite; }
+.s-dot.done     { background: var(--accent); }
+.s-dot.stalled  { background: var(--amber); }
+.s-dot.error    { background: var(--red); }
+@keyframes pulse {
+  0%,100% { opacity:1; box-shadow:0 0 0 0 rgba(22,163,74,.4); }
+  50%      { opacity:.8; box-shadow:0 0 0 5px rgba(22,163,74,0); }
+}
+
+.refresh-btn {
+  font: 11px var(--mono); color: var(--dim);
+  background: var(--surface2); border: 1px solid var(--border);
+  padding: 3px 9px; border-radius: 4px; cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.refresh-btn:hover { color: var(--text); border-color: var(--border2); }
+
+/* ── Layout ──────────────────────────────────────────────────── */
+.container {
+  padding: 20px 28px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 1900px;
+}
+
+/* ── Cards ───────────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.04);
+}
+
+.clabel {
+  font: 10px/1 var(--mono);
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  margin-bottom: 7px;
+  display: block;
+}
+.cval     { font: 700 21px/1 var(--mono); color: var(--text); display: block; }
+.cval.hi  { color: var(--green); }
+.csub     { font: 11px var(--mono); color: var(--dim); margin-top: 4px; display: block; }
+
+.sk {
+  display: inline-block;
+  background: linear-gradient(90deg, var(--surface2) 25%, var(--border2) 50%, var(--surface2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  border-radius: 4px;
+  width: 72px; height: 20px; vertical-align: middle;
+}
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+/* ── Summary row ─────────────────────────────────────────────── */
+.summary-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; }
+
+/* ── Progress ────────────────────────────────────────────────── */
+.progress-card { display: flex; flex-direction: column; gap: 10px; }
+.progress-header { display: flex; justify-content: space-between; align-items: center; }
+.prog-outer { background: var(--surface2); border-radius: 3px; height: 5px; overflow: hidden; }
+.prog-inner { height: 100%; background: linear-gradient(90deg, #2563eb, #0891b2); border-radius: 3px; transition: width .4s ease; }
+.patience-row { display: flex; align-items: center; gap: 8px; }
+.plabel { font: 10px var(--mono); color: var(--dim); white-space: nowrap; }
+.pdots  { display: flex; gap: 3px; }
+.pdot { width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--border2); background: transparent; }
+.pdot.used  { background: var(--amber); border-color: var(--amber); }
+.pdot.alert { background: var(--red);   border-color: var(--red); }
+.pcount { font: 11px var(--mono); color: var(--dim); }
+
+/* ── Charts ──────────────────────────────────────────────────── */
+.charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.chart-title { font: 700 11px var(--mono); color: var(--dim2); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
+.chart-box { position: relative; height: 210px; }
+
+/* ── Per-class panel ─────────────────────────────────────────── */
+.perclass-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; gap: 12px; }
+.perclass-right  { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+.mode-btn {
+  font: 700 10px/1 var(--mono); letter-spacing: .05em;
+  padding: 4px 10px; border-radius: 5px; cursor: pointer; border: none;
+  background: var(--accent); color: #fff;
+  transition: background .15s;
+  white-space: nowrap;
+}
+.mode-btn:hover { background: #1d4ed8; }
+
+/* Source-mode legend (3 groups) */
+.src-legend { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.leg-item { display: flex; align-items: center; gap: 5px; font: 11px var(--mono); color: var(--dim2); }
+.leg-dot  { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+
+/* Class-mode legend (22 items compact grid) */
+.cls-legend {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  gap: 2px 14px;
+  align-items: center;
+}
+.cls-item { display: flex; align-items: center; gap: 4px; font: 10px var(--mono); color: var(--dim2); white-space: nowrap; }
+.cls-dot  { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+
+.chart-box-pc { position: relative; height: 618px; }
+
+/* ── Sparklines ──────────────────────────────────────────────── */
+.chart-box-spark { position: relative; height: 230px; }
+
+/* ── Tile predictions ────────────────────────────────────────── */
+.tiles-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.slider-wrap  { display: flex; align-items: center; gap: 8px; font: 11px var(--mono); color: var(--dim2); }
+#epochSlider  { accent-color: var(--accent); width: 160px; cursor: pointer; }
+.tiles-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+.tile-item { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.tile-item-name { font: 9px var(--mono); color: var(--dim); padding: 5px 7px 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; padding: 4px; }
+.tile-pair img { width: 100%; aspect-ratio: 1; display: block; border-radius: 2px; object-fit: cover; image-rendering: pixelated; }
+.tile-pair img.missing { opacity: .2; background: var(--border); }
+.tile-pair-labels { display: grid; grid-template-columns: 1fr 1fr; }
+.tile-pair-labels span { font: 8px var(--mono); color: var(--dim); text-align: center; padding-bottom: 4px; }
+.tiles-empty { text-align: center; padding: 36px 20px; color: var(--dim); font: 12px var(--mono); line-height: 2; }
+
+/* ── Epoch table ─────────────────────────────────────────────── */
+.table-scroll { max-height: 270px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; margin-top: 10px; }
+.table-scroll::-webkit-scrollbar { width: 4px; }
+.table-scroll::-webkit-scrollbar-track { background: var(--surface2); }
+.table-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+table { width: 100%; border-collapse: collapse; font: 11px var(--mono); }
+thead th {
+  background: var(--surface2); color: var(--dim);
+  font: 10px var(--mono); text-transform: uppercase; letter-spacing: .05em;
+  padding: 7px 10px; text-align: right; position: sticky; top: 0; white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+thead th:first-child { text-align: left; }
+tbody td { padding: 5px 10px; text-align: right; border-top: 1px solid var(--border); color: var(--dim2); }
+tbody td:first-child { text-align: left; }
+tbody tr:hover td { background: var(--surface2); }
+tbody tr.row-best td { color: var(--text); background: #fffbeb; border-left: 2px solid var(--amber); }
+tbody tr.row-best td:first-child { padding-left: 8px; }
+.star { color: var(--amber); }
+
+.update-note { font: 10px var(--mono); color: var(--dim); text-align: right; padding: 0 2px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="job-name">train-pixel-v1</span>
+    <span class="run-id" id="hRunId">—</span>
+    <span class="badge badge-gpu">H100 NVL</span>
+    <span class="badge badge-stage" id="hStage">—</span>
+    <span class="badge badge-amp" id="hAmp" style="display:none">AMP bf16</span>
+  </div>
+  <div class="header-right">
+    <div class="status-badge">
+      <div class="s-dot" id="sDot"></div>
+      <span id="sText">Loading…</span>
+    </div>
+    <button class="refresh-btn" id="refreshBtn" onclick="fetchData()">⟳ 30s</button>
+  </div>
+</div>
+
+<div class="container">
+
+  <div class="summary-row">
+    <div class="card">
+      <span class="clabel">Epoch</span>
+      <span class="cval" id="cEpoch"><span class="sk"></span></span>
+      <span class="csub" id="cEpochSub">—</span>
+    </div>
+    <div class="card">
+      <span class="clabel">Best val mIoU</span>
+      <span class="cval hi" id="cBestMiou"><span class="sk"></span></span>
+      <span class="csub" id="cBestSub">—</span>
+    </div>
+    <div class="card">
+      <span class="clabel">Val mIoU (current)</span>
+      <span class="cval" id="cCurMiou"><span class="sk"></span></span>
+      <span class="csub" id="cCurMiouSub">—</span>
+    </div>
+    <div class="card">
+      <span class="clabel">Val Loss</span>
+      <span class="cval" id="cValLoss"><span class="sk"></span></span>
+      <span class="csub" id="cValLossSub">—</span>
+    </div>
+    <div class="card">
+      <span class="clabel">Val Acc (OA)</span>
+      <span class="cval" id="cValOA"><span class="sk"></span></span>
+      <span class="csub" id="cValOASub">—</span>
+    </div>
+    <div class="card">
+      <span class="clabel">Time / Epoch</span>
+      <span class="cval" id="cTime"><span class="sk"></span></span>
+      <span class="csub" id="cTimeSub">—</span>
+    </div>
+    <div class="card">
+      <span class="clabel">ETA</span>
+      <span class="cval" id="cETA"><span class="sk"></span></span>
+      <span class="csub" id="cETASub">—</span>
+    </div>
+  </div>
+
+  <div class="card progress-card">
+    <div class="progress-header">
+      <span class="clabel" style="margin:0">Training Progress</span>
+      <span id="progPct" style="font:11px var(--mono);color:var(--dim2)">0%</span>
+    </div>
+    <div class="prog-outer"><div class="prog-inner" id="progBar" style="width:0%"></div></div>
+    <div class="patience-row">
+      <span class="plabel">Early-stop patience (10)</span>
+      <div class="pdots" id="pdots"></div>
+      <span class="pcount" id="pcount">0 / 10</span>
+    </div>
+  </div>
+
+  <div class="charts-row">
+    <div class="card">
+      <div class="chart-title">Validation mIoU</div>
+      <div class="chart-box"><canvas id="chartMiou"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="chart-title">Train &amp; Val Loss</div>
+      <div class="chart-box"><canvas id="chartLoss"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Per-class IoU -->
+  <div class="card">
+    <div class="perclass-header">
+      <div>
+        <span class="clabel" style="margin-bottom:4px">Per-Class IoU — latest epoch</span>
+        <div id="pcLegend"></div>
+      </div>
+      <div class="perclass-right">
+        <button class="mode-btn" id="colorModeBtn" onclick="toggleColorMode()">By source</button>
+      </div>
+    </div>
+    <div class="chart-box-pc"><canvas id="chartPerClass"></canvas></div>
+  </div>
+
+  <div class="card">
+    <div class="chart-title">Top 8 Classes — mIoU over epochs</div>
+    <div class="chart-box-spark"><canvas id="chartSpark"></canvas></div>
+  </div>
+
+  <div class="card">
+    <div class="tiles-header">
+      <span class="clabel" style="margin:0">Evolving Predictions — Representative Tiles</span>
+      <div class="slider-wrap" id="sliderWrap" style="display:none">
+        <span>Epoch</span>
+        <input type="range" id="epochSlider" min="1" max="35" value="1">
+        <span id="sliderLabel">—</span>
+      </div>
+    </div>
+    <div id="tilesContent">
+      <div class="tiles-empty">
+        No tile predictions yet<br>
+        <span style="font-size:10px;opacity:.6">Enable with <code>--tile-pred-n 6</code> in training job</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top confusion pairs -->
+  <div class="card" id="confusionCard" style="display:none">
+    <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px">
+      <span class="clabel" style="margin:0">Top Confusion Pairs — latest epoch</span>
+      <span style="font:10px var(--mono);color:var(--dim)">fraction of true-class pixels misclassified as the predicted class</span>
+    </div>
+    <div class="table-scroll" style="max-height:320px">
+      <table id="confusionTable">
+        <thead>
+          <tr>
+            <th style="text-align:left" title="Ground-truth class">True class</th>
+            <th style="text-align:left" title="What the model predicted instead">→ Predicted as</th>
+            <th title="Number of pixels misclassified this way">Count</th>
+            <th title="Fraction of all true-class pixels predicted as this other class&#10;= false-negative rate for this specific pair">Rate</th>
+            <th title="Severity bar — proportional to rate" style="width:120px"></th>
+          </tr>
+        </thead>
+        <tbody id="confusionBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px">
+      <span class="clabel" style="margin:0">Epoch Log</span>
+      <span style="font:10px var(--mono);color:var(--dim)">hover column headers for definitions</span>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th title="Training epoch number">Epoch</th>
+            <th title="Stage 1 = backbone frozen, head only&#10;Stage 2 = full fine-tune at 0.1× backbone LR">Stage</th>
+            <th title="Focal loss (γ=2) on the training set&#10;Lower = better fit to training data">Train Loss</th>
+            <th title="Focal loss on the held-out validation set&#10;Lower = better generalisation">Val Loss</th>
+            <th title="Mean Intersection over Union across all 22 classes (background excluded)&#10;Primary metric — higher is better">Val mIoU</th>
+            <th title="Overall Accuracy: fraction of all valid validation pixels correctly classified&#10;Dominated by large classes (vatten, tallskog)">Val OA</th>
+            <th title="Mean per-class Accuracy (average recall across 22 classes)&#10;Less biased than OA toward large classes">Val mAcc</th>
+            <th title="Current learning rate of the head optimizer&#10;Stage 1: cosine decay from 3e-4&#10;Stage 2: cosine decay from 3e-4 (backbone at 0.1×)">LR</th>
+            <th title="Wall-clock seconds for the full train + val pass&#10;~2600–2700s per epoch on H100 NVL with batch 4096">Time (s)</th>
+            <th title="New best val mIoU achieved this epoch">★</th>
+          </tr>
+        </thead>
+        <tbody id="epochTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="update-note" id="updateNote">—</div>
+</div>
+
+<script>
+// ── Canonical class palette ───────────────────────────────────────────────
+// 22 entries, indexed 0-21 matching CLASS_NAMES.
+// Semantically grounded: NMD greens, crop ambers/yellows, hygge cyan.
+const CLASS_NAMES = [
+  'tallskog','granskog','lövskog','blandskog','sumpskog',
+  'tillfälligt ej skog','våtmark','öppen mark','bebyggelse','vatten',
+  'vete','korn','havre','oljeväxter','slåttervall','bete',
+  'potatis','sockerbetor','trindsäd','råg','majs','hygge'
+];
+// NMD: indices 0-9   LPIS: 10-20   SKS(hygge): 21
+const CLASS_COLORS = [
+  '#1a5c35',  // 0  tallskog          — deep pine green
+  '#2d8a5b',  // 1  granskog          — spruce green
+  '#7bc67e',  // 2  lövskog           — leaf green
+  '#4db380',  // 3  blandskog         — mixed green
+  '#6b8e5a',  // 4  sumpskog          — olive-green
+  '#c9df6e',  // 5  tillfälligt ej skog — yellow-green
+  '#9b7722',  // 6  våtmark           — wetland brown
+  '#d4b44a',  // 7  öppen mark        — straw
+  '#c0392b',  // 8  bebyggelse        — urban red
+  '#2471a3',  // 9  vatten            — water blue
+  '#e8b800',  // 10 vete              — wheat gold
+  '#d4780a',  // 11 korn              — barley amber
+  '#f0d060',  // 12 havre             — oat straw
+  '#d4c600',  // 13 oljeväxter        — rapeseed yellow
+  '#91c84c',  // 14 slåttervall       — meadow green
+  '#b8de86',  // 15 bete              — pasture light green
+  '#9b59b6',  // 16 potatis           — potato purple
+  '#d63381',  // 17 sockerbetor       — beet magenta
+  '#e07020',  // 18 trindsäd          — legume orange
+  '#8b2020',  // 19 råg               — rye dark red
+  '#dcc800',  // 20 majs               — corn yellow
+  '#00a8c6',  // 21 hygge             — clearcut cyan
+];
+
+const NMD_RANGE  = [0,  9];
+const LPIS_RANGE = [10, 20];
+
+// Source-mode group colors
+const SRC_COLOR = {
+  nmd:   'rgba(45,138,91,0.75)',
+  lpis:  'rgba(212,120,10,0.75)',
+  hygge: 'rgba(0,168,198,0.75)',
+};
+
+function srcColor(cls) {
+  const i = CLASS_NAMES.indexOf(cls);
+  if (i <= 9)  return SRC_COLOR.nmd;
+  if (i <= 20) return SRC_COLOR.lpis;
+  return SRC_COLOR.hygge;
+}
+function classColor(cls) {
+  const i = CLASS_NAMES.indexOf(cls);
+  return i >= 0 ? CLASS_COLORS[i] : '#94a3b8';
+}
+
+// ── State ─────────────────────────────────────────────────────────────────
+let charts = { miou: null, loss: null, perClass: null, spark: null };
+let state  = { data: null, lastFetch: null, fetchError: false, countdown: 30 };
+let tileState = { manifest: null, currentEpoch: null };
+let colorMode = 'source';   // 'source' | 'class'
+
+// ── Pixel-count afterDraw plugin ──────────────────────────────────────────
+const pixelCountPlugin = {
+  id: 'pixelCount',
+  afterDatasetsDraw(chart) {
+    const labels = chart._pcLabels;
+    if (!labels) return;
+    const { ctx, chartArea: { right } } = chart;
+    ctx.save();
+    ctx.font = '9px monospace';
+    ctx.fillStyle = '#94a3b8';
+    ctx.textAlign = 'left';
+    chart.getDatasetMeta(0).data.forEach((bar, i) => {
+      if (labels[i]) ctx.fillText(labels[i], right + 5, bar.y + 3);
+    });
+    ctx.restore();
+  }
+};
+
+// ── initCharts ────────────────────────────────────────────────────────────
+function initCharts() {
+  const grid = '#e8edf4', tick = { color: '#94a3b8', font: { size: 10 } };
+  const epAxis = { grid: { color: grid }, ticks: tick,
+    title: { display: true, text: 'Epoch', color: '#94a3b8', font: { size: 10 } } };
+
+  charts.miou = new Chart(document.getElementById('chartMiou'), {
+    type: 'line', data: { labels: [], datasets: [{}] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: false } },
+      scales: {
+        x: epAxis,
+        y: { min: 0, grid: { color: grid }, ticks: { ...tick, callback: v => v.toFixed(2) } }
+      }
+    }
+  });
+
+  charts.loss = new Chart(document.getElementById('chartLoss'), {
+    type: 'line', data: { labels: [], datasets: [] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: true, position: 'top',
+        labels: { color: '#64748b', font: { size: 10 }, boxWidth: 10, padding: 8 } } },
+      scales: {
+        x: epAxis,
+        y: { min: 0, grid: { color: grid }, ticks: { ...tick, callback: v => v.toFixed(2) } }
+      }
+    }
+  });
+
+  charts.perClass = new Chart(document.getElementById('chartPerClass'), {
+    type: 'bar', data: { labels: [], datasets: [{}] },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false, animation: false,
+      layout: { padding: { right: 68 } },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: {
+          label: ctx => {
+            const iouVal = ctx.parsed.x.toFixed(4);
+            const n = charts.perClass._pcN?.[ctx.label];
+            return n != null
+              ? [` IoU: ${iouVal}`, ` n: ${n.toLocaleString('sv-SE')}`]
+              : ` IoU: ${iouVal}`;
+          }
+        }}
+      },
+      scales: {
+        x: { min: 0, max: 1, grid: { color: grid }, ticks: tick },
+        y: { grid: { display: false }, ticks: { color: '#334155', font: { size: 11, family: 'monospace' } } }
+      }
+    },
+    plugins: [pixelCountPlugin]
+  });
+
+  charts.spark = new Chart(document.getElementById('chartSpark'), {
+    type: 'line', data: { labels: [], datasets: [] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: true, position: 'right',
+        labels: { color: '#64748b', font: { size: 10 }, boxWidth: 10, padding: 5 } } },
+      scales: {
+        x: epAxis,
+        y: { min: 0, max: 1, grid: { color: grid }, ticks: { ...tick, callback: v => v.toFixed(2) } }
+      }
+    }
+  });
+}
+
+// ── Color-mode toggle ─────────────────────────────────────────────────────
+function toggleColorMode() {
+  colorMode = colorMode === 'source' ? 'class' : 'source';
+  document.getElementById('colorModeBtn').textContent =
+    colorMode === 'source' ? 'By source' : 'By class';
+  if (state.data?.epochs?.length) {
+    const last = state.data.epochs[state.data.epochs.length - 1];
+    renderPerClass(last);
+    renderPcLegend(last);
+  }
+}
+
+function renderPcLegend(last) {
+  const el = document.getElementById('pcLegend');
+  if (colorMode === 'source') {
+    el.innerHTML = `<div class="src-legend">
+      <div class="leg-item"><div class="leg-dot" style="background:${SRC_COLOR.nmd.replace('0.75','1')}"></div>NMD (land cover)</div>
+      <div class="leg-item"><div class="leg-dot" style="background:${SRC_COLOR.lpis.replace('0.75','1')}"></div>LPIS (crops)</div>
+      <div class="leg-item"><div class="leg-dot" style="background:${SRC_COLOR.hygge.replace('0.75','1')}"></div>Hygge (SKS)</div>
+    </div>`;
+  } else {
+    // Compact 4-column legend grid for all 22 classes
+    const items = CLASS_NAMES.map((cls, i) =>
+      `<span class="cls-item"><span class="cls-dot" style="background:${CLASS_COLORS[i]}"></span>${cls}</span>`
+    ).join('');
+    el.innerHTML = `<div class="cls-legend">${items}</div>`;
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+function computeBest(epochs) {
+  return epochs.reduce(
+    (a, e) => e.val_mIoU > a.bestMiou ? { bestMiou: e.val_mIoU, bestEpoch: e.epoch } : a,
+    { bestMiou: 0, bestEpoch: null }
+  );
+}
+function computePatienceUsed(epochs) {
+  for (let i = epochs.length - 1; i >= 0; i--)
+    if (epochs[i].is_best) return epochs.length - 1 - i;
+  return epochs.length;
+}
+function computeETA(epochs, total) {
+  if (!epochs.length) return null;
+  const w = Math.min(5, epochs.length);
+  const avg = epochs.slice(-w).reduce((s, e) => s + e.elapsed_s, 0) / w;
+  return (total - epochs[epochs.length - 1].epoch) * avg;
+}
+function fmtSec(s) {
+  if (s == null || s < 0) return '—';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+function fmtN(n) {
+  return n >= 1e6 ? `${(n/1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n/1e3)}K` : `${n}`;
+}
+
+// ── Render functions ──────────────────────────────────────────────────────
+function renderHeader(cfg, last, status) {
+  document.getElementById('hRunId').textContent   = cfg.run_id || '—';
+  document.getElementById('hStage').textContent   =
+    last.stage === 1 ? 'Stage 1 — frozen backbone' : 'Stage 2 — full fine-tune';
+  if (cfg.amp) document.getElementById('hAmp').style.display = '';
+  const dot  = document.getElementById('sDot');
+  const text = document.getElementById('sText');
+  dot.className = `s-dot ${status}`;
+  text.textContent = { training: 'Training', done: 'Complete', stalled: 'Stalled — early stop' }[status] ?? status;
+}
+
+function renderCards(cfg, last, bestMiou, bestEpoch, etaSec) {
+  const total = cfg.epochs_planned ?? 35;
+  document.getElementById('cEpoch').textContent    = `${last.epoch} / ${total}`;
+  document.getElementById('cEpochSub').textContent = `Stage ${last.stage}  ·  batch ${cfg.batch_size?.toLocaleString()}`;
+  document.getElementById('cBestMiou').textContent = bestMiou.toFixed(4);
+  document.getElementById('cBestSub').textContent  = `@ epoch ${bestEpoch}`;
+  document.getElementById('cCurMiou').textContent    = last.val_mIoU.toFixed(4);
+  document.getElementById('cCurMiouSub').textContent = last.is_best ? '★ new best' : `Δ ${(last.val_mIoU - bestMiou).toFixed(4)}`;
+  document.getElementById('cValLoss').textContent    = last.val_loss.toFixed(4);
+  document.getElementById('cValLossSub').textContent = `train: ${last.train_loss.toFixed(4)}`;
+  document.getElementById('cValOA').textContent    = last.val_OA.toFixed(4);
+  document.getElementById('cValOASub').textContent = `mAcc: ${last.val_mAcc.toFixed(4)}`;
+  document.getElementById('cTime').textContent    = `${Math.round(last.elapsed_s)}s`;
+  document.getElementById('cTimeSub').textContent =
+    last.stage === 1 ? `lr: ${last.lr.toExponential(1)}` :
+    `head: ${last.lr.toExponential(1)} · bb: ${(last.lr * (cfg.backbone_lr_factor ?? 0.1)).toExponential(1)}`;
+  document.getElementById('cETA').textContent    = fmtSec(etaSec);
+  document.getElementById('cETASub').textContent = `${total - last.epoch} epochs left`;
+}
+
+function renderProgress(last, total, patienceUsed) {
+  const pct = (last.epoch / total * 100).toFixed(1);
+  document.getElementById('progPct').textContent = `${pct}%`;
+  document.getElementById('progBar').style.width = `${pct}%`;
+  const dots = document.getElementById('pdots');
+  dots.innerHTML = '';
+  for (let i = 0; i < 10; i++) {
+    const d = document.createElement('div');
+    d.className = 'pdot' + (i < patienceUsed ? (i >= 8 ? ' alert' : ' used') : '');
+    dots.appendChild(d);
+  }
+  document.getElementById('pcount').textContent = `${patienceUsed} / 10`;
+}
+
+function renderMiouChart(epochs, bestEpoch) {
+  const labels = epochs.map(e => e.epoch);
+  const vals   = epochs.map(e => e.val_mIoU);
+  charts.miou.data.labels = labels;
+  charts.miou.data.datasets = [{
+    label: 'val mIoU', data: vals,
+    borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.06)',
+    borderWidth: 2, fill: true, tension: 0.3,
+    pointStyle:           epochs.map(e => e.epoch === bestEpoch ? 'star' : 'circle'),
+    pointRadius:          epochs.map(e => e.epoch === bestEpoch ? 8 : 3),
+    pointBackgroundColor: epochs.map(e => e.epoch === bestEpoch ? '#d97706' : '#2563eb'),
+  }];
+  charts.miou.options.scales.y.max = Math.max(0.5, ...vals) + 0.05;
+  charts.miou.update('none');
+}
+
+function renderLossChart(epochs) {
+  charts.loss.data.labels = epochs.map(e => e.epoch);
+  charts.loss.data.datasets = [
+    { label: 'train loss', data: epochs.map(e => e.train_loss),
+      borderColor: '#dc2626', backgroundColor: 'transparent',
+      borderWidth: 2, pointRadius: 2, fill: false, tension: 0.3 },
+    { label: 'val loss', data: epochs.map(e => e.val_loss),
+      borderColor: '#ea580c', backgroundColor: 'transparent', borderDash: [5, 3],
+      borderWidth: 2, pointRadius: 2, fill: false, tension: 0.3 }
+  ];
+  charts.loss.update('none');
+}
+
+function renderPerClass(last) {
+  const iou = last.per_class_iou ?? {};
+  const n   = last.per_class_n   ?? {};
+  const sorted = Object.entries(iou).sort(([,a],[,b]) => b - a);
+  const labels = sorted.map(([cls]) => cls);
+  const vals   = sorted.map(([,v]) => v);
+  const getColor = colorMode === 'source' ? srcColor : classColor;
+  const colors = labels.map(getColor);
+
+  charts.perClass._pcLabels = labels.map(cls => fmtN(n[cls] ?? 0));
+  charts.perClass._pcN      = n;
+  charts.perClass.data.labels = labels;
+  charts.perClass.data.datasets = [{
+    data: vals,
+    backgroundColor: colorMode === 'source'
+      ? colors
+      : colors.map(c => c + 'cc'),      // add alpha in class mode
+    borderColor: colors,
+    borderWidth: 1,
+    barPercentage: 0.8,
+  }];
+  charts.perClass.update('none');
+}
+
+function renderSparklines(epochs) {
+  if (epochs.length < 2) return;
+  const last = epochs[epochs.length - 1];
+  const top8 = Object.entries(last.per_class_iou ?? {})
+    .sort(([,a],[,b]) => b - a).slice(0, 8).map(([cls]) => cls);
+  charts.spark.data.labels = epochs.map(e => e.epoch);
+  charts.spark.data.datasets = top8.map(cls => ({
+    label: cls,
+    data:  epochs.map(e => e.per_class_iou?.[cls] ?? null),
+    borderColor: classColor(cls),   // always use per-class colors in sparklines
+    backgroundColor: 'transparent',
+    borderWidth: 1.5, pointRadius: 2, fill: false, tension: 0.2, spanGaps: true,
+  }));
+  charts.spark.update('none');
+}
+
+function renderConfusions(last) {
+  const pairs = last.top_confusions;
+  const card = document.getElementById('confusionCard');
+  if (!pairs || pairs.length === 0) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const maxRate = pairs[0].rate;   // already sorted descending by rate
+  document.getElementById('confusionBody').innerHTML = pairs.map(p => {
+    const trueColor  = classColor(p.true);
+    const predColor  = classColor(p.pred);
+    const barWidth   = (p.rate / maxRate * 100).toFixed(1);
+    const rateClass  = p.rate >= 0.3 ? 'color:#dc2626;font-weight:700'
+                     : p.rate >= 0.15 ? 'color:#d97706;font-weight:600'
+                     : 'color:#475569';
+    return `<tr>
+      <td style="text-align:left">
+        <span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${trueColor};margin-right:5px;vertical-align:middle"></span>${p.true}
+      </td>
+      <td style="text-align:left">
+        <span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${predColor};margin-right:5px;vertical-align:middle"></span>${p.pred}
+      </td>
+      <td>${p.count.toLocaleString('sv-SE')}</td>
+      <td style="${rateClass}">${(p.rate * 100).toFixed(1)}%</td>
+      <td style="padding-right:12px">
+        <div style="background:#f1f5f9;border-radius:2px;height:6px;overflow:hidden">
+          <div style="width:${barWidth}%;height:100%;background:${p.rate>=0.3?'#dc2626':p.rate>=0.15?'#d97706':'#2563eb'};border-radius:2px"></div>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function renderTable(epochs) {
+  document.getElementById('epochTableBody').innerHTML =
+    [...epochs].reverse().map(ep => `
+      <tr class="${ep.is_best ? 'row-best' : ''}">
+        <td>${ep.epoch}</td><td>${ep.stage}</td>
+        <td>${ep.train_loss.toFixed(4)}</td><td>${ep.val_loss?.toFixed(4) ?? '—'}</td>
+        <td>${ep.val_mIoU?.toFixed(4) ?? '—'}</td><td>${ep.val_OA?.toFixed(4) ?? '—'}</td>
+        <td>${ep.val_mAcc?.toFixed(4) ?? '—'}</td>
+        <td>${ep.lr.toExponential(2)}</td><td>${Math.round(ep.elapsed_s)}</td>
+        <td class="star">${ep.is_best ? '★' : ''}</td>
+      </tr>`).join('');
+}
+
+function renderTilePreds() {
+  const m = tileState.manifest;
+  const content = document.getElementById('tilesContent');
+  const sliderWrap = document.getElementById('sliderWrap');
+  if (!m?.tiles?.length || !m.epochs?.length) {
+    content.innerHTML = `<div class="tiles-empty">No tile predictions yet<br>
+      <span style="font-size:10px;opacity:.6">Enable with <code>--tile-pred-n 6</code></span></div>`;
+    sliderWrap.style.display = 'none';
+    return;
+  }
+  const sortedEpochs = [...m.epochs].sort((a,b) => a-b);
+  if (!tileState.currentEpoch || !sortedEpochs.includes(tileState.currentEpoch))
+    tileState.currentEpoch = sortedEpochs[sortedEpochs.length - 1];
+  const slider = document.getElementById('epochSlider');
+  slider.min = sortedEpochs[0]; slider.max = sortedEpochs[sortedEpochs.length-1];
+  slider.value = tileState.currentEpoch;
+  document.getElementById('sliderLabel').textContent = tileState.currentEpoch;
+  sliderWrap.style.display = 'flex';
+  const ep = tileState.currentEpoch;
+  content.innerHTML = `<div class="tiles-grid">${m.tiles.map(t => `
+    <div class="tile-item">
+      <div class="tile-item-name" title="${t.name}">${t.short ?? t.name}</div>
+      <div class="tile-pair">
+        <img src="tile_preds/epoch_${ep}/${t.name}_pred.png" alt="pred" loading="lazy" onerror="this.classList.add('missing')">
+        <img src="tile_preds/gt/${t.name}_gt.png" alt="gt" loading="lazy" onerror="this.classList.add('missing')">
+      </div>
+      <div class="tile-pair-labels"><span>pred</span><span>ground truth</span></div>
+    </div>`).join('')}</div>`;
+}
+
+// ── Main render ───────────────────────────────────────────────────────────
+function render(data) {
+  const cfg    = data.config ?? {};
+  const epochs = data.epochs ?? [];
+  if (!epochs.length) { renderSkeleton(); return; }
+
+  const last  = epochs[epochs.length - 1];
+  const { bestMiou, bestEpoch } = computeBest(epochs);
+  const patienceUsed = computePatienceUsed(epochs);
+  const total  = cfg.epochs_planned ?? 35;
+  const etaSec = computeETA(epochs, total);
+  const status = last.epoch >= total ? 'done'
+    : patienceUsed >= 10 ? 'stalled' : 'training';
+
+  renderHeader(cfg, last, status);
+  renderCards(cfg, last, bestMiou, bestEpoch, etaSec);
+  renderProgress(last, total, patienceUsed);
+  renderMiouChart(epochs, bestEpoch);
+  renderLossChart(epochs);
+  renderPerClass(last);
+  renderPcLegend(last);
+  renderSparklines(epochs);
+  renderConfusions(last);
+  renderTable(epochs);
+
+  document.getElementById('updateNote').textContent =
+    `Synced: ${new Date(state.lastFetch).toLocaleTimeString('sv-SE')} — auto-refresh every 30s`;
+}
+
+function renderSkeleton() {
+  document.getElementById('sDot').className = 's-dot';
+  document.getElementById('sText').textContent = state.fetchError ? 'No data — check sync.sh' : 'Waiting for first epoch…';
+}
+
+// ── Fetch ─────────────────────────────────────────────────────────────────
+async function fetchData() {
+  state.countdown = 30;
+  try {
+    const r = await fetch('training_log.json?t=' + Date.now());
+    if (!r.ok) throw new Error(r.status);
+    state.data = await r.json();
+    state.lastFetch = Date.now();
+    state.fetchError = false;
+    render(state.data);
+  } catch (e) {
+    state.fetchError = true;
+    state.lastFetch = Date.now();
+    document.getElementById('sDot').className = 's-dot error';
+    document.getElementById('sText').textContent = 'No data';
+    document.getElementById('updateNote').textContent =
+      `Error at ${new Date().toLocaleTimeString('sv-SE')} — retrying in 30s`;
+  }
+  try {
+    const r = await fetch('tile_preds/manifest.json?t=' + Date.now());
+    if (r.ok) { tileState.manifest = await r.json(); renderTilePreds(); }
+  } catch (_) {}
+}
+
+function tick() {
+  state.countdown = Math.max(0, state.countdown - 1);
+  document.getElementById('refreshBtn').textContent = `⟳ ${state.countdown}s`;
+}
+
+document.getElementById('epochSlider').addEventListener('input', e => {
+  tileState.currentEpoch = parseInt(e.target.value);
+  document.getElementById('sliderLabel').textContent = tileState.currentEpoch;
+  renderTilePreds();
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+  initCharts();
+  fetchData();
+  setInterval(fetchData, 30000);
+  setInterval(tick, 1000);
+});
+</script>
+</body>
+</html>

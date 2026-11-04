@@ -1,0 +1,100 @@
+---
+# Job: Rebuild all labels (NMD + LPIS + SKS) from scratch for all ~6,600 tiles.
+#
+# Fixes applied in this run vs previous builds:
+#   ✓ NMD seam removed — rasterio out_shape instead of scipy.ndimage.zoom
+#   ✓ LPIS gated — only applied where NMD says åker/öppen mark (merge_all)
+#   ✓ SKS gated  — only applied where NMD says forest (merge_all)
+#   ✓ 23-class unified schema (10-class stubs removed)
+#
+# What this writes to each tile .npz:
+#   label           (H×W int8)   unified 23-class via merge_all()
+#   label_mask      (H×W uint16) raw LPIS SJV crop codes
+#   parcel_area_ha  (H×W float32) per-pixel parcel area for loss weighting
+#   harvest_mask    (H×W uint8)  SKS clearcut, no rotation (fixed geometry)
+#   n_parcels       (int32)
+#
+# Runtime estimate: 6,597 tiles ÷ 32 workers × ~3 s/tile ≈ 10 min
+#   + LPIS/SKS load overhead (~5 min) → ~15 min total
+# Memory: LPIS 4 years × ~3 Gi + SKS ~3 Gi + worker headroom → 96 Gi safe
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-labels-512
+  namespace: prithvi-training-default
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400   # 4 h safety cap (8261 tiles @ ~3000/h ≈ 2.8 h)
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: builder
+          image: python:3.11-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              export PYTHONUNBUFFERED=1
+              echo "=== Build Labels v2 — NMD + LPIS + SKS ==="
+              echo "Started: $(date)"
+
+              apt-get update -qq && apt-get install -y -qq git libgdal-dev gdal-bin > /dev/null 2>&1
+              pip install -q --no-cache-dir numpy scipy rasterio geopandas shapely pyproj pyarrow pyyaml
+
+              mkdir -p /workspace && cd /workspace
+              git clone --depth 1 https://github.com/TobiasEdman/ImintEngine.git imintengine
+              cd /workspace/imintengine
+              pip install --no-cache-dir -e . --no-deps 2>/dev/null || true
+
+              echo ""
+              echo "Data inventory:"
+              echo "  Tiles:      $(ls /data/unified_v2_512/*.npz 2>/dev/null | wc -l)"
+              echo "  NMD raster: $(ls -lh /data/nmd/*.tif 2>/dev/null | head -1)"
+              echo "  LPIS:       $(ls /data/lpis/*.parquet 2>/dev/null | wc -l) parquets"
+              echo "  SKS:        $(ls /data/sks/*.parquet 2>/dev/null | wc -l) parquets"
+              echo ""
+
+              # 2026-04-24: 32 workers / 96 Gi → OOM at tile ~5900/8260
+              #             (≈ 3 Gi/worker peak in dense LPIS regions).
+              # 2026-04-25 morning: 8 workers / 96 Gi finished clean in
+              #             3h24m (~2500 tiles/h).
+              # 2026-04-25 evening (this run): scale up — 32 workers /
+              #             64 CPU / 128 Gi pod. That's 4 Gi/worker
+              #             (33% above the OOM threshold) and ~4× the
+              #             8-worker throughput. Namespace memory quota
+              #             has 117 Gi free; 128 Gi fits once the prior
+              #             96 Gi pod fully terminates. ETA ~30 min.
+              python scripts/build_labels.py \
+                --data-dir  /data/unified_v2_512 \
+                --nmd-raster /data/nmd/nmd2018bas_ogeneraliserad_v1_1.tif \
+                --lpis-dir  /data/lpis \
+                --sks-dir   /data/sks \
+                --workers 32
+
+              echo ""
+              echo "=== QC ==="
+              python scripts/postprocess_qc.py --data-dir /data/unified_v2_512 || true
+
+              echo ""
+              echo "=== Done: $(date) ==="
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "32"
+              memory: "128Gi"
+            limits:
+              cpu: "32"
+              memory: "128Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: training-data-cephfs

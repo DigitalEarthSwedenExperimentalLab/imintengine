@@ -1,0 +1,51 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.9 dropped 2026-04: des-contracts requires >=3.11. ImintEngine
+        # itself is a torch/H100 codebase where 3.9 was legacy ballast.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest scikit-learn
+
+      # This module performs interactive OIDC login during collection.
+      # Run it separately in an authenticated DES session.
+      - name: Run offline regression tests
+        run: pytest tests/ --ignore=tests/test_des_connection.py -v
+
+  installed-library:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build the distributable
+        run: python -m pip wheel --no-deps . --wheel-dir dist
+      - name: Install only the base library
+        run: |
+          cd "$RUNNER_TEMP"
+          python -m pip install "$GITHUB_WORKSPACE"/dist/imint_engine-*.whl
+      - name: Verify installed imports and bundled resources
+        run: python -I tests/smoke_installed_package.py

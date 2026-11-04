@@ -1,0 +1,7391 @@
+"""
+imint/fetch.py — Sentinel-2 data fetching (DES + CDSE) and cloud detection
+
+**openEO-based fetchers** — used as fallback when the primary CDSE
+Sentinel Hub HTTP fetch (``imint/data/cdse_s2.py``) fails.  For bulk
+training data preparation, ``prepare_data.py`` uses the Sentinel Hub
+Process API first (fast, single HTTP POST per tile) and falls back to
+these openEO functions on error.
+
+openEO backends:
+  - DES (Digital Earth Sweden): ``fetch_des_data()``
+  - CDSE (Copernicus Data Space Ecosystem): ``fetch_copernicus_data()``
+  - Dispatcher: ``fetch_sentinel2_data(source="des"|"copernicus")``
+
+Both backends produce identical ``FetchResult`` objects with reflectance
+bands, SCL cloud mask, and RGB composites. Date discovery uses DES STAC
+for both backends.
+
+Also provides NMD (Nationellt Marktäckedata) fetching for LULC analysis.
+NMD is a static 10m land cover dataset from Naturvårdsverket.
+
+Sjökort (nautical chart) data can be fetched from Sjöfartsverket via
+SLU GET (Geodata Extraction Tool). This provides S-57 vector data for
+Swedish coastal and inland waters.
+
+Usage:
+    from imint.fetch import fetch_des_data, fetch_copernicus_data, FetchError
+    from imint.fetch import fetch_sentinel2_data
+    from imint.fetch import fetch_nmd_data, fetch_sjokort_data
+
+    # DES backend (default)
+    result = fetch_des_data(date="2022-06-15", coords={...})
+
+    # CDSE backend
+    result = fetch_copernicus_data(date="2022-06-15", coords={...})
+
+    # Or use the dispatcher
+    result = fetch_sentinel2_data(source="copernicus", date="2022-06-15", coords={...})
+
+    if result.cloud_fraction < 0.3:
+        # Use result.rgb and result.bands for analysis
+        ...
+
+    nmd = fetch_nmd_data(coords={...}, target_shape=(H, W))
+    # nmd.nmd_raster is uint8 with NMD class codes
+
+    sjokort = fetch_sjokort_data(coords={...}, email="user@org.se", session=shibboleth_session)
+    # sjokort.s57_paths contains downloaded S-57 (.000) files
+
+    # Or with pre-downloaded S-57 data and rendering:
+    sjokort = fetch_sjokort_data(
+        coords={...}, s57_dir="path/to/s57/",
+        render=True, output_path="sjokort.png",
+    )
+"""
+from __future__ import annotations
+
+import calendar
+import gzip
+import hashlib
+import io
+import json
+import math
+import os
+import tarfile
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from .utils import dn_to_reflectance, des_to_imint_bands, bands_to_rgb, haversine_m
+from .job import GeoContext
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+OPENEO_URL = "https://openeo.digitalearth.se"
+COLLECTION = "s2_msi_l2a"
+NMD_COLLECTION = "NMD_2018_Basskikt_v1_1"
+NMD_BAND = "Basskikt"
+# NMD is a static dataset — temporal extent on DES is a single ingestion
+# timestamp (2024-08-28), NOT the data vintage year. We omit the temporal
+# filter entirely to avoid the DES server returning an empty cube and
+# crashing with 500 Internal Error.
+NMD_TEMPORAL = None
+
+# NMD grid size in meters (EPSG:3006). All bounding boxes are snapped to this
+# grid so that Sentinel-2 and NMD rasters are pixel-aligned.
+NMD_GRID_SIZE = 10
+TARGET_CRS = "EPSG:3006"
+
+# DES band groupings by native resolution
+BANDS_10M = ["b02", "b03", "b04", "b08"]
+BANDS_20M_SPECTRAL = ["b05", "b06", "b07", "b8a", "b11", "b12"]
+BANDS_60M = ["b09"]
+BANDS_60M_ALL = ["b01", "b09"]  # Includes B01 (coastal aerosol) for grazing model
+BANDS_20M_CATEGORICAL = ["scl"]
+
+# 12-band order expected by pib-ml-grazing CNN-LSTM model (all S2 except B10)
+GRAZING_BAND_ORDER = [
+    "b01", "b02", "b03", "b04", "b05", "b06",
+    "b07", "b08", "b8a", "b09", "b11", "b12",
+]
+# Reorder indices: download order (10m+20m+60m_all) → GRAZING_BAND_ORDER
+# Download: b02(0) b03(1) b04(2) b08(3) b05(4) b06(5) b07(6) b8a(7) b11(8) b12(9) b01(10) b09(11)
+# Target:   b01(0) b02(1) b03(2) b04(3) b05(4) b06(5) b07(6) b08(7) b8a(8) b09(9) b11(10) b12(11)
+_GRAZING_REORDER = [10, 0, 1, 2, 4, 5, 6, 3, 7, 11, 8, 9]
+
+# ── CDSE (Copernicus Data Space Ecosystem) constants ─────────────────────────
+CDSE_OPENEO_URL = "https://openeo.dataspace.copernicus.eu/"
+CDSE_COLLECTION = "SENTINEL2_L2A"
+CDSE_BANDS_10M = ["B02", "B03", "B04", "B08"]
+CDSE_BANDS_20M_SPECTRAL = ["B05", "B06", "B07", "B8A", "B11", "B12"]
+CDSE_BANDS_60M = ["B09"]
+CDSE_BANDS_20M_CATEGORICAL = ["SCL"]
+
+# SCL cloud + shadow classes (Sentinel-2 L2A Scene Classification)
+# 3 = cloud_shadow, 8 = cloud_medium_probability,
+# 9 = cloud_high_probability, 10 = thin_cirrus
+SCL_CLOUD_CLASSES = frozenset({3, 8, 9, 10})
+
+# ── LPIS (Jordbruksverket) ────────────────────────────────────────────────
+LPIS_WFS_URL = "http://epub.sjv.se/inspire/inspire/wfs"
+LPIS_LAYER = "inspire:senaste_arslager_block"
+LPIS_PASTURE_AGOSLAG = "Bete"
+
+# Default token file location (project root)
+TOKEN_PATH_DEFAULT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".des_token"
+)
+
+
+# ── Grid alignment ───────────────────────────────────────────────────────────
+
+def _snap_to_target_grid(
+    raw: np.ndarray,
+    src_transform,
+    src_crs,
+    target_bounds: dict,
+    pixel_size: int = 10,
+    *,
+    resample: str = "subpixel",
+) -> tuple[np.ndarray, "Affine"]:
+    """Reproject/snap a raster to the exact target pixel grid.
+
+    The DES/openEO server may return Sentinel-2 data on a pixel grid that
+    is offset from the requested bounds due to the native tile alignment
+    and reprojection pipeline. This function ensures the output is
+    pixel-aligned to our canonical NMD 10m grid.
+
+    Uses a Fourier phase-shift for sub-pixel corrections (sinc
+    interpolation) when the offset is fractional, and simple array
+    slicing for integer-pixel offsets. Falls back to rasterio warp
+    for CRS mismatches.
+
+    Args:
+        raw:            (n_bands, H, W) array from rasterio.
+        src_transform:  Affine transform of the downloaded GeoTIFF.
+        src_crs:        CRS of the downloaded GeoTIFF.
+        target_bounds:  Dict with west/south/east/north in EPSG:3006.
+        pixel_size:     Grid cell size (default 10m).
+        resample:       ``"subpixel"`` (default) applies a Fourier sinc
+                        sub-pixel shift for the fractional offset — correct
+                        for continuous reflectance. ``"nearest"`` rounds the
+                        offset to the nearest integer pixel and never runs
+                        the sinc branch — MANDATORY for categorical rasters
+                        (SCL class codes): a sinc/bilinear shift would ring
+                        across class boundaries and invent codes that never
+                        existed. For a CRS-mismatch warp, ``"nearest"``
+                        selects ``Resampling.nearest`` (else bilinear).
+
+    Returns:
+        (aligned_raw, target_transform) — the raster snapped to the
+        target grid, and the corresponding Affine transform.
+    """
+    if resample not in ("subpixel", "nearest"):
+        raise ValueError(
+            f"_snap_to_target_grid: resample must be 'subpixel' or 'nearest', "
+            f"got {resample!r}"
+        )
+    from rasterio.transform import from_origin
+    from rasterio.crs import CRS
+
+    target_w = target_bounds["west"]
+    target_n = target_bounds["north"]
+    target_width = int((target_bounds["east"] - target_bounds["west"]) / pixel_size)
+    target_height = int((target_bounds["north"] - target_bounds["south"]) / pixel_size)
+    target_transform = from_origin(target_w, target_n, pixel_size, pixel_size)
+
+    # Check if the source transform already matches the target
+    src_x0 = src_transform.c
+    src_y0 = src_transform.f
+    dx_m = src_x0 - target_w
+    dy_m = target_n - src_y0
+
+    # Convert offset to pixels
+    dx_px = dx_m / pixel_size
+    dy_px = dy_m / pixel_size
+
+    # If essentially zero offset and same dimensions, no correction needed
+    if (abs(dx_px) < 0.01 and abs(dy_px) < 0.01
+            and raw.shape[1] == target_height and raw.shape[2] == target_width):
+        return raw, target_transform
+
+    # Check CRS match
+    if isinstance(src_crs, CRS):
+        src_crs_obj = src_crs
+    elif isinstance(src_crs, str):
+        src_crs_obj = CRS.from_user_input(src_crs)
+    else:
+        src_crs_obj = CRS(src_crs)
+    target_crs = CRS.from_epsg(3006)
+    if src_crs_obj != target_crs:
+        # Full reprojection needed (different CRS)
+        from rasterio.warp import reproject, Resampling
+        n_bands = raw.shape[0]
+        aligned = np.zeros((n_bands, target_height, target_width), dtype=raw.dtype)
+        for b in range(n_bands):
+            reproject(
+                source=raw[b],
+                destination=aligned[b],
+                src_transform=src_transform,
+                src_crs=src_crs_obj,
+                dst_transform=target_transform,
+                dst_crs=target_crs,
+                resampling=(Resampling.nearest if resample == "nearest"
+                            else Resampling.bilinear),
+            )
+        print(f"    [grid] Reprojected from {src_crs_obj} to target grid "
+              f"(offset was {dx_px:.2f}, {dy_px:.2f} px)")
+        return aligned, target_transform
+
+    # Same CRS — handle pixel offset (integer + sub-pixel)
+    int_dx = int(round(dx_px))
+    int_dy = int(round(dy_px))
+    frac_dx = dx_px - int_dx
+    frac_dy = dy_px - int_dy
+
+    n_bands, src_h, src_w = raw.shape
+    aligned = np.zeros((n_bands, target_height, target_width), dtype=raw.dtype)
+
+    # Compute overlap region
+    # Source pixel (sr, sc) maps to target pixel (sr + int_dy, sc + int_dx)
+    tgt_r0 = max(0, int_dy)
+    tgt_c0 = max(0, int_dx)
+    src_r0 = max(0, -int_dy)
+    src_c0 = max(0, -int_dx)
+    copy_h = min(target_height - tgt_r0, src_h - src_r0)
+    copy_w = min(target_width - tgt_c0, src_w - src_c0)
+
+    if copy_h > 0 and copy_w > 0:
+        aligned[:, tgt_r0:tgt_r0 + copy_h, tgt_c0:tgt_c0 + copy_w] = \
+            raw[:, src_r0:src_r0 + copy_h, src_c0:src_c0 + copy_w]
+
+    # Apply sub-pixel correction if needed (uses shared coregistration module).
+    # Skipped entirely for categorical rasters (resample="nearest") — the
+    # integer overlap-copy above already placed the class codes; a sinc shift
+    # would corrupt them.
+    if resample == "subpixel" and (abs(frac_dx) > 0.01 or abs(frac_dy) > 0.01):
+        from .coregistration import subpixel_shift
+        for b in range(n_bands):
+            aligned[b] = subpixel_shift(
+                aligned[b].astype(np.float64), frac_dy, frac_dx
+            ).astype(aligned.dtype)
+        print(f"    [grid] Applied sub-pixel correction: "
+              f"dy={frac_dy:+.3f} dx={frac_dx:+.3f} px "
+              f"({frac_dy*pixel_size:+.1f}m / {frac_dx*pixel_size:+.1f}m)")
+
+    if int_dx != 0 or int_dy != 0:
+        print(f"    [grid] Snapped to target grid: "
+              f"integer offset {int_dy},{int_dx} px "
+              f"({int_dy*pixel_size}m, {int_dx*pixel_size}m)")
+
+    return aligned, target_transform
+
+
+def _to_nmd_grid(coords: dict) -> dict:
+    """Convert WGS84 bounding box to EPSG:3006 snapped to the NMD 10m grid.
+
+    Steps:
+        1. Project WGS84 (EPSG:4326) → SWEREF99 TM (EPSG:3006)
+        2. Snap to NMD 10m grid boundaries (floor for west/south, ceil for east/north)
+        3. Return projected bbox with ``"crs": "EPSG:3006"``
+
+    This ensures all rasters fetched with the same WGS84 input coords land on
+    identical 10m pixel grids, making Sentinel-2 and NMD pixel-aligned.
+
+    Args:
+        coords: WGS84 bounding box ``{"west": lon, "south": lat, "east": lon, "north": lat}``.
+
+    Returns:
+        EPSG:3006 bounding box dict with ``"crs"`` key, snapped to 10m boundaries.
+        Example: ``{"west": 373820, "south": 6157630, "east": 380450, "north": 6168950, "crs": "EPSG:3006"}``
+    """
+    from rasterio.crs import CRS
+    from rasterio.warp import transform_bounds
+
+    w, s, e, n = transform_bounds(
+        CRS.from_epsg(4326), CRS.from_epsg(3006),
+        coords["west"], coords["south"], coords["east"], coords["north"],
+    )
+
+    grid = NMD_GRID_SIZE
+    return {
+        "west": math.floor(w / grid) * grid,
+        "south": math.floor(s / grid) * grid,
+        "east": math.ceil(e / grid) * grid,
+        "north": math.ceil(n / grid) * grid,
+        "crs": TARGET_CRS,
+    }
+
+
+# ── Exceptions ───────────────────────────────────────────────────────────────
+
+class FetchError(Exception):
+    """Raised when DES data fetching fails."""
+    pass
+
+
+# ── Result dataclass ─────────────────────────────────────────────────────────
+
+@dataclass
+class FetchResult:
+    """Result of a DES data fetch.
+
+    Attributes:
+        bands: Band dict with uppercase keys, reflectance [0, 1].
+               Example: {"B02": arr, "B03": arr, "B04": arr, "B08": arr, "B11": arr}
+        scl: Scene Classification Layer array (uint8, values 0-11), or None.
+        cloud_fraction: Fraction of pixels classified as cloud by SCL (0.0-1.0).
+        rgb: RGB composite (H, W, 3) float32 [0, 1], percentile-stretched.
+        geo: GeoContext with CRS, transform, and projected bounds.
+        crs: Coordinate reference system from the GeoTIFF (e.g. "EPSG:3006").
+             Deprecated — use geo.crs instead.
+        transform: Affine transform from the GeoTIFF.
+                   Deprecated — use geo.transform instead.
+    """
+    bands: dict[str, np.ndarray]
+    scl: np.ndarray | None
+    cloud_fraction: float
+    rgb: np.ndarray
+    geo: GeoContext | None = None
+    crs: Any | None = None
+    transform: Any | None = None
+
+
+@dataclass
+class GrazingTimeseriesResult:
+    """Result of a grazing timeseries fetch for one polygon.
+
+    Attributes:
+        data: (T, 12, H, W) float32 reflectance array.
+              Band order: B01, B02, B03, B04, B05, B06, B07, B08,
+                          B8A, B09, B11, B12.
+        dates: List of ISO date strings for the T cloud-free timesteps.
+        cloud_fractions: Per-date cloud fraction within the polygon.
+        polygon_id: Identifier for this polygon (index or name).
+        geo: GeoContext with CRS, transform, and projected bounds.
+        shape_hw: Spatial dimensions (H, W) of each timestep.
+    """
+    data: np.ndarray             # (T, 12, H, W) float32
+    dates: list[str]
+    cloud_fractions: list[float]
+    polygon_id: str | int
+    geo: GeoContext
+    shape_hw: tuple[int, int]
+
+
+# ── Cloud detection ──────────────────────────────────────────────────────────
+
+def check_cloud_fraction(scl: np.ndarray) -> float:
+    """Compute cloud + shadow fraction from a Scene Classification Layer array.
+
+    SCL classes counted as cloud/shadow:
+        3 = cloud_shadow
+        8 = cloud_medium_probability
+        9 = cloud_high_probability
+        10 = thin_cirrus
+
+    Args:
+        scl: 2D array (H, W) with SCL class values (0-11).
+
+    Returns:
+        Fraction of pixels that are cloud or shadow (0.0 to 1.0).
+    """
+    cloud_mask = np.isin(scl, list(SCL_CLOUD_CLASSES))
+    return float(cloud_mask.sum()) / max(scl.size, 1)
+
+
+def _polygon_cloud_fraction(
+    scl: np.ndarray,
+    polygon_mask: np.ndarray,
+) -> float:
+    """Compute cloud fraction ONLY within a polygon mask.
+
+    Unlike :func:`check_cloud_fraction` which checks the full bounding
+    box, this function restricts the count to pixels inside *polygon_mask*.
+
+    Args:
+        scl: 2D array (H, W) with SCL class values (0-11).
+        polygon_mask: 2D boolean array (H, W), True inside polygon.
+
+    Returns:
+        Fraction of polygon pixels that are cloud/shadow (0.0 to 1.0).
+        Returns 1.0 if polygon_mask has zero True pixels.
+    """
+    n_polygon = int(polygon_mask.sum())
+    if n_polygon == 0:
+        return 1.0
+    cloud_mask = np.isin(scl, list(SCL_CLOUD_CLASSES))
+    cloud_in_polygon = int((cloud_mask & polygon_mask).sum())
+    return cloud_in_polygon / n_polygon
+
+
+def _rasterize_polygon(
+    polygon_geom,
+    projected_bounds: dict,
+    pixel_size: int = 10,
+) -> np.ndarray:
+    """Rasterize a shapely polygon to a boolean mask on the NMD 10m grid.
+
+    Args:
+        polygon_geom: Shapely geometry in EPSG:3006.
+        projected_bounds: Dict with west/south/east/north in EPSG:3006.
+        pixel_size: Grid cell size (default 10m).
+
+    Returns:
+        Boolean array (H, W) where True = inside polygon.
+    """
+    from rasterio.transform import from_origin
+    from rasterio.features import rasterize as rio_rasterize
+
+    width = int((projected_bounds["east"] - projected_bounds["west"]) / pixel_size)
+    height = int((projected_bounds["north"] - projected_bounds["south"]) / pixel_size)
+    transform = from_origin(
+        projected_bounds["west"], projected_bounds["north"],
+        pixel_size, pixel_size,
+    )
+    mask = rio_rasterize(
+        [(polygon_geom, 1)],
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+    )
+    return mask.astype(bool)
+
+
+def _polygon_to_projected_bbox(
+    polygon_geom,
+    src_crs: str = "EPSG:4326",
+    buffer_m: float = 50.0,
+) -> dict:
+    """Convert a polygon geometry to a projected EPSG:3006 bbox on the NMD grid.
+
+    Computes the bounding box of the polygon, adds a buffer, and snaps
+    to the 10m NMD grid.
+
+    Args:
+        polygon_geom: Shapely geometry (in *src_crs*).
+        src_crs: CRS of the input geometry.  Default: EPSG:4326.
+        buffer_m: Buffer in metres around the polygon bbox (default 50m =
+                  5 pixels at 10m, giving the model context around edges).
+
+    Returns:
+        EPSG:3006 bbox dict snapped to NMD grid, with ``"crs"`` key.
+    """
+    from rasterio.crs import CRS
+    from rasterio.warp import transform_bounds
+
+    minx, miny, maxx, maxy = polygon_geom.bounds
+
+    if src_crs != TARGET_CRS:
+        w, s, e, n = transform_bounds(
+            CRS.from_user_input(src_crs), CRS.from_epsg(3006),
+            minx, miny, maxx, maxy,
+        )
+    else:
+        w, s, e, n = minx, miny, maxx, maxy
+
+    # Add buffer
+    w -= buffer_m
+    s -= buffer_m
+    e += buffer_m
+    n += buffer_m
+
+    # Snap to NMD grid
+    grid = NMD_GRID_SIZE
+    return {
+        "west": math.floor(w / grid) * grid,
+        "south": math.floor(s / grid) * grid,
+        "east": math.ceil(e / grid) * grid,
+        "north": math.ceil(n / grid) * grid,
+        "crs": TARGET_CRS,
+    }
+
+
+# ── DES connection ───────────────────────────────────────────────────────────
+
+_ROOT_DOTENV_LOADED = False
+
+
+def _try_load_root_dotenv():
+    """Try loading .env from the project root (auto-discover).
+
+    Injects DES_USER, DES_PASSWORD, CDSE_CLIENT_ID, etc. into os.environ
+    without overwriting values already set.  Runs at most once.
+    """
+    global _ROOT_DOTENV_LOADED
+    if _ROOT_DOTENV_LOADED:
+        return
+    _ROOT_DOTENV_LOADED = True
+
+    from pathlib import Path
+
+    # Walk up from this file to find the project root (.git marker)
+    for ancestor in Path(__file__).resolve().parents:
+        env_file = ancestor / ".env"
+        if env_file.exists():
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                        value = value[1:-1]
+                    if key not in os.environ:
+                        os.environ[key] = value
+            return
+        if (ancestor / ".git").exists():
+            break
+
+
+def _discover_openeo_endpoint(base_url: str, timeout: float = 10.0) -> tuple[str, str] | None:
+    """Query ``/.well-known/openeo`` and return the (url, api_version)
+    of the highest production version the server advertises.
+
+    openEO servers advertise version-pinned URLs (e.g.
+    ``https://openeo.dataspace.copernicus.eu/openeo/1.2/``). Connecting
+    to that pinned URL — instead of the root — forces the client to
+    speak exactly that version, protecting us from:
+
+        - Servers stuck on older API (DES is 1.1.0 only)
+        - Client library defaults drifting across upgrades
+        - Silent negotiation picking a version with process-graph
+          regressions (we had reduce_dimension issues before)
+
+    Args:
+        base_url: openEO root URL.
+        timeout: HTTP timeout.
+
+    Returns:
+        ``(pinned_url, api_version)`` or ``None`` when discovery fails.
+        Caller should fall back to implicit ``openeo.connect(base_url)``.
+    """
+    import json as _json
+    import urllib.request
+
+    url = base_url.rstrip("/") + "/.well-known/openeo"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            payload = _json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+    versions = payload.get("versions") or []
+    prod = [v for v in versions if v.get("production") is True
+            and v.get("api_version") and v.get("url")]
+    if not prod:
+        prod = [v for v in versions if v.get("api_version") and v.get("url")]
+    if not prod:
+        return None
+
+    def _vkey(v):
+        try:
+            return tuple(int(p) for p in v["api_version"].split("."))
+        except Exception:
+            return (0,)
+
+    prod.sort(key=_vkey, reverse=True)
+    best = prod[0]
+    return best["url"], best["api_version"]
+
+
+def _connect_with_version(openeo_module, base_url: str, label: str):
+    """Connect to the version-pinned URL from ``/.well-known/openeo``.
+
+    Logs which API version was selected. Falls back to implicit
+    ``openeo.connect(base_url)`` when discovery fails (unreachable
+    well-known, malformed payload, empty versions list).
+    """
+    discovered = _discover_openeo_endpoint(base_url)
+    if discovered is not None:
+        pinned_url, version = discovered
+        print(f"    [{label}] openEO api={version} url={pinned_url}")
+        return openeo_module.connect(pinned_url)
+    print(f"    [{label}] openEO version discovery failed; implicit connect to {base_url}")
+    return openeo_module.connect(base_url)
+
+
+def _connect(token: str | None = None, token_path: str | None = None):
+    """Connect and authenticate to DES.
+
+    Authentication priority:
+        1. Explicit token argument
+        2. DES_TOKEN environment variable
+        3. DES_USER + DES_PASSWORD environment variables (Basic Auth)
+        4. Stored refresh token (from ``des_login.py --device``, auto-renews)
+        5. Token file at token_path (default: .des_token in project root)
+
+    Returns:
+        Authenticated openeo.Connection.
+
+    Raises:
+        FetchError: If authentication fails.
+    """
+    try:
+        import openeo
+    except ImportError:
+        raise ImportError(
+            "openeo is required for DES data fetching. "
+            "Install with: pip install openeo"
+        )
+
+    try:
+        conn = _connect_with_version(openeo, OPENEO_URL, "DES")
+    except Exception as e:
+        raise FetchError(f"Failed to connect to {OPENEO_URL}: {e}")
+
+    # Authentication priority (see docstring): explicit token -> DES_TOKEN env
+    # -> basic auth -> stored refresh token -> token file. Each tier falls
+    # through to the next on absence/failure; only the last tier raises.
+    PROVIDER = "egi"
+
+    # 1. Explicit token argument
+    if token:
+        conn.authenticate_oidc_access_token(access_token=token, provider_id=PROVIDER)
+        return conn
+
+    # 2. DES_TOKEN environment variable
+    env_token = os.environ.get("DES_TOKEN")
+    if env_token:
+        conn.authenticate_oidc_access_token(access_token=env_token, provider_id=PROVIDER)
+        return conn
+
+    # 3. Basic Auth — DES_USER + DES_PASSWORD (env, else root .env file)
+    des_user = os.environ.get("DES_USER")
+    des_password = os.environ.get("DES_PASSWORD")
+    if not des_user or not des_password:
+        _try_load_root_dotenv()
+        des_user = os.environ.get("DES_USER")
+        des_password = os.environ.get("DES_PASSWORD")
+    if des_user and des_password:
+        conn.authenticate_basic(username=des_user, password=des_password)
+        return conn
+
+    # 4. Stored refresh token (from des_login.py --device; auto-renews)
+    try:
+        conn.authenticate_oidc_refresh_token()
+        return conn
+    except Exception:
+        pass  # no/expired stored refresh token -> fall through to the token file
+
+    # 5. Token file (explicit path, else .des_token in project root)
+    tok_path = token_path or TOKEN_PATH_DEFAULT
+    if os.path.isfile(tok_path):
+        with open(tok_path) as fh:
+            file_token = fh.read().strip()
+        if file_token:
+            conn.authenticate_oidc_access_token(access_token=file_token, provider_id=PROVIDER)
+            return conn
+
+    raise FetchError(
+        "DES authentication not configured. Provide a token argument, set "
+        "DES_TOKEN, set DES_USER + DES_PASSWORD, store a refresh token via "
+        f"des_login.py --device, or place a token at {tok_path}."
+    )
+
+
+# ── CDSE connection ──────────────────────────────────────────────────────────
+
+_CDSE_CC_FALLBACK_WARNED = False  # warn once per process when client_creds 401s
+
+
+def _connect_cdse():
+    """Connect and authenticate to CDSE (Copernicus Data Space Ecosystem).
+
+    Methods are attempted in priority order, falling through on failure so
+    a broken service-account secret degrades gracefully to the account
+    password flow instead of hard-failing:
+
+        1. client_credentials — service account
+           (CDSE_CLIENT_ID/SECRET env, else .cdse_credentials lines 3+4).
+        2. resource-owner password — account login via the public client
+           (CDSE_USER/CDSE_PASSWORD env, else .cdse_credentials lines 1+2).
+           Always uses client_id="cdse-public"; the confidential service
+           client is never reused for the password grant.
+        3. interactive OIDC (browser) — local-dev last resort.
+
+    Returns:
+        Authenticated openeo.Connection.
+
+    Raises:
+        FetchError: If every configured method fails.
+    """
+    try:
+        import openeo
+    except ImportError:
+        raise ImportError(
+            "openeo is required for CDSE data fetching. "
+            "Install with: pip install openeo"
+        )
+
+    try:
+        conn = _connect_with_version(openeo, CDSE_OPENEO_URL, "CDSE")
+    except Exception as e:
+        raise FetchError(f"Failed to connect to {CDSE_OPENEO_URL}: {e}")
+
+    # Gather credentials: env first (pod), then .cdse_credentials file as
+    # local-dev fallback (line1 email, line2 password, line3 client_id,
+    # line4 client_secret). env values always take priority.
+    client_id = os.environ.get("CDSE_CLIENT_ID")
+    client_secret = os.environ.get("CDSE_CLIENT_SECRET")
+    username = os.environ.get("CDSE_USER")
+    password = os.environ.get("CDSE_PASSWORD")
+    if not (client_id and client_secret and username and password):
+        _try_load_root_dotenv()
+        client_id = client_id or os.environ.get("CDSE_CLIENT_ID")
+        client_secret = client_secret or os.environ.get("CDSE_CLIENT_SECRET")
+        username = username or os.environ.get("CDSE_USER")
+        password = password or os.environ.get("CDSE_PASSWORD")
+
+    cred_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ".cdse_credentials",
+    )
+    if os.path.isfile(cred_path):
+        try:
+            with open(cred_path) as f:
+                lines = [l.strip() for l in f.readlines()]
+        except Exception as e:
+            raise FetchError(f"Failed to read {cred_path}: {e}")
+        username = username or (lines[0] if len(lines) >= 1 else None)
+        password = password or (lines[1] if len(lines) >= 2 else None)
+        client_id = client_id or (lines[2] if len(lines) >= 3 else None)
+        client_secret = client_secret or (lines[3] if len(lines) >= 4 else None)
+
+    errors = []
+
+    # 1. Service account (client_credentials). On failure, fall through —
+    #    a rotated/revoked service secret must not block the password flow.
+    if client_id and client_secret:
+        try:
+            conn.authenticate_oidc_client_credentials(
+                client_id=client_id, client_secret=client_secret,
+            )
+            return conn
+        except Exception as e:
+            errors.append(f"client_credentials: {e}")
+            global _CDSE_CC_FALLBACK_WARNED
+            if not _CDSE_CC_FALLBACK_WARNED:
+                _CDSE_CC_FALLBACK_WARNED = True
+                print(
+                    f"    [CDSE] client_credentials auth failed ({type(e).__name__}); "
+                    "falling through to account password flow (warned once)",
+                    flush=True,
+                )
+
+    # 2. Resource-owner password via the PUBLIC client. The confidential
+    #    service client_id is intentionally not reused here — the password
+    #    grant runs against "cdse-public".
+    if username and password:
+        try:
+            conn.authenticate_oidc_resource_owner_password_credentials(
+                username=username, password=password, client_id="cdse-public",
+            )
+            return conn
+        except Exception as e:
+            errors.append(f"password: {e}")
+
+    # 3. Interactive OIDC (opens browser) — local-dev last resort.
+    try:
+        conn.authenticate_oidc()
+        return conn
+    except Exception as e:
+        errors.append(f"oidc: {e}")
+
+    raise FetchError(
+        "CDSE authentication failed for every configured method:\n  "
+        + "\n  ".join(errors)
+        + "\nSet CDSE_CLIENT_ID+CDSE_CLIENT_SECRET (service account) or "
+        "CDSE_USER+CDSE_PASSWORD (account login), or create "
+        f"{cred_path} (line1 email, line2 password, line3 client_id, line4 secret)."
+    )
+
+
+# ── Main fetch function ─────────────────────────────────────────────────────
+
+def _unpack_openeo_gtiff_bytes(data: bytes) -> bytes:
+    """Unwrap an openEO ``download(format="gtiff")`` response to a bare GeoTIFF.
+
+    Some openEO backends (DES as of 2026-04) wrap the result in a gzipped
+    tar archive even for single-date single-band-group requests — one
+    GeoTIFF per scene timestamp inside. This helper detects gzip / tar
+    framing and returns a single GeoTIFF byte string regardless. Bare
+    GeoTIFFs pass through untouched.
+
+    Multi-scene tarballs (e.g. S2A and S2B passes ten minutes apart) are
+    resolved by picking the **earliest** member by sorted name — which
+    is the earliest acquisition timestamp because DES names members
+    ``out_<YYYY>_<MM>_<DD>T<HH>_<MM>_<SS>.tif``. Single-sensor
+    consistency beats mosaicking by default; callers that genuinely
+    need multi-scene fusion can use ``return_bytes=True`` and parse the
+    archive themselves.
+
+    Returns:
+        Bytes parseable directly with ``rasterio.open(io.BytesIO(...))``.
+
+    Raises:
+        FetchError: If the payload appears to be a tar archive with no
+            ``.tif``/``.tiff`` members.
+    """
+    # Layer 1 — gzip
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+
+    # Layer 2 — tar
+    is_tar = (
+        data[:14] == b"././@PaxHeader"
+        or (len(data) > 262 and data[257:262] == b"ustar")
+    )
+    if not is_tar:
+        return data
+
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        members = sorted(
+            (m for m in tf
+             if m.isfile() and m.name.lower().endswith((".tif", ".tiff"))),
+            key=lambda m: m.name,
+        )
+        if not members:
+            raise FetchError("openEO tar payload contained no GeoTIFF members")
+        return tf.extractfile(members[0]).read()
+
+
+def _load_s2_cube(
+    conn,
+    *,
+    projected_coords: dict,
+    temporal: list,
+    collection_id: str,
+    bands_10m: list[str],
+    bands_20m: list[str] | None = None,
+    bands_60m: list[str] | None = None,
+    scl_band: list[str] | None = None,
+    reduce_last: bool = False,
+    merge_reference_into_output: bool = True,
+    return_bytes: bool = False,
+    empty_msg: str = "openEO returned empty cube data",
+):
+    """Assemble + download (+ optionally parse) a Sentinel-2 openEO cube.
+
+    Captures the openEO load-collection / resample / merge / download-gtiff /
+    parse skeleton shared by all multi-band Sentinel-2 fetchers in this
+    module: :func:`_fetch_s2_via_openeo`, :func:`_fetch_tci_bands`,
+    :func:`_fetch_ai2_bands`, :func:`_fetch_scl`, :func:`_fetch_scl_batch`,
+    :func:`_fetch_tci_scl_batch`.  Each caller keeps its own DN→reflectance,
+    tar.gz extraction, RGB-composite, and FetchResult-build logic; this
+    helper only abstracts the cube-assembly stage.
+
+    Args:
+        conn: Authenticated openEO connection (DES or CDSE).
+        projected_coords: EPSG:3006 bbox dict including ``"crs"``.
+        temporal: Two-element ``[start, end]`` ISO date range.
+        collection_id: openEO collection id (e.g. ``"s2_msi_l2a"`` or
+            ``"SENTINEL2_L2A"``).
+        bands_10m: 10m bands. Used as the reference grid for all
+            ``resample_cube_spatial`` calls. Required.
+        bands_20m: 20m spectral bands, resampled to 10m with bilinear.
+        bands_60m: 60m bands, resampled to 10m with bilinear.
+        scl_band: SCL band list, resampled to 10m with nearest-neighbour.
+        reduce_last: If True, reduce the temporal dimension with the
+            ``last`` reducer before download (used when a date window
+            is in play and the freshest pixel is wanted).
+        merge_reference_into_output: If True (default), the 10m bands are
+            merged into the downloaded cube. If False, the 10m bands are
+            used purely as a resample target and the output cube contains
+            only the 20m / 60m / SCL bands. Used by SCL-only fetchers that
+            need a 10m grid reference but do not want the reference band
+            in the result.
+        return_bytes: If True, return the raw downloaded ``bytes`` (and a
+            ``None`` for crs/transform) so the caller can parse a tar.gz
+            archive or otherwise handle multi-date payloads. If False
+            (default), parse the bytes as a single GeoTIFF and return
+            ``(raw_array, crs, transform)``.
+        empty_msg: Error message used if the backend returns empty bytes.
+
+    Returns:
+        - If ``return_bytes=False`` (default): ``(raw, crs, transform)``
+          where *raw* is a ``(N, H, W)`` numpy array in band order
+          ``bands_10m + bands_20m + bands_60m + scl_band`` (omitting
+          groups not requested, and omitting bands_10m when
+          ``merge_reference_into_output=False``).
+        - If ``return_bytes=True``: ``(data_bytes, None, None)``.
+
+    Raises:
+        FetchError: If the backend returns empty bytes, or the caller
+            requests ``merge_reference_into_output=False`` without any
+            non-10m bands (no output to download).
+    """
+    import rasterio
+
+    cube_10m = conn.load_collection(
+        collection_id=collection_id,
+        spatial_extent=projected_coords,
+        temporal_extent=temporal,
+        bands=bands_10m,
+    )
+
+    # Choose the cube that gets downloaded: either the 10m cube + everything
+    # merged on top, or — for SCL-only fetchers — only the non-10m bands.
+    if merge_reference_into_output:
+        cube = cube_10m
+    else:
+        cube = None  # populated by the first non-10m group below
+
+    def _attach(extra_cube):
+        nonlocal cube
+        if cube is None:
+            cube = extra_cube
+        else:
+            cube = cube.merge_cubes(extra_cube)
+
+    if bands_20m:
+        cube_20m = conn.load_collection(
+            collection_id=collection_id,
+            spatial_extent=projected_coords,
+            temporal_extent=temporal,
+            bands=bands_20m,
+        )
+        _attach(cube_20m.resample_cube_spatial(target=cube_10m, method="bilinear"))
+    if bands_60m:
+        cube_60m = conn.load_collection(
+            collection_id=collection_id,
+            spatial_extent=projected_coords,
+            temporal_extent=temporal,
+            bands=bands_60m,
+        )
+        _attach(cube_60m.resample_cube_spatial(target=cube_10m, method="bilinear"))
+    if scl_band:
+        cube_scl = conn.load_collection(
+            collection_id=collection_id,
+            spatial_extent=projected_coords,
+            temporal_extent=temporal,
+            bands=scl_band,
+        )
+        _attach(cube_scl.resample_cube_spatial(target=cube_10m, method="near"))
+
+    if cube is None:
+        raise FetchError(
+            "_load_s2_cube: merge_reference_into_output=False requires at "
+            "least one of bands_20m / bands_60m / scl_band."
+        )
+
+    if reduce_last:
+        cube = cube.reduce_dimension(dimension="t", reducer="last")
+
+    data = cube.download(format="gtiff")
+    if not data:
+        raise FetchError(empty_msg)
+
+    if return_bytes:
+        return data, None, None
+
+    # DES (and possibly other backends) may wrap the response in gzip+tar
+    # even for a single-date single-band-group request. Unwrap transparently.
+    data = _unpack_openeo_gtiff_bytes(data)
+
+    with rasterio.open(io.BytesIO(data)) as src:
+        raw = src.read()  # (N, H, W)
+        crs = src.crs
+        transform = src.transform
+
+    return raw, crs, transform
+
+
+def _fetch_scl(conn, projected_coords: dict, temporal: list, date_window: int,
+               source: str = "des"):
+    """Fetch only the SCL band and compute cloud fraction.
+
+    This is a lightweight request (~20x smaller than full spectral fetch)
+    used to pre-screen scenes before downloading expensive spectral bands.
+
+    Args:
+        conn: openEO connection (DES or CDSE).
+        projected_coords: EPSG:3006 bbox dict with ``"crs"`` key.
+        temporal: Two-element list ``[start_date, end_date]``.
+        date_window: Days before/after to search.
+        source: ``"des"`` or ``"copernicus"`` — selects collection/band names.
+
+    Returns:
+        Tuple of (scl_array, cloud_fraction, crs, transform).
+    """
+    # Select collection + band names based on source
+    if source == "copernicus":
+        _collection = CDSE_COLLECTION
+        _ref_band = "B02"
+        _scl_bands = CDSE_BANDS_20M_CATEGORICAL
+    else:
+        _collection = COLLECTION
+        _ref_band = "b02"
+        _scl_bands = BANDS_20M_CATEGORICAL
+
+    raw, crs, transform = _load_s2_cube(
+        conn,
+        projected_coords=projected_coords,
+        temporal=temporal,
+        collection_id=_collection,
+        bands_10m=[_ref_band],
+        scl_band=_scl_bands,
+        reduce_last=date_window > 0,
+        merge_reference_into_output=False,
+        empty_msg=f"{source.upper()} returned empty SCL data",
+    )
+
+    scl = raw[0].astype(np.uint8)
+    cloud_fraction = check_cloud_fraction(scl)
+    return scl, cloud_fraction, crs, transform
+
+
+def _fetch_scl_batch(
+    conn,
+    projected_coords: dict,
+    candidate_dates: list[str] | None = None,
+    *,
+    temporal: list[str] | None = None,
+    source: str = "des",
+) -> list[tuple[str, float]]:
+    """Fetch SCL for multiple dates in one call, return per-date cloud fractions.
+
+    Multi-date downloads are returned as a ``.tar.gz`` archive containing
+    one GeoTIFF per date (filename pattern ``out_YYYY_MM_DDT...tif``).
+    This function extracts each TIF, parses the date from the filename,
+    and computes ``check_cloud_fraction`` locally.
+
+    Supports two modes:
+
+    * **candidate_dates** — temporal extent is derived from the list;
+      only these dates are returned.
+    * **temporal** — explicit ``[start, end)`` range; ALL dates found
+      in the archive are returned (sorted by date).  This is the
+      "skip STAC" mode where DES discovers available dates directly.
+
+    Args:
+        conn: openEO connection (DES or CDSE).
+        projected_coords: EPSG:3006 bbox dict with ``"crs"`` key.
+        candidate_dates: Optional list of date strings to filter to.
+        temporal: Optional ``[start, end)`` ISO date pair.  If given,
+            *candidate_dates* is ignored and all dates are returned.
+        source: ``"des"`` or ``"copernicus"`` — selects collection/band names.
+
+    Returns:
+        List of ``(date_str, cloud_fraction)`` sorted by date or in
+        *candidate_dates* order.
+
+    Raises:
+        FetchError: If backend returns empty/unparseable data.
+    """
+    import re
+    import tarfile
+    import rasterio
+    from datetime import datetime as _dt, timedelta as _td
+
+    # Select collection + band names based on source
+    if source == "copernicus":
+        _collection = CDSE_COLLECTION
+        _ref_band = "B02"
+        _scl_bands = CDSE_BANDS_20M_CATEGORICAL
+    else:
+        _collection = COLLECTION
+        _ref_band = "b02"
+        _scl_bands = BANDS_20M_CATEGORICAL
+
+    # Determine temporal extent
+    if temporal is not None:
+        _temporal = temporal
+        cand_set = None  # accept all dates
+    elif candidate_dates:
+        sorted_cands = sorted(candidate_dates)
+        dt_end = _dt.strptime(sorted_cands[-1], "%Y-%m-%d") + _td(days=1)
+        _temporal = [sorted_cands[0], dt_end.strftime("%Y-%m-%d")]
+        cand_set = set(candidate_dates)
+    else:
+        return []
+
+    # Multi-date payload may be tar.gz (DES) or stacked-band gtiff (CDSE) —
+    # let the helper assemble + download, then parse the bytes here.
+    data, _, _ = _load_s2_cube(
+        conn,
+        projected_coords=projected_coords,
+        temporal=_temporal,
+        collection_id=_collection,
+        bands_10m=[_ref_band],
+        scl_band=_scl_bands,
+        merge_reference_into_output=False,
+        return_bytes=True,
+        empty_msg=f"{source.upper()} returned empty SCL batch data",
+    )
+
+    # DES returns tar.gz for multi-date results
+    cloud_by_date: dict[str, float] = {}
+    _DATE_RE = re.compile(r"out_(\d{4})_(\d{2})_(\d{2})T")
+
+    if isinstance(data, bytes) and data[:2] == b"\x1f\x8b":
+        # tar.gz archive — extract TIFs, parse dates from filenames
+        tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+        for member in tf.getmembers():
+            if not member.name.lower().endswith((".tif", ".tiff")):
+                continue
+            m = _DATE_RE.search(member.name)
+            if not m:
+                continue
+            date_str = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            if cand_set is not None and date_str not in cand_set:
+                continue  # extra date in range, skip
+            f = tf.extractfile(member)
+            if f is None:
+                continue
+            with rasterio.open(io.BytesIO(f.read())) as src:
+                scl = src.read()[0].astype(np.uint8)
+            cloud_by_date[date_str] = check_cloud_fraction(scl)
+        tf.close()
+    elif isinstance(data, bytes):
+        # Plain GeoTIFF — CDSE returns multi-date results as stacked
+        # bands (one band per date) instead of a tar.gz archive.
+        with rasterio.open(io.BytesIO(data)) as src:
+            raw = src.read()  # (N_dates, H, W)
+
+        # Build date list to match bands
+        if candidate_dates:
+            dates_list = sorted(candidate_dates)
+        elif temporal is not None:
+            dates_list = []
+            dt_cur = _dt.strptime(temporal[0], "%Y-%m-%d")
+            dt_end = _dt.strptime(temporal[1], "%Y-%m-%d")
+            while dt_cur < dt_end:
+                dates_list.append(dt_cur.strftime("%Y-%m-%d"))
+                dt_cur += _td(days=1)
+        else:
+            dates_list = []
+
+        n_bands = raw.shape[0]
+        if n_bands == 1 and dates_list:
+            # Single date — use first candidate
+            scl = raw[0].astype(np.uint8)
+            cloud_by_date[dates_list[0]] = check_cloud_fraction(scl)
+        elif n_bands == len(dates_list):
+            # One band per candidate date
+            for i, date_str in enumerate(dates_list):
+                if cand_set is not None and date_str not in cand_set:
+                    continue
+                scl = raw[i].astype(np.uint8)
+                cloud_by_date[date_str] = check_cloud_fraction(scl)
+        else:
+            # Band count doesn't match dates — use what we have
+            for i in range(min(n_bands, len(dates_list) if dates_list else n_bands)):
+                date_str = dates_list[i] if i < len(dates_list) else f"band_{i}"
+                scl = raw[i].astype(np.uint8)
+                cloud_by_date[date_str] = check_cloud_fraction(scl)
+    else:
+        raise FetchError(
+            f"SCL batch: unexpected format (magic={data[:4].hex()})"
+        )
+
+    if not cloud_by_date:
+        raise FetchError("SCL batch: no matching dates in archive")
+
+    # Return in candidate_dates order, or sorted by date
+    if candidate_dates is not None and cand_set is not None:
+        return [(d, cloud_by_date[d]) for d in candidate_dates if d in cloud_by_date]
+    return sorted(cloud_by_date.items())
+
+
+# ── Per-source openEO config ─────────────────────────────────────────────────
+#
+# Both DES and CDSE expose the same openEO API surface for Sentinel-2 L2A.
+# They differ only in:
+#   - which connection helper to call,
+#   - the collection id and band-name casing (DES lowercase / CDSE uppercase),
+#   - the DN→reflectance offset (`source` kwarg to `dn_to_reflectance`),
+#   - whether bands need a lowercase→uppercase remap on the way out,
+#   - the per-source cloud-fraction log prefix.
+#
+# This dict captures every divergence so the worker body can stay source-agnostic.
+_S2_SOURCES = {
+    "des": {
+        "collection_id":         COLLECTION,
+        "bands_10m":             BANDS_10M,
+        "bands_20m_spectral":    BANDS_20M_SPECTRAL,
+        "bands_60m":             BANDS_60M,
+        "bands_scl":             BANDS_20M_CATEGORICAL,
+        "reflectance_source":    "des",
+        "remap_to_imint":        True,   # lowercase b02 → IMINT uppercase B02
+        "cloud_log_prefix":      "    Cloud fraction:",
+        "empty_msg":             "DES returned empty data",
+        "fetch_failed_msg":      "DES fetch failed",
+    },
+    "copernicus": {
+        "collection_id":         CDSE_COLLECTION,
+        "bands_10m":             CDSE_BANDS_10M,
+        "bands_20m_spectral":    CDSE_BANDS_20M_SPECTRAL,
+        "bands_60m":             CDSE_BANDS_60M,
+        "bands_scl":             CDSE_BANDS_20M_CATEGORICAL,
+        "reflectance_source":    "copernicus",
+        "remap_to_imint":        False,  # already uppercase IMINT names
+        "cloud_log_prefix":      "    [CDSE] Cloud fraction:",
+        "empty_msg":             "CDSE returned empty data",
+        "fetch_failed_msg":      "CDSE fetch failed",
+    },
+}
+
+
+def _fetch_s2_via_openeo(
+    *,
+    source: str,
+    date: str,
+    coords: dict,
+    cloud_threshold: float,
+    token: str | None,
+    include_scl: bool,
+    date_window: int,
+) -> FetchResult:
+    """Unified Sentinel-2 L2A fetch via openEO (DES or CDSE).
+
+    Single implementation backing :func:`fetch_des_data` and
+    :func:`fetch_copernicus_data`.  Per-source differences are encoded in
+    :data:`_S2_SOURCES`; the body here is identical for every backend.
+
+    See :func:`fetch_des_data` for parameter docs — the public wrappers pin
+    *source* and otherwise forward kwargs unchanged.
+    """
+    import rasterio
+    from datetime import datetime, timedelta
+
+    cfg = _S2_SOURCES[source]
+
+    # STAC-guided date selection when using a date window
+    if date_window > 0:
+        date = _stac_best_date(coords, date, date_window)
+        date_window = 0  # fetch exact date
+
+    if source == "copernicus":
+        conn = _connect_cdse()
+    else:
+        conn = _connect(token=token)
+
+    # Project WGS84 coords to EPSG:3006 snapped to NMD 10m grid
+    projected_coords = _to_nmd_grid(coords)
+
+    # Temporal extent: single date (STAC already selected the best)
+    dt = datetime.strptime(date, "%Y-%m-%d")
+    start = dt.strftime("%Y-%m-%d")
+    end = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    temporal = [start, end]
+
+    # ── Fetch all bands in a single request ──────────────────────────────
+    try:
+        raw, crs, transform = _load_s2_cube(
+            conn,
+            projected_coords=projected_coords,
+            temporal=temporal,
+            collection_id=cfg["collection_id"],
+            bands_10m=cfg["bands_10m"],
+            bands_20m=cfg["bands_20m_spectral"],
+            bands_60m=cfg["bands_60m"],
+            scl_band=cfg["bands_scl"] if include_scl else None,
+            reduce_last=date_window > 0,
+            empty_msg=f"{cfg['empty_msg']} for {date}",
+        )
+    except FetchError:
+        raise
+    except Exception as e:
+        raise FetchError(f"{cfg['fetch_failed_msg']} for {date}: {e}")
+
+    # Snap to target NMD grid — corrects pixel-level and sub-pixel offsets
+    # that arise from Sentinel-2 tile alignment during server-side
+    # reprojection.  Ensures all dates produce identical pixel grids.
+    target_bounds = {k: v for k, v in projected_coords.items() if k != "crs"}
+    raw, transform = _snap_to_target_grid(
+        raw, transform, crs, target_bounds, pixel_size=NMD_GRID_SIZE,
+    )
+    crs = rasterio.crs.CRS.from_epsg(3006)
+
+    # Split into individual bands (order follows merge order):
+    # 10m → 20m spectral → 60m → SCL (if included)
+    spectral_names = (
+        cfg["bands_10m"] + cfg["bands_20m_spectral"] + cfg["bands_60m"]
+    )
+    n_spectral = len(spectral_names)
+
+    # Convert spectral bands: DN → reflectance
+    raw_bands = {}
+    for i, band_name in enumerate(spectral_names):
+        raw_bands[band_name] = dn_to_reflectance(
+            raw[i], source=cfg["reflectance_source"]
+        )
+
+    # Extract SCL if present (last band)
+    scl = None
+    cloud_fraction = 0.0
+    if include_scl and raw.shape[0] > n_spectral:
+        scl = raw[n_spectral].astype(np.uint8)
+        cloud_fraction = check_cloud_fraction(scl)
+        print(f"{cfg['cloud_log_prefix']} {cloud_fraction:.1%}")
+
+        if cloud_fraction > cloud_threshold:
+            raise FetchError(
+                f"Scene too cloudy: {cloud_fraction:.1%} cloud "
+                f"(threshold: {cloud_threshold:.0%}). "
+                f"Try a different date or wider date_window."
+            )
+
+    # Map to IMINT (uppercase) names if the backend used lowercase
+    if cfg["remap_to_imint"]:
+        imint_bands = des_to_imint_bands(raw_bands)
+    else:
+        imint_bands = raw_bands
+
+    # Create RGB composite (mask clouds from stretch if SCL available)
+    rgb = bands_to_rgb(imint_bands, scl=scl)
+
+    # Build GeoContext — links this raster to the NMD 10m grid
+    geo = GeoContext(
+        crs=str(crs),
+        transform=transform,
+        bounds_projected={k: v for k, v in projected_coords.items() if k != "crs"},
+        bounds_wgs84=coords,
+        shape=rgb.shape[:2],
+    )
+
+    return FetchResult(
+        bands=imint_bands,
+        scl=scl,
+        cloud_fraction=cloud_fraction,
+        rgb=rgb,
+        geo=geo,
+        crs=crs,
+        transform=transform,
+    )
+
+
+def fetch_des_data(
+    date: str,
+    coords: dict,
+    cloud_threshold: float = 0.1,
+    token: str | None = None,
+    include_scl: bool = True,
+    date_window: int = 0,
+) -> FetchResult:
+    """Fetch Sentinel-2 L2A data from DES via openEO.
+
+    Fetches all spectral bands + SCL in a single request. Cloud fraction
+    is computed *after* download from the SCL band and compared against
+    the threshold.  If the scene exceeds the threshold a ``FetchError``
+    is raised.
+
+    Args:
+        date: ISO date string, e.g. "2022-06-15".
+        coords: Bounding box dict with keys: west, south, east, north.
+        cloud_threshold: Maximum cloud fraction (0.0–1.0). Set to 1.0
+                         to accept any cloud cover. Default: 0.1 (10%).
+        token: Optional DES access token. Falls back to env/file/OIDC.
+        include_scl: If True, fetch SCL band for cloud stats and
+                     visualization. If False, skip SCL entirely.
+        date_window: Days before/after date to search for imagery.
+                     0 = single day, 5 = ±5 days window.
+
+    Returns:
+        FetchResult with bands, rgb, cloud_fraction, etc.
+
+    Raises:
+        FetchError: If data fetching fails or cloud cover exceeds threshold.
+        ImportError: If openeo is not installed.
+    """
+    return _fetch_s2_via_openeo(
+        source="des", date=date, coords=coords,
+        cloud_threshold=cloud_threshold, token=token,
+        include_scl=include_scl, date_window=date_window,
+    )
+
+
+# ── CDSE / Copernicus data fetching ──────────────────────────────────────────
+
+def fetch_copernicus_data(
+    date: str,
+    coords: dict,
+    cloud_threshold: float = 0.1,
+    include_scl: bool = True,
+    date_window: int = 0,
+) -> FetchResult:
+    """Fetch Sentinel-2 L2A data from CDSE via openEO.
+
+    Mirrors ``fetch_des_data`` but uses the Copernicus Data Space Ecosystem
+    (CDSE) openEO backend. Date discovery still uses DES STAC (via
+    ``_stac_best_date``); only the data fetch goes through CDSE.
+
+    Band names on CDSE are uppercase (B02, SCL) and DN→reflectance uses
+    ``source="copernicus"`` (offset = -1000).
+
+    Args:
+        date: ISO date string, e.g. "2022-06-15".
+        coords: Bounding box dict with keys: west, south, east, north.
+        cloud_threshold: Maximum cloud fraction (0.0–1.0). Default: 0.1.
+        include_scl: If True, fetch SCL band for cloud stats.
+        date_window: Days before/after date to search for imagery.
+                     0 = single day, 5 = ±5 days window.
+
+    Returns:
+        FetchResult with bands, rgb, cloud_fraction, etc.
+
+    Raises:
+        FetchError: If data fetching fails or cloud cover exceeds threshold.
+    """
+    return _fetch_s2_via_openeo(
+        source="copernicus", date=date, coords=coords,
+        cloud_threshold=cloud_threshold, token=None,
+        include_scl=include_scl, date_window=date_window,
+    )
+
+
+# ── L1C SAFE archive fetch from Google Cloud public bucket ─────────────────
+#
+# Fallback for when DES/CDSE openEO L1C paths are unavailable. The bucket
+# ``gs://gcp-public-data-sentinel-2`` mirrors ESA's L1C archive globally
+# with anonymous HTTPS access — no auth, no requester-pays charges. Used by
+# downstream tools (SNAP c2rcc, ACOLITE) that need full SAFE archives on
+# disk rather than a band cube.
+
+GCP_S2_BUCKET = "gcp-public-data-sentinel-2"
+GCP_S2_BASE = f"https://storage.googleapis.com/{GCP_S2_BUCKET}"
+GCP_S2_LIST_API = (
+    f"https://storage.googleapis.com/storage/v1/b/{GCP_S2_BUCKET}/o"
+)
+
+
+def _parse_safe_mgrs(safe_name: str) -> tuple[str, str, str]:
+    """Extract ``(utm_zone, lat_band, square)`` from a SAFE archive name.
+
+    Sentinel-2 SAFE naming convention (PSD ≥ 14.6):
+    ``S2{A,B}_MSIL1C_<DATE>T<TIME>_N<BASELINE>_R<ORBIT>_T<MGRS>_<DATE>T<TIME>.SAFE``
+
+    The MGRS token ``T<utm><lat_band><square>`` (e.g. ``T33VUE``) drives the
+    Google Cloud bucket layout: ``tiles/{utm}/{lat_band}/{square}/``.
+
+    Raises:
+        ValueError: If the name does not contain a recognisable MGRS token.
+    """
+    import re
+
+    m = re.search(r"_T(\d{2})([A-Z])([A-Z]{2})_", safe_name)
+    if not m:
+        raise ValueError(f"cannot parse MGRS tile from SAFE name: {safe_name}")
+    return m.group(1), m.group(2), m.group(3)
+
+
+def _utm_zone_from_lon(lon: float) -> int:
+    """Return the UTM zone number that covers a given WGS84 longitude.
+
+    Standard 6° UTM zones, 1–60. Lilla Karlsö centrum 17.925°E → zone 33.
+    Used by :func:`_stac_best_l1c_scene` to prefer SAFE archives whose
+    MGRS-tile is in the same UTM zone as the AOI centroid — avoids
+    cross-zone reprojection seams when the AOI happens to straddle a
+    zone boundary (Lilla Karlsö 17.91–18.075°E spans the 18°E gränsen,
+    STAC otherwise picks the cleanest tile regardless of zone).
+    """
+    return int((lon + 180) // 6) + 1
+
+
+def _stac_best_l1c_scene(
+    coords: dict,
+    date: str,
+    date_window: int = 0,
+    cloud_max: float = 100.0,
+    *,
+    preferred_utm_zone: int | None = None,
+) -> dict:
+    """Query the DES STAC catalogue for the best L1C scene around ``date``.
+
+    DES STAC indexing is reliable even when the openEO data plane fails
+    (the 2026-04 L1C nodata bug). The catalogue links list the canonical
+    SAFE archive name we need to construct the Google Cloud path.
+
+    Args:
+        coords: WGS84 bbox dict.
+        date: Target date ``YYYY-MM-DD``.
+        date_window: ± days around ``date`` to consider.
+        cloud_max: Reject scenes with ``eo:cloud_cover`` above this.
+        preferred_utm_zone: If set, SAFE archives with this UTM zone
+            (parsed from MGRS-tile in safe_name) are ranked above other
+            zones regardless of cloud cover. If ``None``, the zone is
+            auto-derived from the AOI longitude centre — set explicitly
+            to override (e.g. 0 to disable the prefer entirely).
+
+    Returns:
+        Dict with at least ``id``, ``safe_name``, ``cloud_cover``,
+        ``datetime``, ``proj_code``, ``tile_id``.
+
+    Raises:
+        FetchError: If no L1C scene matches the request.
+    """
+    import requests
+    from datetime import datetime, timedelta
+
+    dt = datetime.strptime(date, "%Y-%m-%d")
+    start = (dt - timedelta(days=date_window)).strftime("%Y-%m-%d")
+    end = (dt + timedelta(days=date_window + 1)).strftime("%Y-%m-%d")
+
+    body = {
+        "collections": ["s2_msi_l1c"],
+        "bbox": [coords["west"], coords["south"], coords["east"], coords["north"]],
+        "datetime": f"{start}/{end}",
+        "limit": 25,
+    }
+    resp = requests.post(STAC_SEARCH_URL, json=body, timeout=30)
+    resp.raise_for_status()
+    features = resp.json().get("features") or []
+
+    # Auto-derive UTM-zon från AOI longitud-centrum om inte explicit satt.
+    # Sätt 0 (eller annan otrolig zon) i caller för att avaktivera prefer:n.
+    if preferred_utm_zone is None:
+        lon_center = (coords["west"] + coords["east"]) / 2.0
+        preferred_utm_zone = _utm_zone_from_lon(lon_center)
+
+    candidates = []
+    for f in features:
+        props = f.get("properties") or {}
+        cloud = props.get("eo:cloud_cover")
+        # eo:cloud_cover är granul-snitt (~110×110 km) — meningslös för
+        # en liten AOI. Filtret är default disabled (cloud_max=100).
+        # Pre-filtering ska göras upstream (optimal_fetch_dates ERA5+SCL).
+        if cloud is not None and cloud > cloud_max:
+            continue
+        # Resolve SAFE name from any asset href containing ".SAFE/"
+        safe_name = None
+        for asset in (f.get("assets") or {}).values():
+            href = asset.get("href") or ""
+            if ".SAFE/" in href:
+                safe_name = href.split("/.SAFE/")[0].rsplit("/", 1)[-1]
+                if not safe_name.endswith(".SAFE"):
+                    safe_name = href.split(".SAFE/")[0].rsplit("/", 1)[-1] + ".SAFE"
+                break
+        if safe_name is None:
+            for link in f.get("links") or []:
+                href = link.get("href") or ""
+                if ".SAFE" in href:
+                    safe_name = href.rsplit("/", 1)[-1].split(".SAFE")[0] + ".SAFE"
+                    break
+        if safe_name is None:
+            continue
+        # Parse UTM-zon från MGRS-tile-token i SAFE-namnet (T33VXD → 33).
+        try:
+            scene_utm, _, _ = _parse_safe_mgrs(safe_name)
+            scene_utm = int(scene_utm)
+        except (ValueError, FetchError):
+            scene_utm = -1
+        candidates.append({
+            "id": f.get("id"),
+            "safe_name": safe_name,
+            "cloud_cover": cloud if cloud is not None else 100.0,
+            "datetime": props.get("start_datetime") or props.get("datetime"),
+            "proj_code": props.get("proj:code"),
+            "tile_id": props.get("cubedash:region_code"),
+            "utm_zone": scene_utm,
+        })
+
+    if not candidates:
+        raise FetchError(
+            f"no L1C scenes for bbox {coords} around {date} (cloud<={cloud_max}%)"
+        )
+
+    # Sortering: UTM-zon-match är primär, cloud_cover sekundär (tiebreak).
+    # AOI som korsar UTM-zon-gräns (Lilla Karlsö 17.91–18.075°E vid 18°E-gränsen)
+    # får annars cross-zone-reprojektion → seam-artefakter, kvalitetsförlust.
+    candidates.sort(key=lambda c: (
+        0 if c["utm_zone"] == preferred_utm_zone else 1,
+        c["cloud_cover"],
+    ))
+    return candidates[0]
+
+
+def _gcp_resolve_safe_name(safe_name: str) -> str:
+    """Resolve a CDSE/DES SAFE name to the name that actually exists in GCS.
+
+    CDSE STAC serves the Collection-1 reprocessed products (baseline
+    ``N0500``, 2022–2023 processing dates). The
+    ``gcp-public-data-sentinel-2`` public bucket carries the
+    *original-baseline* archives instead (e.g. ``N0202`` for 2016). The
+    two names share the mission, level and acquisition timestamp but
+    differ in the baseline and processing-timestamp tokens — so a path
+    built straight from the STAC name lists zero files.
+
+    This lists the bucket by the stable acquisition prefix and returns
+    the real ``.SAFE`` folder name. If several baselines are present
+    (e.g. 2017 acquisitions have BOTH the original ``N0205`` AND the
+    2023-reprocessed ``N0500``), the orbit token disambiguates and the
+    **highest baseline wins** — reversed 2026-06-04 from the previous
+    "lowest baseline" policy after the Sen2Cor 2017 backfill blew up
+    on it. Justification:
+
+    * Sen2Cor 2.12.04 supports PSD 14.2 onward only. The 2017 original
+      ``N0205`` is PSD ~13.x; its DATASTRIP doesn't even contain a
+      ``QI_DATA`` directory (PSD 13 didn't define it), so
+      ``L2A_ProcessDataStrip.generate()`` ``os.listdir(qiDir)`` raises
+      ``Errno 2`` and the whole tile is lost.
+    * ``N0500`` (Collection-1 reprocessing, PSD 14.9) IS supported and
+      has the full DATASTRIP/QI_DATA layout Sen2Cor expects.
+    * CDSE STAC returns the N0500 name anyway, so the downstream
+      ``work_dir = safe_cache/{scene_id}_l2a`` name matches what we
+      actually fetched only when we pick N0500.
+    * For 2016 acquisitions (where only ``N0202``/``N0204`` exist),
+      reversing the sort is a no-op (single folder).
+
+    Raises:
+        FetchError: If no SAFE for this acquisition exists in the bucket.
+    """
+    import re
+    import requests
+
+    name = safe_name[:-5] if safe_name.endswith(".SAFE") else safe_name
+    utm, lat_band, square = _parse_safe_mgrs(name)
+
+    m = re.match(r"(S2[AB]_MSIL1C_\d{8}T\d{6})", name)
+    if not m:
+        raise FetchError(f"cannot parse acquisition token from SAFE name: {safe_name}")
+    stable = m.group(1)
+
+    orbit_m = re.search(r"_R(\d{3})_", name)
+    want_orbit = orbit_m.group(1) if orbit_m else None
+
+    prefix = f"tiles/{utm}/{lat_band}/{square}/{stable}"
+    r = requests.get(
+        GCP_S2_LIST_API,
+        params={"prefix": prefix, "delimiter": "/"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    folders = [
+        p.rstrip("/").rsplit("/", 1)[-1]
+        for p in r.json().get("prefixes", [])
+        if p.endswith(".SAFE/")
+    ]
+    if want_orbit:
+        orbit_matched = [f for f in folders if f"_R{want_orbit}_" in f]
+        if orbit_matched:
+            folders = orbit_matched
+    if not folders:
+        raise FetchError(
+            f"GCP bucket {GCP_S2_BUCKET} has no SAFE for acquisition "
+            f"{stable} tile T{utm}{lat_band}{square}"
+        )
+    # Highest baseline first — N0500 (Sen2Cor-2.12.04 compatible) over
+    # N02xx (PSD ~13, no QI_DATA dir). String-sort is monotone in
+    # baseline because the field is fixed-width `_N\d{4}_`.
+    folders.sort(reverse=True)
+    return folders[0]
+
+
+def _gcp_list_safe_files(safe_name: str) -> list[dict]:
+    """Page through GCS object-list API to enumerate every file in a SAFE.
+
+    Returns a list of dicts with ``name`` (full GCS object key) and
+    ``size`` (int bytes).
+    """
+    import requests
+
+    utm, lat_band, square = _parse_safe_mgrs(safe_name)
+    prefix = f"tiles/{utm}/{lat_band}/{square}/{safe_name}/"
+    out: list[dict] = []
+    page_token: str | None = None
+    while True:
+        params = {"prefix": prefix, "maxResults": "1000"}
+        if page_token:
+            params["pageToken"] = page_token
+        r = requests.get(GCP_S2_LIST_API, params=params, timeout=30)
+        r.raise_for_status()
+        body = r.json()
+        for item in body.get("items", []):
+            out.append({"name": item["name"], "size": int(item.get("size", 0))})
+        page_token = body.get("nextPageToken")
+        if not page_token:
+            break
+    if not out:
+        raise FetchError(
+            f"GCP bucket {GCP_S2_BUCKET} returned no files under prefix {prefix}"
+        )
+    return out
+
+
+def _gcs_marker_dir(rel: str) -> str | None:
+    """Directory path a GCS ``_$folder$`` placeholder stands for, else None.
+
+    The Sentinel-2 public bucket marks a (possibly empty) directory with a
+    sibling ``<dir>_$folder$`` zero-byte object. Downloading that object as
+    a *file* leaves the directory itself non-existent — and sen2cor's
+    ``L2A_ProcessDataStrip`` does ``os.listdir()`` on such dirs (notably
+    ``DATASTRIP/.../QI_DATA``) and crashes when they are missing.
+    """
+    marker = "_$folder$"
+    return rel[: -len(marker)] if rel.endswith(marker) else None
+
+
+def fetch_l1c_safe_from_gcp(
+    date: str,
+    coords: dict,
+    dest_dir: str | Path | None = None,
+    *,
+    date_window: int = 0,
+    cloud_max: float = 100.0,
+    max_workers: int = 8,
+    overwrite: bool = False,
+    preferred_utm_zone: int | None = None,
+) -> Path:
+    """Download a Sentinel-2 L1C SAFE archive from Google Cloud public bucket.
+
+    Resolves the best matching scene via DES STAC, derives the GCS path
+    from the SAFE name's MGRS token, and pulls every member file in
+    parallel. Existing files are reused unless ``overwrite=True``.
+
+    This is the recommended fallback when DES openEO L1C returns nodata
+    (the 2026-04 bug confirmed via L2A baseline diff) and CDSE is
+    blocked by credit limits. The bucket is anonymous-read with no
+    requester-pays charges.
+
+    Args:
+        date: Target acquisition date ``YYYY-MM-DD``.
+        coords: WGS84 bbox dict (``west``/``south``/``east``/``north``).
+        dest_dir: Local root for the downloaded SAFE. Defaults to
+            ``./outputs/safe_archives/``. The SAFE folder is created
+            beneath this root.
+        date_window: ± days around ``date`` to scan when looking for
+            the cleanest scene.
+        cloud_max: Reject scenes above this cloud-cover percentage.
+        max_workers: Parallel HTTPS workers.
+        overwrite: If False (default) and a file is already on disk
+            with the expected size, it is skipped.
+
+    Returns:
+        Path to the downloaded ``.SAFE`` directory root.
+
+    Raises:
+        FetchError: If STAC has no matching scene or GCS listing fails.
+    """
+    import os
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    scene = _stac_best_l1c_scene(
+        coords, date,
+        date_window=date_window,
+        cloud_max=cloud_max,
+        preferred_utm_zone=preferred_utm_zone,
+    )
+    return fetch_l1c_safe_by_name(
+        scene["safe_name"], dest_dir,
+        max_workers=max_workers, overwrite=overwrite,
+    )
+
+
+# Cached password-grant token for CDSE OData/Catalogue. Distinct from
+# the client-credentials token cached in cdse_vpp because OData
+# specifically rejects client-credentials tokens (SH scope ⊄ OData scope)
+# while accepting password-grant tokens against the public client. Live
+# probe from inside the cluster (2026-06-04):
+#   client_credentials → HTTP 401 Unauthorized
+#   password (cdse-public) → HTTP 200, ZIP magic confirmed
+# Hence: separate cache, separate refresh.
+_CDSE_PWD_TOKEN: str | None = None
+_CDSE_PWD_TOKEN_EXPIRES: float = 0.0
+_CDSE_PWD_TOKEN_LOCK: "object" = None  # threading.Lock, init lazy
+
+
+def _get_cdse_oidc_password_token() -> str:
+    """Get a CDSE OAuth2 access token via the resource-owner password grant.
+
+    Used by :func:`_cdse_download_safe` for CDSE OData/Catalogue access.
+    The token from :func:`imint.data.cdse_vpp._get_token` (client
+    credentials, SH-scoped service account) returns ``401 Unauthorized``
+    on the OData download endpoint — this helper produces a token with
+    the right scope.
+
+    Credentials priority:
+        1. ``CDSE_USER`` + ``CDSE_PASSWORD`` env vars
+        2. ``.cdse_credentials`` file (line 1 email, line 2 password)
+
+    Always authenticates against the PUBLIC client ``cdse-public`` —
+    the confidential service client_id is never reused for the password
+    grant.
+
+    Returns:
+        Bearer access token. Cached in-process with a 60 s safety
+        margin against the server-reported ``expires_in``.
+
+    Raises:
+        RuntimeError: If credentials are not configured or the token
+            exchange fails after retries.
+    """
+    global _CDSE_PWD_TOKEN, _CDSE_PWD_TOKEN_EXPIRES, _CDSE_PWD_TOKEN_LOCK
+    import threading
+    import time
+    import urllib.parse
+    import urllib.request
+    import json as _json
+
+    if _CDSE_PWD_TOKEN_LOCK is None:
+        _CDSE_PWD_TOKEN_LOCK = threading.Lock()
+
+    with _CDSE_PWD_TOKEN_LOCK:
+        if _CDSE_PWD_TOKEN and time.time() < _CDSE_PWD_TOKEN_EXPIRES - 60:
+            return _CDSE_PWD_TOKEN
+
+    username = os.environ.get("CDSE_USER")
+    password = os.environ.get("CDSE_PASSWORD")
+    if not (username and password):
+        # .cdse_credentials fallback for local dev
+        cred_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ".cdse_credentials",
+        )
+        if os.path.isfile(cred_path):
+            with open(cred_path) as f:
+                lines = [l.strip() for l in f.readlines()]
+            username = username or (lines[0] if len(lines) >= 1 else None)
+            password = password or (lines[1] if len(lines) >= 2 else None)
+    if not (username and password):
+        raise RuntimeError(
+            "CDSE OData requires CDSE_USER + CDSE_PASSWORD env vars "
+            "(or .cdse_credentials lines 1+2). The client_credentials "
+            "service account is NOT sufficient — OData rejects it with 401."
+        )
+
+    data = urllib.parse.urlencode({
+        "grant_type": "password",
+        "username": username,
+        "password": password,
+        "client_id": "cdse-public",
+    }).encode()
+    req = urllib.request.Request(
+        "https://identity.dataspace.copernicus.eu/auth/realms/CDSE"
+        "/protocol/openid-connect/token",
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                tok = _json.loads(resp.read())
+            with _CDSE_PWD_TOKEN_LOCK:
+                _CDSE_PWD_TOKEN = tok["access_token"]
+                _CDSE_PWD_TOKEN_EXPIRES = time.time() + tok.get("expires_in", 300)
+            return _CDSE_PWD_TOKEN
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"CDSE password-grant token fetch failed: {last_exc}") from last_exc
+
+
+def _cdse_download_safe(
+    safe_name: str,
+    dest_root: Path,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Download one L1C SAFE via CDSE OData when GCS doesn't have it.
+
+    Used as the fallback path inside :func:`fetch_l1c_safe_by_name`
+    when ``_gcp_resolve_safe_name`` reports "no SAFE for acquisition"
+    on the public GCS bucket. CDSE OData covers the full ESA archive
+    including the re-ingested 2017-vintage SAFEs GCS sometimes lacks
+    (e.g. the S2A 2017-08-28 R108 cohort the Sen2Cor 2017 backfill
+    needed).
+
+    Two-step OData:
+
+      1. ``GET /odata/v1/Products?$filter=Name eq '<safe>.SAFE'&$top=1``
+         → ``value[0].Id`` (CDSE ProductId UUID).
+      2. ``GET /odata/v1/Products(<Id>)/$value`` with
+         ``Authorization: Bearer <token>`` → streamed ZIP of the
+         whole SAFE archive, unpacked into ``dest_root``.
+
+    Uses :func:`_get_cdse_oidc_password_token` for auth — the
+    client_credentials token from ``cdse_vpp._get_token`` returns
+    ``401 Unauthorized`` on the OData download endpoint (scope
+    mismatch: SH-Process service account can read the catalogue but
+    not download SAFEs). The password grant against ``cdse-public``
+    is the only client that consistently authorises ``Products(<Id>)/$value``
+    streaming, verified live 2026-06-04.
+
+    Args:
+        safe_name: SAFE archive name *with* the ``.SAFE`` suffix
+            (e.g. ``S2A_MSIL1C_20170828T103021_N0500_R108_T33VVJ_...SAFE``).
+        dest_root: Local directory to unpack into.
+        overwrite: If ``False`` (default) and the unpacked SAFE
+            directory already exists with content, skip the download.
+
+    Returns:
+        ``Path`` to the unpacked ``.SAFE`` directory.
+
+    Raises:
+        FetchError: If CDSE OData has no product with that name
+            either (every source exhausted), or if the download
+            unpacks to an unexpected location.
+    """
+    import json as _json
+    import urllib.parse
+    import urllib.request
+    import zipfile
+
+    name_no_suffix = safe_name[:-5] if safe_name.endswith(".SAFE") else safe_name
+    safe_root = dest_root / (name_no_suffix + ".SAFE")
+    if (not overwrite
+            and safe_root.exists()
+            and any(safe_root.iterdir())):
+        return safe_root  # cached from a prior run
+
+    token = _get_cdse_oidc_password_token()
+    auth = {"Authorization": f"Bearer {token}"}
+
+    # Step 1 — resolve name → ProductId
+    filter_expr = f"Name eq '{name_no_suffix}.SAFE'"
+    q = urllib.parse.urlencode({"$filter": filter_expr, "$top": "1"})
+    cat_url = (
+        f"https://catalogue.dataspace.copernicus.eu/odata/v1/Products?{q}"
+    )
+    req = urllib.request.Request(cat_url, headers=auth)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = _json.loads(resp.read())
+    values = body.get("value", [])
+    if not values:
+        raise FetchError(
+            f"CDSE OData has no product matching {name_no_suffix}.SAFE; "
+            f"both GCS and CDSE exhausted."
+        )
+    product_id = values[0]["Id"]
+
+    # Step 2 — stream the ZIP
+    zip_path = dest_root / f"{name_no_suffix}.zip"
+    dl_url = (
+        f"https://download.dataspace.copernicus.eu/odata/v1/"
+        f"Products({product_id})/$value"
+    )
+    dl_req = urllib.request.Request(dl_url, headers=auth)
+    print(
+        f"  [safe-fetch] CDSE OData GET {name_no_suffix}.zip "
+        f"(productId={product_id})",
+        flush=True,
+    )
+    with urllib.request.urlopen(dl_req, timeout=900) as resp, \
+            open(zip_path, "wb") as f:
+        while True:
+            chunk = resp.read(1 << 20)  # 1 MiB
+            if not chunk:
+                break
+            f.write(chunk)
+
+    # Step 3 — unpack and clean up
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(dest_root)
+    zip_path.unlink()
+
+    if safe_root.exists():
+        return safe_root
+    # Some CDSE archives unpack into a folder without the trailing
+    # ``.SAFE`` or with a slightly different processing-timestamp
+    # tail. Be tolerant: pick the most-recently-modified candidate.
+    candidates = sorted(
+        dest_root.glob(f"{name_no_suffix[:60]}*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0]
+    raise FetchError(
+        f"CDSE OData download for {name_no_suffix}.SAFE unpacked to an "
+        f"unexpected location under {dest_root}"
+    )
+
+
+def fetch_l1c_safe_by_name(
+    safe_name: str,
+    dest_dir: str | Path | None = None,
+    *,
+    max_workers: int = 8,
+    overwrite: bool = False,
+) -> Path:
+    """Download a specific L1C SAFE archive — GCS first, CDSE fallback.
+
+    Unlike :func:`fetch_l1c_safe_from_gcp`, this takes a specific SAFE
+    name (== a CDSE STAC L1C item id) and downloads exactly that
+    acquisition — no STAC re-resolution that could pick a different
+    scene. Use it when an upstream selector has already picked the
+    scene and the caller must not get a different one.
+
+    Source strategy:
+
+      1. **GCS public bucket** (primary, parallel chunked, anonymous,
+         free). The bucket carries multiple baselines per acquisition;
+         :func:`_gcp_resolve_safe_name` picks the highest available
+         (Sen2Cor-compatible) when several exist.
+      2. **CDSE OData fallback** (:func:`_cdse_download_safe`), taken
+         only when GCS responds "no SAFE for acquisition" — happens
+         for some pre-2020 SAFEs that were re-ingested after the GCS
+         mirror was synced. Requires CDSE credentials; covers the full
+         ESA archive.
+
+    Other GCS errors (network, bucket-side) re-raise rather than
+    silently falling back — we don't want to mask transient issues.
+
+    Args:
+        safe_name: SAFE archive name, with or without the ``.SAFE``
+            suffix (e.g. a CDSE STAC item id like
+            ``S2A_MSIL1C_20160821T103022_N0500_R108_T33VUD_...``).
+        dest_dir: Local root. Defaults to ``./outputs/safe_archives/``.
+        max_workers: Parallel HTTPS download workers.
+        overwrite: Re-download files already present at the right size.
+
+    Returns:
+        Path to the downloaded ``.SAFE`` directory.
+    """
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not safe_name.endswith(".SAFE"):
+        safe_name = safe_name + ".SAFE"
+
+    if dest_dir is None:
+        dest_dir = Path("outputs") / "safe_archives"
+    dest_root = Path(dest_dir)
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    # Two source strategies, GCS-first:
+    #
+    # 1. GCS public bucket — fast (parallel chunked, anonymous, free).
+    #    Covers most acquisitions but is missing a subset of 2017-vintage
+    #    re-ingested-only SAFEs (e.g. the S2A 2017-08-28 R108 cohort the
+    #    Sen2Cor 2017 backfill needed — 4 of 5 returned "no SAFE for
+    #    acquisition" on first try).
+    # 2. CDSE OData fallback — slower (single-stream ZIP), requires
+    #    CDSE credentials (already mounted in the cluster as
+    #    CDSE_CLIENT_ID/CDSE_CLIENT_SECRET), but has the complete ESA
+    #    archive coverage GCS lacks.
+    #
+    # The fallback is taken exclusively on the GCS "no SAFE for
+    # acquisition" FetchError — other GCS failures (network, bucket-side
+    # errors) re-raise so we don't silently mask transient issues.
+    try:
+        safe_name = _gcp_resolve_safe_name(safe_name)
+    except FetchError as gcs_exc:
+        if "no SAFE for acquisition" not in str(gcs_exc):
+            raise
+        print(
+            f"  [safe-fetch] GCS gap → CDSE OData fallback for {safe_name}",
+            flush=True,
+        )
+        return _cdse_download_safe(safe_name, dest_root, overwrite=overwrite)
+
+    files = _gcp_list_safe_files(safe_name)
+    safe_root = dest_root / safe_name
+    safe_root.mkdir(parents=True, exist_ok=True)
+
+    utm, lat_band, square = _parse_safe_mgrs(safe_name)
+    gcs_prefix = f"tiles/{utm}/{lat_band}/{square}/{safe_name}/"
+
+    def _fetch_one(item: dict) -> int:
+        rel = item["name"][len(gcs_prefix):]
+        marker_dir = _gcs_marker_dir(rel)
+        if marker_dir is not None:
+            (safe_root / marker_dir).mkdir(parents=True, exist_ok=True)
+            return 0
+        out = safe_root / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if (
+            not overwrite
+            and out.exists()
+            and out.stat().st_size == item["size"]
+        ):
+            return 0
+        url = f"{GCP_S2_BASE}/{item['name']}"
+        with urllib.request.urlopen(url, timeout=120) as resp, open(out, "wb") as f:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+        return item["size"]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for fut in as_completed(ex.submit(_fetch_one, f) for f in files):
+            fut.result()
+    return safe_root
+
+
+def fetch_sentinel2_data(
+    source: str = "des",
+    **kwargs,
+) -> FetchResult:
+    """Fetch Sentinel-2 L2A data from either DES or CDSE.
+
+    Dispatcher that routes to ``fetch_des_data`` or ``fetch_copernicus_data``
+    based on the ``source`` argument.
+
+    Args:
+        source: "des" for Digital Earth Sweden (default),
+                "copernicus" for CDSE.
+        **kwargs: Passed through to the underlying fetch function.
+
+    Returns:
+        FetchResult (identical format from both backends).
+    """
+    if source == "copernicus":
+        return fetch_copernicus_data(**kwargs)
+    elif source == "des":
+        return fetch_des_data(**kwargs)
+    else:
+        raise ValueError(f"Unknown source '{source}'. Use 'des' or 'copernicus'.")
+
+
+# ── Seasonal / multitemporal fetching ────────────────────────────────────────
+
+
+def _seasonal_window_to_date_range(
+    year: int,
+    window: tuple[int, int],
+    mode: str,
+) -> tuple[str, str]:
+    """Convert a seasonal window into ISO ``(start, end)`` date strings.
+
+    Args:
+        year: Calendar year, e.g. 2024.
+        window: Two-element tuple. For ``mode="month"`` it is
+            ``(start_month, end_month)`` (1-12 inclusive). For ``mode="doy"``
+            it is ``(doy_start, doy_end)`` (1-366 inclusive).
+        mode: ``"month"`` or ``"doy"``.
+
+    Returns:
+        Tuple ``(date_start, date_end)`` of ISO ``YYYY-MM-DD`` strings.
+
+    For month mode the end-of-month is computed via :func:`calendar.monthrange`,
+    so February is correctly handled for leap and non-leap years.
+    """
+    if mode == "month":
+        m_start, m_end = window
+        date_start = f"{year:04d}-{m_start:02d}-01"
+        last_day = calendar.monthrange(year, m_end)[1]
+        date_end = f"{year:04d}-{m_end:02d}-{last_day:02d}"
+        return date_start, date_end
+    if mode == "doy":
+        from datetime import datetime, timedelta
+        doy_start, doy_end = window
+        dt_start = datetime(year, 1, 1) + timedelta(days=doy_start - 1)
+        dt_end = datetime(year, 1, 1) + timedelta(days=doy_end - 1)
+        return dt_start.strftime("%Y-%m-%d"), dt_end.strftime("%Y-%m-%d")
+    raise ValueError(f"Unknown mode {mode!r}; expected 'month' or 'doy'.")
+
+
+def fetch_seasonal_dates(
+    coords: dict,
+    seasonal_windows: list[tuple[int, int]],
+    years: list[str],
+    scene_cloud_max: float = 50.0,
+) -> list[list[tuple[str, float]]]:
+    """Find best available Sentinel-2 dates for each seasonal window.
+
+    Queries STAC for each window across the given years and returns
+    candidate dates sorted by cloud cover (ascending).
+
+    Args:
+        coords: WGS84 bounding box dict.
+        seasonal_windows: List of (start_month, end_month) tuples defining
+            each seasonal window, e.g. [(4,5), (6,7), (8,9), (1,2)].
+        years: Years to search, e.g. ["2019", "2018"].
+        scene_cloud_max: Max scene cloud % for STAC pre-filter.
+
+    Returns:
+        List of lists (one per window), each containing
+        ``[(date_str, scene_cloud_pct), ...]`` sorted by cloud ascending.
+        Empty list if no data found for that window.
+    """
+    results = []
+    for window in seasonal_windows:
+        window_candidates = []
+        for year in years:
+            date_start, date_end = _seasonal_window_to_date_range(
+                int(year), window, mode="month",
+            )
+            try:
+                dates = _stac_available_dates(
+                    coords, date_start, date_end,
+                    scene_cloud_max=scene_cloud_max,
+                )
+                window_candidates.extend(dates)
+            except Exception:
+                pass  # STAC timeout — skip this year/window
+
+        # Sort all candidates across years by cloud ascending
+        window_candidates.sort(key=lambda x: x[1])
+        results.append(window_candidates)
+
+    return results
+
+
+#: Canonical S2-L2A spectral band order returned by default by
+#: :func:`fetch_seasonal_image`. Eleven bands — every reflectance band the
+#: DES / CDSE openEO collection delivers (B01 60-m coastal aerosol and L1C-
+#: only B10 are not part of the standard L2A spectral set we fetch).
+S2L2A_SPECTRAL_BANDS = [
+    "B02", "B03", "B04", "B05", "B06", "B07",
+    "B08", "B8A", "B09", "B11", "B12",
+]
+
+
+def fetch_seasonal_image(
+    date: str,
+    coords: dict,
+    prithvi_bands: list[str] | None = None,
+    source: str = "des",
+) -> tuple[np.ndarray, str] | None:
+    """Fetch a single Sentinel-2 scene for seasonal tile assembly.
+
+    Uses ``fetch_sentinel2_data`` (routing to DES or CDSE based on
+    *source*) with grid snapping and sub-pixel correction, but skips
+    SCL and cloud threshold since STAC + SCL pre-screening has already
+    been done.
+
+    Args:
+        date: ISO date string (already cloud-screened).
+        coords: WGS84 bounding box dict.
+        prithvi_bands: Band names for stacking, e.g. ["B02", ..., "B12"].
+                       Defaults to :data:`S2L2A_SPECTRAL_BANDS` — the full
+                       11-band L2A spectral set. Callers that want a smaller
+                       subset (e.g. the Prithvi 6-band set
+                       ``["B02", "B03", "B04", "B8A", "B11", "B12"]``) must
+                       pass it explicitly.
+        source: ``"des"`` or ``"copernicus"`` — backend to fetch from.
+
+    Returns:
+        Tuple of ``(image_array, date_str)`` where ``image_array`` is
+        ``(N, H, W)`` float32 reflectance [0, 1] with ``N == len(prithvi_bands)``
+        (11 by default), or ``None`` if fetch fails (caller handles missing
+        seasons).
+    """
+    if prithvi_bands is None:
+        prithvi_bands = S2L2A_SPECTRAL_BANDS
+
+    try:
+        result = fetch_sentinel2_data(
+            source=source,
+            date=date,
+            coords=coords,
+            cloud_threshold=1.0,    # already screened
+            include_scl=False,      # skip redundant SCL
+        )
+    except FetchError:
+        return None
+
+    # Check all Prithvi bands present
+    missing = [b for b in prithvi_bands if b not in result.bands]
+    if missing:
+        return None
+
+    image = np.stack(
+        [result.bands[b] for b in prithvi_bands], axis=0,
+    ).astype(np.float32)
+
+    return image, date
+
+
+def fetch_seasonal_dates_doy(
+    coords: dict,
+    doy_windows: list[tuple[int, int]],
+    years: list[str],
+    scene_cloud_max: float = 50.0,
+) -> list[list[tuple[str, float]]]:
+    """Find best S2 dates for DOY-based seasonal windows (VPP-guided).
+
+    Like ``fetch_seasonal_dates`` but accepts day-of-year windows instead
+    of month-based windows, enabling per-tile phenology-guided fetching.
+
+    Args:
+        coords: WGS84 bounding box dict.
+        doy_windows: List of (doy_start, doy_end) tuples, e.g.
+            [(100, 140), (141, 180), (181, 220), (221, 273)].
+        years: Years to search, e.g. ["2019", "2018"].
+        scene_cloud_max: Max scene cloud % for STAC pre-filter.
+
+    Returns:
+        List of lists (one per window), each containing
+        ``[(date_str, scene_cloud_pct), ...]`` sorted by cloud ascending.
+    """
+    results = []
+    for window in doy_windows:
+        window_candidates = []
+        for year in years:
+            date_start, date_end = _seasonal_window_to_date_range(
+                int(year), window, mode="doy",
+            )
+            try:
+                dates = _stac_available_dates(
+                    coords, date_start, date_end,
+                    scene_cloud_max=scene_cloud_max,
+                )
+                window_candidates.extend(dates)
+            except Exception:
+                pass  # STAC timeout — skip this year/window
+
+        # Sort all candidates across years by cloud ascending
+        window_candidates.sort(key=lambda x: x[1])
+        results.append(window_candidates)
+
+    return results
+
+
+# ── Multi-temporal vessel heatmap ────────────────────────────────────────────
+
+
+def _fetch_tci_bands(
+    conn,
+    projected_coords: dict,
+    temporal: list,
+) -> tuple[dict, np.ndarray, "GeoContext"]:
+    """Fetch B02+B03+B04+SCL for vessel detection (lightweight, single date).
+
+    Downloads only the three 10 m TCI bands and the SCL layer — roughly
+    3× smaller than a full spectral fetch.  The TCI bands are needed by
+    ``MarineVesselAnalyzer`` (L1C-TCI formula) and the SCL is used for
+    water-mask filtering of false positives.
+
+    Args:
+        conn: Authenticated openEO connection.
+        projected_coords: EPSG:3006 bbox dict with ``"crs"`` key.
+        temporal: Two-element list ``[start_date, end_date]``.
+
+    Returns:
+        Tuple of ``(bands_dict, scl_array, geo)`` where *bands_dict*
+        has uppercase keys ``{"B02", "B03", "B04"}`` as float32
+        reflectance, *scl_array* is uint8, and *geo* is a GeoContext.
+    """
+    from .utils import dn_to_reflectance, des_to_imint_bands
+
+    tci_bands = ["b02", "b03", "b04"]
+
+    raw, crs, transform = _load_s2_cube(
+        conn,
+        projected_coords=projected_coords,
+        temporal=temporal,
+        collection_id=COLLECTION,
+        bands_10m=tci_bands,
+        scl_band=BANDS_20M_CATEGORICAL,
+        empty_msg="DES returned empty TCI data",
+    )
+
+    # TCI bands → reflectance
+    bands = {}
+    for i, name in enumerate(tci_bands):
+        bands[name] = dn_to_reflectance(raw[i], source="des")
+    imint_bands = des_to_imint_bands(bands)
+
+    # SCL (last band)
+    scl = raw[len(tci_bands)].astype(np.uint8)
+
+    # Strip "crs" key for bounds_projected
+    proj_bounds = {k: v for k, v in projected_coords.items() if k != "crs"}
+
+    geo = GeoContext(
+        crs=str(crs),
+        transform=transform,
+        bounds_projected=proj_bounds,
+        bounds_wgs84=None,  # not needed for vessel detection
+        shape=(raw.shape[1], raw.shape[2]),
+    )
+
+    return imint_bands, scl, geo
+
+
+def _fetch_ai2_bands(
+    conn,
+    projected_coords: dict,
+    temporal: list,
+) -> tuple[dict, np.ndarray, "GeoContext"]:
+    """Fetch all 9 bands needed by the AI2 vessel detector, plus SCL.
+
+    Downloads B02, B03, B04, B08 (10 m) and B05, B06, B07, B11, B12 (20 m)
+    plus SCL.  The 20 m bands and SCL are resampled to 10 m to match the
+    high-resolution bands.
+
+    The returned bands dict contains **raw DN values** (not reflectance),
+    as the AI2 model handles its own normalization (divide by 3000/8160).
+
+    Args:
+        conn: Authenticated openEO connection.
+        projected_coords: EPSG:3006 bbox dict with ``"crs"`` key.
+        temporal: Two-element list ``[start_date, end_date]``.
+
+    Returns:
+        Tuple of ``(bands_dict, scl_array, geo)`` where *bands_dict*
+        has uppercase keys (B02, B03, B04, B05, B06, B07, B08, B11, B12)
+        as float32 DN values, *scl_array* is uint8, and *geo* is a GeoContext.
+    """
+    bands_10m = ["b02", "b03", "b04", "b08"]
+    bands_20m = ["b05", "b06", "b07", "b11", "b12"]
+
+    raw, crs, transform = _load_s2_cube(
+        conn,
+        projected_coords=projected_coords,
+        temporal=temporal,
+        collection_id=COLLECTION,
+        bands_10m=bands_10m,
+        bands_20m=bands_20m,
+        scl_band=BANDS_20M_CATEGORICAL,
+        empty_msg="DES returned empty AI2 band data",
+    )
+
+    all_band_names = bands_10m + bands_20m  # 9 bands
+    bands = {}
+    for i, name in enumerate(all_band_names):
+        uname = name.upper()
+        bands[uname] = raw[i].astype(np.float32)
+
+    # SCL is the last band
+    scl = raw[len(all_band_names)].astype(np.uint8)
+
+    proj_bounds = {k: v for k, v in projected_coords.items() if k != "crs"}
+    geo = GeoContext(
+        crs=str(crs),
+        transform=transform,
+        bounds_projected=proj_bounds,
+        bounds_wgs84=None,
+        shape=(raw.shape[1], raw.shape[2]),
+    )
+
+    return bands, scl, geo
+
+
+# ── Sentinel-1 GRD scenes for the AI2 vessel detector ────────────────────────
+#
+# Input contract (docs/marine/s1_vessels_reference.md §c): uncalibrated GRD DN
+# (detected amplitude, uint16) from the ESA measurement TIFFs, warped exactly as
+# rslearn ingests and materialises them in AI2's scene-ID pipeline:
+#   1. radar geometry + GCPs -> cubic WarpedVRT, thin-plate spline, into the UTM
+#      zone of the FIRST GCP on GDAL's suggested grid (~10.06 m), uint16. One
+#      departure from rslearn (chain 2): the GCPs are first moved onto the sea
+#      surface, so ships sit where AIS puts them (see _S1_TIE_POINTS); AI2
+#      parity therefore holds in radar coordinates, not in UTM pixels;
+#   2. -> cubic WarpedVRT onto the window grid: UTM zone of the target footprint
+#      centroid, 10 m, origin on integer multiples of 10 m; uint16 (rslearn casts
+#      to float32 here; the analyzer does so per 512 px patch instead).
+# GDAL's warp output depends on the request window (each chunk gets its own
+# kernel scale and approximate-transformer segments), so a warp of a small crop
+# is NOT the full-scene result. Both steps therefore run over the full scene's
+# request geometry: the source is a full-size VRT carrying all GCPs whose pixels
+# are real only inside a radar window around the AOI. Inside the AOI the output
+# is bit-identical to the full-scene chain; only the radar window is downloaded.
+
+# Pixel chain; part of the cache key, bump when it changes. 2: every GCP is
+# moved onto the sea surface (``_s1_sea_surface_gcps``) before any use.
+S1_VESSEL_CHAIN_VERSION = 2
+# Geocoding of the radar raster (chain 2). ESA's GRD GCPs are zero-Doppler
+# solutions at the GCP's own ellipsoidal height z, ~0 m over the sea; the sea
+# lies on the geoid, N ~37 m higher off Skagen. GDAL's GCP transformer is 2-D
+# (it drops Z), so a ship at height N lands N / tan(incidence), 41-56 m,
+# toward the satellite. Each GCP is therefore moved (N - z) / tan(incidence)
+# away from the satellite along its GCP row and given z = N: the whole TPS then
+# describes targets at sea level (land GCPs above the geoid move toward the
+# satellite). The sign flips with the pass, so no constant shift can do this.
+_S1_TIE_POINTS = "sea surface: (N - z) / tan(incidence) away from the satellite, z = N"
+# GCP pixel convention. ESA's geolocation grid gives pixel/line of sample
+# centres (0 = the centre of the first sample; the last GCP is at width - 1).
+# GDAL reads a GCP's Pixel/Line on the pixel-corner lattice (the first pixel
+# spans 0..1; the GRDs say AREA_OR_POINT=Area). Taken as delivered, every
+# sample is geocoded half a pixel and half a line on, ~7 m: too far from the
+# satellite and too far along track. True: add half a pixel and a line, which
+# moves ships 5.0 m toward the satellite and 5.1 m back along track (measured
+# on the 06-28 S1D and 06-27 S1C asc headers). It follows from the two
+# conventions; the AIS check cannot resolve a 5 m term. Own flag and commit so
+# it can be reverted alone. Read at call time (_s1_gcp_half_px); part of the
+# geocoding model, hence of the cache key, only when True, so False is the
+# chain without the step: same key, same pixels.
+S1_GCP_SAMPLE_CENTRE = True
+# Annotation grid vs TIFF GCPs: the same points (same order, same values).
+_S1_GCP_IDENTITY_TOL_DEG = 1e-9
+_S1_GCP_IDENTITY_TOL_M = 1e-6
+_S1_INCIDENCE_RANGE_DEG = (15.0, 60.0)    # IW is ~29-46 deg; outside this is garbage
+_S1_SEA_GCP_MAX_ABS_Z_M = 1.0             # ESA solves sea GCPs at z ~ 0 (provenance stats)
+# Cached record layout; part of the cache key. 3: the key holds the pass's
+# slice ids and the record its slices (a format-2 entry is keyed by date + bbox
+# only and may hold either pass of a two-pass date, so it is never reused).
+_S1_VESSEL_CACHE_FORMAT = 3
+S1_VESSEL_GSD_M = 10                 # AI2 window resolution
+S1_VESSEL_SOURCE = "Microsoft Planetary Computer sentinel-1-grd (GRD DN, uncalibrated)"
+# Keys of the analyzer's ``bands`` dict: GRD DN, [vv, vh], target then historical.
+S1_TARGET_BAND_KEYS = ("VV_DN", "VH_DN")
+S1_HISTORICAL_BAND_KEYS = ("VV_DN_HIST", "VH_DN_HIST")
+# AI2 predict_pipeline: HISTORICAL_TIME_OFFSET = -60 d, then a 30 d search window,
+# i.e. the historical scene starts in [t0 - 60 d, t0 - 30 d].
+S1_VESSEL_HISTORICAL_OFFSET_DAYS = 60
+S1_VESSEL_HISTORICAL_WINDOW_DAYS = 30
+# Radar-pixel margin around the AOI footprint. The cubic supports of both warps
+# plus GDAL's 0.125 px transformer tolerance need ~6 px; 32 is cheap headroom.
+_S1_RADAR_MARGIN_PX = 32
+# Forward(inverse(TPS)) round-trip error allowed on the AOI outline before the
+# radar window is distrusted (a quarter of the margin).
+_S1_TPS_ROUNDTRIP_TOL_M = _S1_RADAR_MARGIN_PX * S1_VESSEL_GSD_M / 4
+_S1_POLARISATIONS = ("vv", "vh")
+_S1_ORBIT_STATES = ("ascending", "descending")
+# A pass time selects the pass whose [first slice start, last slice end] lies
+# within this of it. Passes over one AOI can be ~7 min apart (2026-06-28 Skagen:
+# S1A 05:23:51, S1D 05:31:10), so the tolerance must stay well below that.
+_S1_PASS_TIME_TOL = timedelta(minutes=2)
+_S1_MOSAIC_RULE = ("slices ranked by AOI footprint cover, then earliest start; each warped "
+                   "onto its own AI2 window in the first slice's UTM zone; a pixel takes "
+                   "the first-ranked slice whose target VV is valid, target and historical "
+                   "both from that slice; a slice is not fetched once the AOI is covered")
+# Without the timeouts a stalled blob read waits forever (seen on MPC
+# 2026-10-11: 0 bytes in curl poll, run hung) and the retries never fire;
+# with them a stall fails loud.
+_S1_GDAL_ENV = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "GDAL_HTTP_MAX_RETRY": "5",
+    "GDAL_HTTP_RETRY_DELAY": "2",
+    "GDAL_HTTP_CONNECTTIMEOUT": "30",
+    "GDAL_HTTP_LOW_SPEED_TIME": "60",
+    "GDAL_HTTP_LOW_SPEED_LIMIT": "1024",
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff",
+    "GDAL_HTTP_MULTIRANGE": "YES",
+    "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+}
+
+
+@dataclass
+class S1SceneInfo:
+    """Provenance of one Sentinel-1 IW GRDH scene (MPC ``sentinel-1-grd`` item)."""
+    scene_id: str            # MPC item id: the ESA product name without the CRC
+    safe_name: str           # SAFE directory name incl. CRC, from the asset href
+    start_utc: str           # ISO 8601 with "Z"
+    end_utc: str
+    platform: str
+    orbit_direction: str     # "ASCENDING" | "DESCENDING"
+    relative_orbit: int
+    absolute_orbit: int
+    footprint: dict          # GeoJSON Polygon, WGS84
+
+
+@dataclass
+class S1VesselScenes:
+    """Target + historical GRD DN on one grid, as AI2's S1 vessel detector expects.
+
+    The target is one satellite pass. When the AOI spans two slices of that
+    pass (one datatake cut into ~25 s products), the slices are mosaicked on
+    one AI2 window lattice, each with its own historical scene (AI2's rule).
+
+    Attributes:
+        target: (2, H, W) uint16 DN, bands [vv, vh]; 0 is nodata (outside the swath).
+        historical: (2, H, W) uint16 DN on the same grid.
+        geo: AI2's window grid: UTM, 10 m, origin on multiples of 10 m. This is
+            NOT the NMD/EPSG:3006 grid; the detector's contract fixes the grid.
+        target_scene / historical_scene: the first-ranked slice (largest AOI
+            cover) and its historical scene; the whole target when the pass
+            needed one slice.
+        scene_time_utc: when the pass imaged the AOI centre (ISO 8601, "Z"):
+            ``start + (row_c / lines) * (end - start)`` with ``row_c`` the radar
+            line of the AOI centre in the slice that supplied the centre pixel
+            and ``lines`` that slice's line count. A slice spans ~25 s, so a
+            slice start can be off by that much (~155 m of travel at 12 kn).
+        provenance: chain version, geocoding (tie points on the sea surface:
+            geoid model, grid sha256; per radar window the GCP shifts), grids,
+            the pass and its slices, radar windows, coverage, library versions.
+        target_slices / historical_slices: every slice in the mosaic, in
+            acquisition order, and the historical scene paired with each.
+            Default: ``[target_scene]`` / ``[historical_scene]``.
+    """
+    target: np.ndarray
+    historical: np.ndarray
+    geo: GeoContext
+    target_scene: S1SceneInfo
+    historical_scene: S1SceneInfo
+    scene_time_utc: str
+    provenance: dict
+    target_slices: list[S1SceneInfo] = field(default_factory=list)
+    historical_slices: list[S1SceneInfo] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.target_slices = list(self.target_slices) or [self.target_scene]
+        self.historical_slices = list(self.historical_slices) or [self.historical_scene]
+        if len(self.target_slices) != len(self.historical_slices):
+            raise ValueError(f"{len(self.target_slices)} target slices but "
+                             f"{len(self.historical_slices)} historical scenes")
+
+    @property
+    def scene_id(self) -> str:
+        """Target product id; several slices are joined with ``" + "`` (acquisition order)."""
+        return " + ".join(s.scene_id for s in self.target_slices)
+
+    @property
+    def historical_scene_id(self) -> str:
+        """Historical product id(s), in the order of ``target_slices``."""
+        return " + ".join(s.scene_id for s in self.historical_slices)
+
+    @property
+    def start_utc(self) -> str:
+        """Start of the first target slice."""
+        return self.target_slices[0].start_utc
+
+    @property
+    def end_utc(self) -> str:
+        """End of the last target slice."""
+        return self.target_slices[-1].end_utc
+
+    def bands(self) -> dict[str, np.ndarray]:
+        """Band dict in the layout ``AI2S1VesselAnalyzer`` reads (views, no copies)."""
+        out = dict(zip(S1_TARGET_BAND_KEYS, self.target, strict=True))
+        out.update(zip(S1_HISTORICAL_BAND_KEYS, self.historical, strict=True))
+        return out
+
+
+def fetch_s1_vessel_scenes(
+    coords: dict,
+    date: str,
+    *,
+    cache_dir: str | Path,
+    orbit_state: str | None = None,
+    pass_time_utc: str | None = None,
+) -> S1VesselScenes:
+    """Fetch the Sentinel-1 target pass and AI2's historical scenes for an AOI.
+
+    Data source: Microsoft Planetary Computer ``sentinel-1-grd`` (anonymous,
+    SAS-signed COGs; no PU billing, no requester-pays). Only a radar-geometry
+    window around the AOI is downloaded.
+
+    Scene choice:
+        * pass: the IW GRDH VV+VH slices acquired on ``date`` (UTC) whose
+          footprints intersect the AOI, grouped by satellite and absolute
+          orbit (one pass = one datatake, cut into ~25 s slices). With one
+          pass on the date it is used; with several, ``orbit_state`` and/or
+          ``pass_time_utc`` must leave exactly one, otherwise FetchError lists
+          the passes. Silently taking one would date the detections to a pass
+          the caller did not ask for (hours apart for ascending/descending);
+        * target: the pass's slices ranked by AOI footprint cover (earliest
+          start on a tie); the first is what a one-slice fetch would take.
+          Further slices fill the AOI pixels it leaves without data, see
+          ``_S1_MOSAIC_RULE``; a slice is not fetched once the AOI is covered;
+        * historical: per slice, AI2's rule: the scene starting in
+          ``[t0 - 60 d, t0 - 30 d]`` (t0 = slice start) whose footprint overlaps
+          the slice footprint most, restricted to the slice's orbit direction
+          (AI2 states the scenes must share it; its catalogue query does not
+          filter on it). Per slice because AI2 pairs one historical scene with
+          each scene it processes; a pixel's (target, historical) pair is
+          therefore the one AI2 would see for that slice.
+
+    Everything fetched or computed is cached under ``cache_dir``: the raw radar
+    windows (``s1_grd/<scene>/``) and the final model input
+    (``s1_vessel_inputs/<date>_<key>.tif`` + ``.json``). The key holds the
+    pass's slice ids, so the target-day catalogue search runs on every call;
+    a cached request downloads and warps nothing.
+
+    Args:
+        coords: WGS84 bbox ``{"west", "south", "east", "north"}``.
+        date: target acquisition date, ``YYYY-MM-DD`` (UTC).
+        cache_dir: cache root.
+        orbit_state: ``"ascending"`` or ``"descending"``: keep only passes in
+            that direction.
+        pass_time_utc: keep only the pass acquired within 2 min of this time:
+            ``HH:MM[:SS]`` on ``date``, or ISO 8601 (UTC if no offset).
+
+    Returns:
+        S1VesselScenes on the AOI subset of AI2's window grid.
+
+    Raises:
+        ValueError: an invalid ``orbit_state`` or ``pass_time_utc`` (before any search).
+        FetchError: no suitable pass/historical scene, several passes and no
+            selector that leaves one, or the AOI is outside the pass's swath.
+    """
+    import rasterio
+    from rasterio.transform import Affine
+    from shapely.geometry import box
+
+    state = None if orbit_state is None else _s1_orbit_state(orbit_state)
+    when = None if pass_time_utc is None else _s1_pass_time(pass_time_utc, date)
+    cache_dir = Path(cache_dir)
+    aoi = box(coords["west"], coords["south"], coords["east"], coords["north"])
+    chosen, passes, selected_by = _select_s1_pass(aoi, date, orbit_state=state, pass_time=when)
+    key = _s1_vessel_cache_key(coords, date, [it.id for it in chosen.slices])
+    out_dir = cache_dir / "s1_vessel_inputs"
+    tif_path = out_dir / f"{date}_{key}.tif"
+    meta_path = out_dir / f"{date}_{key}.json"
+    if tif_path.exists() and meta_path.exists():
+        print(f"    [S1 vessels] cache hit {tif_path}")
+        return _load_s1_vessel_cache(tif_path, meta_path)
+
+    print(f"    [S1 vessels] pass {_s1_pass_line(chosen.describe())} ({selected_by})")
+    for other in passes:
+        if other is not chosen:
+            print(f"    [S1 vessels]   not used: {_s1_pass_line(other.describe())}")
+
+    primary = chosen.slices[0]
+    epsg, primary_window = _ai2_scene_window(primary.geometry)
+    windows = [primary_window] + [_ai2_scene_window(it.geometry, epsg)[1]
+                                  for it in chosen.slices[1:]]
+    aoi_px = _s1_aoi_pixel_bounds(coords, epsg, (
+        min(w[0] for w in windows), min(w[1] for w in windows),
+        max(w[2] for w in windows), max(w[3] for w in windows)))
+    c0, r0, c1, r1 = aoi_px
+    target_dn = np.zeros((len(_S1_POLARISATIONS), r1 - r0, c1 - c0), dtype=np.uint16)
+    hist_dn = np.zeros_like(target_dn)
+    source = np.full((r1 - r0, c1 - c0), -1, dtype=np.int8)   # rank of the supplying slice
+    radar_windows: dict = {}
+    used: list[dict] = []
+    skipped: list[dict] = []
+    for rank, (item, window) in enumerate(zip(chosen.slices, windows, strict=True)):
+        if rank and not (source < 0).any():
+            skipped.append({"scene_id": item.id, "reason": "AOI already covered"})
+            continue
+        try:
+            sub = _s1_aoi_pixel_bounds(coords, epsg, window)
+        except FetchError:
+            if rank == 0:
+                raise
+            skipped.append({"scene_id": item.id, "reason": "its window misses the AOI"})
+            continue
+        hist_item = _select_s1_historical(item)
+        print(f"    [S1 vessels] target {item.id} (AOI cover {chosen.covers[rank]:.3f}), "
+              f"historical {hist_item.id}")
+        t_k, h_k, rw_k = _s1_scene_pair(item, hist_item, epsg, window, sub, cache_dir)
+        rows, cols = slice(sub[1] - r0, sub[3] - r0), slice(sub[0] - c0, sub[2] - c0)
+        if rank == 0:
+            # The first slice is pasted whole (nodata included): with one slice
+            # the model input is exactly the single-scene fetch.
+            target_dn[:, rows, cols] = t_k
+            hist_dn[:, rows, cols] = h_k
+            source[rows, cols][t_k[0] != 0] = 0
+        else:
+            fill = (source[rows, cols] < 0) & (t_k[0] != 0)
+            if not fill.any():
+                skipped.append({"scene_id": item.id, "historical_scene_id": hist_item.id,
+                                "reason": "no valid pixel where the AOI lacked data"})
+                continue
+            target_dn[:, rows, cols][:, fill] = t_k[:, fill]
+            hist_dn[:, rows, cols][:, fill] = h_k[:, fill]
+            source[rows, cols][fill] = rank
+        for name, rw in rw_k.items():   # one historical may serve two slices
+            radar_windows[name if name not in radar_windows else f"{name}#{rank}"] = rw
+        used.append({"rank": rank, "item": item, "hist": hist_item, "window": window,
+                     "sub": sub})
+
+    valid_t = np.count_nonzero(target_dn[0]) / target_dn[0].size
+    valid_h = np.count_nonzero(hist_dn[0]) / hist_dn[0].size
+    if valid_t == 0.0:
+        raise FetchError(f"AOI {coords} lies outside the swath of "
+                         f"{' + '.join(u['item'].id for u in used)}")
+    # Date the AOI centre by the slice that supplied its pixel (the first
+    # slice if the centre has no data, as a one-slice fetch does).
+    centre_rank = int(source[(r1 - r0) // 2, (c1 - c0) // 2])
+    dating = next(u for u in used if u["rank"] == max(centre_rank, 0))
+    header, _ = _s1_scene_header(dating["item"], _S1_POLARISATIONS[0],
+                                 cache_dir / "s1_grd" / dating["item"].id, None)
+    scene_time_utc = _s1_line_time_utc(_s1_scene_info(dating["item"]),
+                                       _s1_aoi_centre_line(header, epsg, aoi_px)
+                                       / header["height"])
+
+    transform = Affine(
+        S1_VESSEL_GSD_M, 0, c0 * S1_VESSEL_GSD_M, 0, -S1_VESSEL_GSD_M, -r0 * S1_VESSEL_GSD_M)
+    geo = GeoContext(
+        crs=f"EPSG:{epsg}",
+        transform=transform,
+        bounds_projected={"west": c0 * S1_VESSEL_GSD_M, "south": -r1 * S1_VESSEL_GSD_M,
+                          "east": c1 * S1_VESSEL_GSD_M, "north": -r0 * S1_VESSEL_GSD_M},
+        bounds_wgs84=dict(coords),
+        shape=(r1 - r0, c1 - c0),
+    )
+    in_time_order = sorted(used, key=lambda u: _s1_start(u["item"]))
+    provenance = {
+        "chain_version": S1_VESSEL_CHAIN_VERSION,
+        # The tie-point model; each radar window adds its GCP shifts (gcp_shift_m).
+        "geocoding": _s1_geocoding_model(),
+        "source": S1_VESSEL_SOURCE,
+        "request": {"coords": dict(coords), "date": date, "orbit_state": state,
+                    "pass_time_utc": pass_time_utc},
+        "window_epsg": epsg,
+        "ai2_window_px": list(primary_window),
+        "aoi_px": list(aoi_px),
+        "aoi_cover_target_footprint": round(chosen.covers[0], 6),
+        "valid_frac_target": round(valid_t, 6),
+        "valid_frac_historical": round(valid_h, 6),
+        "pass": {
+            **chosen.describe(),
+            "selected_by": selected_by,
+            "other_passes": [p.describe() for p in passes if p is not chosen],
+            "mosaic_rule": _S1_MOSAIC_RULE,
+            "scene_time_from": dating["item"].id,
+            "slices": [{
+                "scene_id": u["item"].id,
+                "historical_scene_id": u["hist"].id,
+                "rank": u["rank"],
+                "aoi_cover_footprint": round(chosen.covers[u["rank"]], 6),
+                "ai2_window_px": list(u["window"]),
+                "aoi_px": list(u["sub"]),
+                "mosaic_px": int(np.count_nonzero(source == u["rank"])),
+            } for u in in_time_order],
+            "skipped_slices": skipped,
+        },
+        "radar_windows": radar_windows,
+        "rasterio": rasterio.__version__,
+        "gdal": rasterio.__gdal_version__,
+    }
+    first = used[0]                    # rank 0: the first slice is always used
+    scenes = S1VesselScenes(
+        target=target_dn, historical=hist_dn, geo=geo,
+        target_scene=_s1_scene_info(first["item"]),
+        historical_scene=_s1_scene_info(first["hist"]),
+        scene_time_utc=scene_time_utc, provenance=provenance,
+        target_slices=[_s1_scene_info(u["item"]) for u in in_time_order],
+        historical_slices=[_s1_scene_info(u["hist"]) for u in in_time_order])
+    _write_s1_vessel_cache(tif_path, meta_path, scenes)
+    return scenes
+
+
+def s1_vessel_passes(coords: dict, date: str) -> list[dict]:
+    """The Sentinel-1 passes on ``date`` whose IW GRDH VV+VH slices touch the AOI.
+
+    One dict per pass (acquisition order) with the fields ``fetch_s1_vessel_scenes``
+    records under ``provenance["pass"]``: platform, orbits, orbit state, start/end,
+    the AOI fraction inside the union of the footprints, and the slice ids.
+    """
+    from shapely.geometry import box
+
+    aoi = box(coords["west"], coords["south"], coords["east"], coords["north"])
+    return [p.describe() for p in _s1_passes(aoi, date)]
+
+
+def _s1_scene_pair(target_item, hist_item, epsg: int, window_px: tuple, aoi_px: tuple,
+                   cache_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Target and historical DN of one slice on its window grid, cut to ``aoi_px``.
+
+    Returns ``(target (2, h, w), historical (2, h, w), radar_windows)``, uint16.
+    """
+    radar_windows: dict = {}
+    stacks = []
+    for item in (target_item, hist_item):
+        signed = None
+        pols = []
+        for pol in _S1_POLARISATIONS:
+            vrt_path, rwin, step1_epsg, signed = _s1_sparse_scene_vrt(
+                item, pol, epsg, aoi_px, cache_dir / "s1_grd" / item.id, signed)
+            radar_windows[f"{item.id}/{pol}"] = {**rwin, "step1_epsg": step1_epsg}
+            pols.append(_s1_grd_to_window_grid(vrt_path, step1_epsg, epsg, window_px, aoi_px))
+        stacks.append(np.stack(pols))
+    return stacks[0], stacks[1], radar_windows
+
+
+def _s1_vessel_cache_key(coords: dict, date: str, scene_ids: list[str]) -> str:
+    """Deterministic cache key of a fetch (chain + record versions, geocoding, date, bbox, slices).
+
+    ``scene_ids`` are the chosen pass's slice ids (order-free): a request for
+    another pass on the same date and bbox never meets this entry.
+    """
+    payload = {
+        "chain": S1_VESSEL_CHAIN_VERSION,
+        "geocoding": _s1_geocoding_model(),
+        "format": _S1_VESSEL_CACHE_FORMAT,
+        "date": date,
+        "bbox": [round(float(coords[k]), 6) for k in ("west", "south", "east", "north")],
+        "scenes": sorted(scene_ids),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _ai2_s1_candidates(items: list) -> list:
+    """IW GRDH dual-pol (VV+VH) items: the only products AI2's data source returns."""
+    from .data import s1_shared
+
+    return [
+        it for it in s1_shared.filter_iw_grdh(items, None)
+        if "_GRDH_" in it.id
+        and sorted(it.properties.get("sar:polarizations") or []) == ["VH", "VV"]
+    ]
+
+
+def _parse_utc(iso: str) -> datetime:
+    """ISO 8601 UTC string (``...Z``) -> aware datetime."""
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def _s1_start(item) -> datetime:
+    """Scene start time (aware datetime), AI2's ``time_range[0]``."""
+    return _parse_utc(item.properties["start_datetime"])
+
+
+def _s1_line_time_utc(scene: S1SceneInfo, line_frac: float) -> str:
+    """Acquisition time of a radar line at ``line_frac`` (0 = first, 1 = last) of the slice.
+
+    GRD lines are in azimuth-time order, so the time is linear in the line
+    index between the scene's start and end. Returns ISO 8601 with "Z".
+    """
+    if not 0.0 <= line_frac <= 1.0:
+        raise ValueError(f"line fraction {line_frac} outside the scene [0, 1]")
+    start, end = _parse_utc(scene.start_utc), _parse_utc(scene.end_utc)
+    t = start + line_frac * (end - start)
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _s1_orbit_state(value: str) -> str:
+    """Validated ``orbit_state`` selector, lower case."""
+    state = str(value).strip().lower()
+    if state not in _S1_ORBIT_STATES:
+        raise ValueError(f"orbit_state must be one of {_S1_ORBIT_STATES}, got {value!r}")
+    return state
+
+
+def _s1_pass_time(value: str, date: str) -> datetime:
+    """``pass_time_utc`` -> aware UTC datetime on ``date``.
+
+    Accepts ``HH:MM[:SS[.ffffff]]`` (optionally ending in "Z"), taken on
+    ``date``, or a full ISO 8601 datetime (UTC unless it carries an offset).
+    """
+    from datetime import time as clock
+
+    day = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    text = str(value).strip()
+    try:
+        if "T" in text or " " in text:
+            t = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            t = t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t
+        else:
+            tod = clock.fromisoformat(text.removesuffix("Z"))
+            t = datetime.combine(day.date(), tod, tzinfo=tod.tzinfo or timezone.utc)
+    except ValueError:
+        raise ValueError(f"pass_time_utc must be HH:MM[:SS] or ISO 8601, got {value!r}") from None
+    t = t.astimezone(timezone.utc)
+    if t.date() != day.date():
+        raise ValueError(f"pass_time_utc {value!r} is not on {date} (UTC)")
+    return t
+
+
+@dataclass
+class _S1Pass:
+    """The slices of one satellite pass (one absolute orbit) that touch the AOI."""
+    slices: list            # STAC items, ranked: AOI cover desc, then start, then id
+    covers: list[float]     # AOI fraction inside each slice's footprint (same order)
+    union_cover: float      # AOI fraction inside the union of the footprints
+
+    @property
+    def start(self) -> datetime:
+        return min(_s1_start(it) for it in self.slices)
+
+    @property
+    def end(self) -> datetime:
+        return max(_parse_utc(it.properties["end_datetime"]) for it in self.slices)
+
+    def time_distance(self, t: datetime) -> timedelta:
+        """Zero inside ``[start, end]``, else the gap to the nearer end."""
+        return max(self.start - t, t - self.end, timedelta(0))
+
+    def describe(self) -> dict:
+        from .data import s1_shared
+
+        first = min(self.slices, key=_s1_start)
+        last = max(self.slices, key=lambda it: _parse_utc(it.properties["end_datetime"]))
+        p = first.properties
+        return {
+            "platform": p.get("platform") or first.id[:3],
+            "absolute_orbit": int(p["sat:absolute_orbit"]),
+            "relative_orbit": int(p["sat:relative_orbit"]),
+            "orbit_state": s1_shared.orbit_from_item(first) or "UNKNOWN",
+            "start_utc": p["start_datetime"],
+            "end_utc": last.properties["end_datetime"],
+            "aoi_cover_footprints": round(self.union_cover, 6),
+            "slice_ids": [it.id for it in sorted(self.slices, key=_s1_start)],
+        }
+
+
+def _s1_pass_line(d: dict) -> str:
+    """One human-readable line per pass, for logs and errors."""
+    n = len(d["slice_ids"])
+    return (f"{d['orbit_state'].lower()} {d['platform']} abs. orbit {d['absolute_orbit']} "
+            f"(rel. {d['relative_orbit']}) {d['start_utc'][11:19]}-{d['end_utc'][11:19]} UTC, "
+            f"{n} slice{'s' if n > 1 else ''}, AOI cover {d['aoi_cover_footprints']:.3f}")
+
+
+def _s1_pass_group(item) -> tuple[str, int]:
+    """Pass identity: satellite + absolute orbit (a datatake's slices share both)."""
+    p = item.properties
+    return str(p.get("platform") or item.id[:3]).lower(), int(p["sat:absolute_orbit"])
+
+
+def _s1_drop_duplicates(items: list) -> list:
+    """One item per acquisition (satellite, start, end).
+
+    MPC lists some products twice, e.g. on 2025-07-19
+    ``S1C_..._003292_006A41`` and ``S1C_..._003292`` (same times and
+    footprint). Keeps the full product name (the longer id), then the smaller id.
+    """
+    best: dict = {}
+    for it in items:
+        k = (_s1_pass_group(it)[0], it.properties["start_datetime"],
+             it.properties["end_datetime"])
+        if k not in best or (-len(it.id), it.id) < (-len(best[k].id), best[k].id):
+            best[k] = it
+    return list(best.values())
+
+
+def _s1_passes(aoi, date: str) -> list[_S1Pass]:
+    """The passes on ``date`` whose IW GRDH VV+VH slices intersect the AOI, by start."""
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    from .data import mpc_s1, s1_shared
+
+    day = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    interval = f"{day:%Y-%m-%dT%H:%M:%SZ}/{day + timedelta(days=1):%Y-%m-%dT%H:%M:%SZ}"
+    items = _ai2_s1_candidates(mpc_s1.search_grd_items(interval, bbox_4326=aoi.bounds))
+    if not items:
+        raise FetchError(f"No Sentinel-1 IW GRDH VV+VH scene on {date} over {aoi.bounds}")
+    area = {it.id: s1_shared.footprint_intersection_area(it, aoi) for it in items}
+    items = _s1_drop_duplicates([it for it in items if area[it.id] > 0.0])
+    if not items:
+        raise FetchError(f"No Sentinel-1 footprint on {date} intersects {aoi.bounds}")
+    groups: dict = {}
+    for it in items:
+        groups.setdefault(_s1_pass_group(it), []).append(it)
+    passes = []
+    for group in groups.values():
+        # Ranked as the one-slice choice was: footprint overlap, then earliest start.
+        ranked = sorted(group, key=lambda it: (-area[it.id], _s1_start(it), it.id))
+        union = unary_union([shape(it.geometry) for it in ranked]).intersection(aoi).area
+        passes.append(_S1Pass(slices=ranked, covers=[area[it.id] / aoi.area for it in ranked],
+                              union_cover=union / aoi.area))
+    return sorted(passes, key=lambda p: (p.start, _s1_pass_group(p.slices[0])))
+
+
+def _select_s1_pass(aoi, date: str, *, orbit_state: str | None = None,
+                    pass_time: datetime | None = None) -> tuple[_S1Pass, list[_S1Pass], str]:
+    """The one pass the request names: ``(chosen, all passes on the date, how chosen)``.
+
+    Several passes and no selector (or a selector that leaves several) is an
+    error that lists them; so is a selector that matches none.
+    """
+    passes = _s1_passes(aoi, date)
+    chosen, rule = passes, []
+    if orbit_state is not None:
+        chosen = [p for p in chosen if p.describe()["orbit_state"].lower() == orbit_state]
+        rule.append(f"orbit_state={orbit_state}")
+    if pass_time is not None:
+        chosen = [p for p in chosen if p.time_distance(pass_time) <= _S1_PASS_TIME_TOL]
+        rule.append(f"pass_time_utc={pass_time:%H:%M:%S}")
+    listing = "\n".join(f"  {_s1_pass_line(p.describe())}" for p in passes)
+    if not chosen:
+        raise FetchError(f"No Sentinel-1 pass on {date} over {aoi.bounds} matches "
+                         f"{', '.join(rule)}; passes on the date:\n{listing}")
+    if len(chosen) > 1:
+        what = f" matching {', '.join(rule)}" if rule else ""
+        raise FetchError(
+            f"{len(chosen)} Sentinel-1 passes{what} on {date} over {aoi.bounds}; choose one "
+            f"with orbit_state ('ascending'/'descending') and/or pass_time_utc (HH:MM[:SS], "
+            f"within {_S1_PASS_TIME_TOL.seconds // 60} min of the pass):\n{listing}")
+    return chosen[0], passes, ", ".join(rule) or "the only pass on the date"
+
+
+def _select_s1_historical(target) -> Any:
+    """AI2's historical scene: best footprint overlap in ``[t0 - 60 d, t0 - 30 d]``."""
+    from shapely.geometry import shape
+
+    from .data import mpc_s1, s1_shared
+
+    t0 = _s1_start(target)
+    lo = t0 - timedelta(days=S1_VESSEL_HISTORICAL_OFFSET_DAYS)
+    hi = lo + timedelta(days=S1_VESSEL_HISTORICAL_WINDOW_DAYS)
+    footprint = shape(target.geometry)
+    direction = s1_shared.orbit_from_item(target)
+    items = [
+        it for it in _ai2_s1_candidates(
+            mpc_s1.search_grd_items(f"{lo.isoformat()}/{hi.isoformat()}",
+                                    intersects=target.geometry, limit=100))
+        if s1_shared.orbit_from_item(it) == direction
+    ]
+    if not items:
+        raise FetchError(f"No {direction} historical scene for {target.id} in "
+                         f"[{lo:%Y-%m-%d}, {hi:%Y-%m-%d}]")
+    return min(items, key=lambda it: (-s1_shared.footprint_intersection_area(it, footprint),
+                                      _s1_start(it)))
+
+
+def _s1_scene_info(item) -> S1SceneInfo:
+    from .data import s1_shared
+
+    p = item.properties
+    return S1SceneInfo(
+        scene_id=item.id,
+        safe_name=item.assets["vv"].href.split("?")[0].split("/")[-3],
+        start_utc=p["start_datetime"],
+        end_utc=p["end_datetime"],
+        platform=p.get("platform", ""),
+        orbit_direction=s1_shared.orbit_from_item(item) or "UNKNOWN",
+        relative_orbit=int(p["sat:relative_orbit"]),
+        absolute_orbit=int(p["sat:absolute_orbit"]),
+        footprint=item.geometry,
+    )
+
+
+def _ai2_utm_epsg(lon: float, lat: float) -> int:
+    """UTM EPSG for a point, chosen exactly as rslearn's ``get_utm_ups_crs`` does."""
+    from pyproj.aoi import AreaOfInterest
+    from pyproj.database import query_utm_crs_info
+
+    infos = query_utm_crs_info(
+        datum_name="WGS 84",
+        area_of_interest=AreaOfInterest(west_lon_degree=lon, south_lat_degree=lat,
+                                        east_lon_degree=lon, north_lat_degree=lat),
+    )
+    if not infos:
+        raise FetchError(f"No UTM zone for lon={lon}, lat={lat}")
+    return int(infos[0].code)
+
+
+def _ai2_scene_window(footprint: dict,
+                      epsg: int | None = None) -> tuple[int, tuple[int, int, int, int]]:
+    """AI2's scene-ID window: UTM zone of the footprint centroid, int() pixel bounds.
+
+    Mirrors ``setup_dataset_with_scene_ids``: the footprint is reprojected
+    vertex-wise, divided by (10, -10) and its bounds are truncated with
+    ``int()`` (towards zero, so the negative row bounds round up).
+
+    ``epsg`` forces the zone. The later slices of a pass use the first slice's
+    zone so that all lie on one lattice; where their own centroid zone agrees,
+    which is the common case, the window is AI2's own.
+    """
+    from rasterio.warp import transform_geom
+    from shapely.geometry import shape
+
+    if epsg is None:
+        shp = shape(footprint)
+        epsg = _ai2_utm_epsg(shp.centroid.x, shp.centroid.y)
+    minx, miny, maxx, maxy = shape(transform_geom("EPSG:4326", f"EPSG:{epsg}", footprint)).bounds
+    g = S1_VESSEL_GSD_M
+    return epsg, (int(minx / g), int(maxy / -g), int(maxx / g), int(miny / -g))
+
+
+def _s1_aoi_pixel_bounds(coords: dict, epsg: int, window_px: tuple) -> tuple[int, int, int, int]:
+    """The AOI on the window's pixel lattice (absolute pixel units), clipped to it."""
+    from rasterio.warp import transform_bounds
+
+    left, bottom, right, top = transform_bounds(
+        "EPSG:4326", f"EPSG:{epsg}", coords["west"], coords["south"],
+        coords["east"], coords["north"], densify_pts=21)
+    g = S1_VESSEL_GSD_M
+    c0 = max(math.floor(left / g), window_px[0])
+    r0 = max(math.floor(-top / g), window_px[1])
+    c1 = min(math.ceil(right / g), window_px[2])
+    r1 = min(math.ceil(-bottom / g), window_px[3])
+    if c1 <= c0 or r1 <= r0:
+        raise FetchError(f"AOI {coords} does not intersect the scene window {window_px}")
+    return c0, r0, c1, r1
+
+
+def _s1_aoi_outline_lonlat(epsg: int, aoi_px: tuple, pad_px: int = 4,
+                           n: int = 64) -> tuple[np.ndarray, np.ndarray]:
+    """Densified outline of the AOI rectangle (padded by ``pad_px``) as lon/lat."""
+    from pyproj import Transformer
+
+    c0, r0, c1, r1 = aoi_px[0] - pad_px, aoi_px[1] - pad_px, aoi_px[2] + pad_px, aoi_px[3] + pad_px
+    t = np.linspace(0.0, 1.0, n, endpoint=False)
+    cols = np.concatenate([c0 + (c1 - c0) * t, np.full(n, c1), c1 - (c1 - c0) * t, np.full(n, c0)])
+    rows = np.concatenate([np.full(n, r0), r0 + (r1 - r0) * t, np.full(n, r1), r1 - (r1 - r0) * t])
+    g = S1_VESSEL_GSD_M
+    return Transformer.from_crs(epsg, 4326, always_xy=True).transform(cols * g, rows * -g)
+
+
+def _private_tmp(path: Path) -> Path:
+    """A sibling temp name owned by one writer.
+
+    Concurrent writers of the same cache entry (e.g. two AOIs on one scene)
+    must never share a temp file: with a shared name one ``os.replace``
+    moves the other's file away and the second raises FileNotFoundError.
+    """
+    return path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.part")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via a private sibling temp file + ``os.replace``.
+
+    A reader (or a cache-hit check) never sees a partially written file.
+    """
+    tmp = _private_tmp(path)
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _s1_scene_header(item, pol: str, scene_dir: Path, signed) -> tuple[dict, Any]:
+    """Raster size, nodata, all GCPs of one measurement TIFF and each GCP's incidence.
+
+    The incidence angles (``gcp_incidence_deg``, one per GCP, same order) come
+    from the product annotation, whose geolocation grid must be the TIFF's GCPs
+    point for point. The header is cached as JSON (the annotation XML next to
+    it); a cached header without incidence angles (chain 1) is rebuilt.
+    """
+    path = scene_dir / f"{pol}_header.json"
+    if path.exists():
+        header = json.loads(path.read_text())
+        if "gcp_incidence_deg" in header:
+            return header, signed
+    import rasterio
+
+    from .data import mpc_s1, s1_shared
+
+    signed = signed or mpc_s1.sign_item(item)
+    href = dict(zip(_S1_POLARISATIONS, s1_shared.pick_measurement_urls(signed), strict=True))[pol]
+    with rasterio.Env(**_S1_GDAL_ENV), rasterio.open(href) as src:
+        gcps, gcp_crs = src.gcps
+        if src.crs is not None or not gcps:
+            raise FetchError(f"{item.id} {pol}: expected a GCP-referenced radar-geometry GRD")
+        header = {
+            "scene_id": item.id,
+            "href": href.split("?")[0],
+            "width": src.width,
+            "height": src.height,
+            "dtype": src.dtypes[0],
+            "nodata": src.nodata,
+            "gcp_crs": str(gcp_crs),
+            "gcps": [[g.id, g.col, g.row, g.x, g.y, g.z] for g in gcps],
+        }
+    ann_url = _s1_annotation_url(href, pol)
+    xml = _s1_http_get(ann_url, f"{item.id} {pol} annotation")
+    header["annotation_href"] = ann_url.split("?")[0]
+    header["gcp_incidence_deg"] = _s1_gcp_incidence(xml, header, pol)
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    tmp = _private_tmp(scene_dir / f"{pol}_annotation.xml")
+    try:
+        tmp.write_bytes(xml)
+        os.replace(tmp, scene_dir / f"{pol}_annotation.xml")
+    finally:
+        tmp.unlink(missing_ok=True)
+    _atomic_write_text(path, json.dumps(header))
+    return header, signed
+
+
+def _s1_annotation_url(measurement_href: str, pol: str) -> str:
+    """The product annotation of a measurement TIFF: ``annotation/iw-{pol}.xml``.
+
+    Not MPC's ``schema-product-{pol}`` asset: for the 2026 products it points
+    at ``annotation/rfi/rfi-iw-{pol}.xml``, the RFI report (no geolocation
+    grid). MPC stores the annotation as the measurement's sibling; the SAS
+    token of the measurement href is valid for it. Its content is validated
+    by ``_s1_gcp_incidence``.
+    """
+    base, sep, query = measurement_href.partition("?")
+    tail = f"/measurement/iw-{pol}.tiff"
+    if not base.endswith(tail):
+        raise FetchError(f"measurement href {base!r} does not end in {tail!r}; cannot locate "
+                         f"its product annotation")
+    return f"{base[:-len(tail)]}/annotation/iw-{pol}.xml{sep}{query}"
+
+
+def _s1_http_get(url: str, what: str, attempts: int = 3) -> bytes:
+    """GET with a timeout and retries; a failure is a FetchError naming ``what``.
+
+    HTTP 4xx (an expired SAS token is 403, a missing blob 404) is final and
+    raised at once: waiting does not heal it. Server errors and network
+    failures are retried ``attempts`` times.
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    for k in range(attempts):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500 or k == attempts - 1:
+                raise FetchError(f"{what}: download failed (HTTP {e.code} {e.reason})") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if k == attempts - 1:
+                raise FetchError(f"{what}: download failed ({e})") from e
+        time.sleep(2 * (k + 1))
+    raise AssertionError("unreachable")
+
+
+def _s1_gcp_incidence(xml: bytes, header: dict, pol: str) -> list[float]:
+    """Incidence angle (deg) of every GCP, from the product annotation's geolocation grid.
+
+    The grid must be the TIFF's GCPs: same count, same order, pixel/line equal
+    and lon/lat/height equal to float precision. Anything else (another file,
+    another product, a reordered grid) raises instead of pairing an angle with
+    the wrong tie point.
+    """
+    import xml.etree.ElementTree as ET
+
+    sid = header["scene_id"]
+    root = ET.fromstring(xml)
+    if root.tag != "product":
+        raise FetchError(f"{sid} {pol}: not a product annotation (root <{root.tag}>)")
+    ann_pol = (root.findtext("adsHeader/polarisation") or "").lower()
+    if ann_pol != pol:
+        raise FetchError(f"{sid} {pol}: annotation is for polarisation {ann_pol!r}")
+    points = root.findall("geolocationGrid/geolocationGridPointList/geolocationGridPoint")
+    gcps = header["gcps"]
+    if len(points) != len(gcps):
+        raise FetchError(f"{sid} {pol}: annotation grid has {len(points)} points, the TIFF "
+                         f"{len(gcps)} GCPs")
+    lo, hi = _S1_INCIDENCE_RANGE_DEG
+
+    def number(p, k: int, tag: str) -> float:
+        text = p.findtext(tag)
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            raise FetchError(f"{sid} {pol}: annotation grid point {k} has no numeric "
+                             f"<{tag}> ({text!r})") from None
+
+    out = []
+    for k, ((gid, c, r, x, y, z), p) in enumerate(zip(gcps, points, strict=True)):
+        pixel, line, lon, lat, h, inc = (number(p, k, t) for t in (
+            "pixel", "line", "longitude", "latitude", "height", "incidenceAngle"))
+        if (pixel, line) != (c, r) or max(abs(lon - x), abs(lat - y)) > _S1_GCP_IDENTITY_TOL_DEG \
+                or abs(h - z) > _S1_GCP_IDENTITY_TOL_M:
+            raise FetchError(f"{sid} {pol}: annotation grid point {k} (pixel {pixel}, line "
+                             f"{line}, {lon}, {lat}, {h} m) is not TIFF GCP {gid} ({c}, {r}, "
+                             f"{x}, {y}, {z} m)")
+        if not lo < inc < hi:
+            raise FetchError(f"{sid} {pol}: incidence {inc} deg at grid point {k} outside "
+                             f"({lo}, {hi})")
+        out.append(inc)
+    return out
+
+
+def _s1_geocoding_model() -> dict:
+    """The tie-point model; part of the cache key and of the provenance."""
+    from .geoid import EGM96_GRID, EGM96_MODEL, egm96_grid_sha256
+
+    model = {"tie_points": _S1_TIE_POINTS, "surface": EGM96_MODEL,
+             "grid": EGM96_GRID.name, "grid_sha256": egm96_grid_sha256()}
+    if S1_GCP_SAMPLE_CENTRE:
+        model["gcp_pixel_convention"] = (
+            "ESA sample centre -> GDAL corner lattice: pixel + 0.5, line + 0.5")
+    return model
+
+
+def _s1_gcp_half_px() -> float:
+    """GCP pixel/line offset of ``S1_GCP_SAMPLE_CENTRE``, read at call time."""
+    return 0.5 if S1_GCP_SAMPLE_CENTRE else 0.0
+
+
+def _s1_geocoding_id() -> str:
+    """Short id of ``_s1_geocoding_model()``: names the cached radar-window TIFFs."""
+    payload = json.dumps(_s1_geocoding_model(), sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()[:8]
+
+
+def _s1_sea_surface(header: dict) -> tuple[list[list], np.ndarray]:
+    """The scene's GCPs on the sea surface, and each GCP's shift (m, + = away from the satellite).
+
+    Per GCP ``[id, col, row, lon, lat, z]``: col and row move by
+    ``_s1_gcp_half_px()`` (sample centre on GDAL's lattice); N is the EGM96 undulation at
+    (lon, lat); the GCP moves ``(N - z) / tan(incidence)`` metres along the
+    ground direction of increasing pixel on its GCP row (S1 looks right, so
+    increasing pixel is away from the satellite). That direction is the central
+    difference of the row's neighbouring GCPs in the GCP's own tangent plane
+    (one-sided at the row ends), from geodesic azimuths and distances, never
+    from degree differences. Then z = N.
+
+    Raises:
+        FetchError: no or misaligned incidence angles, a GCP row with fewer
+            than two points (no range direction), or a row whose incidence does
+            not increase with pixel (then increasing pixel is not away from the
+            satellite and the shift would point the wrong way).
+    """
+    from pyproj import Geod
+
+    from .geoid import egm96_undulation
+
+    gcps = header["gcps"]
+    inc = header.get("gcp_incidence_deg")
+    if inc is None or len(inc) != len(gcps):
+        raise FetchError(f"{header['scene_id']}: header has no incidence angle per GCP; "
+                         f"rebuild it with _s1_scene_header")
+    col = np.array([g[1] for g in gcps], dtype=float)
+    row = np.array([g[2] for g in gcps], dtype=float)
+    lon = np.array([g[3] for g in gcps], dtype=float)
+    lat = np.array([g[4] for g in gcps], dtype=float)
+    z = np.array([g[5] for g in gcps], dtype=float)
+    inc = np.asarray(inc, dtype=float)
+    geod = Geod(ellps="WGS84")
+    east = np.zeros(len(gcps))
+    north = np.zeros(len(gcps))
+    for line in np.unique(row):
+        idx = np.flatnonzero(row == line)
+        idx = idx[np.argsort(col[idx], kind="stable")]
+        if len(idx) < 2:
+            raise FetchError(f"{header['scene_id']}: GCP row at line {line} has one point; "
+                             f"its range direction is undefined")
+        if not (np.diff(inc[idx]) > 0).all():
+            raise FetchError(f"{header['scene_id']}: incidence does not increase with pixel "
+                             f"on the GCP row at line {line} ({inc[idx].round(2).tolist()}); "
+                             f"increasing pixel is not away from the satellite")
+        a, b = idx[:-1], idx[1:]
+        az_ab, az_ba, d = geod.inv(lon[a], lat[a], lon[b], lat[b])
+        # + vector to the next GCP (in a's plane), - vector to the previous (in b's).
+        east[a] += d * np.sin(np.radians(az_ab))
+        north[a] += d * np.cos(np.radians(az_ab))
+        east[b] -= d * np.sin(np.radians(az_ba))
+        north[b] -= d * np.cos(np.radians(az_ba))
+    n = np.asarray(egm96_undulation(lon, lat), dtype=float)
+    shift = (n - z) / np.tan(np.radians(inc))
+    az = np.degrees(np.arctan2(east, north))
+    lon2, lat2, _ = geod.fwd(lon, lat, np.where(shift < 0, az + 180.0, az), np.abs(shift))
+    half = _s1_gcp_half_px()
+    out = [[g[0], g[1] + half, g[2] + half, float(x), float(y), float(h)]
+           for g, x, y, h in zip(gcps, lon2, lat2, n, strict=True)]
+    return out, shift
+
+
+def _s1_sea_surface_gcps(header: dict) -> list[list]:
+    """GCPs ``[id, col, row, lon, lat, z]`` on the sea surface (see ``_s1_sea_surface``).
+
+    The only GCPs the chain uses: radar window, AOI dating, window TIFF and the
+    sparse VRT that the warp reads. ``header["gcps"]`` is the raw product.
+    """
+    return _s1_sea_surface(header)[0]
+
+
+def _s1_gcp_tps(gcps: list[list]):
+    """GDAL's GCP thin-plate-spline transformer (the warp's model) over ``gcps``."""
+    from rasterio.control import GroundControlPoint
+    from rasterio.transform import GCPTransformer
+
+    return GCPTransformer([GroundControlPoint(row=r, col=c, x=x, y=y, z=z, id=i)
+                           for i, c, r, x, y, z in gcps], tps=True)
+
+
+def _s1_shift_stats(shift_m: np.ndarray, header: dict) -> dict:
+    """GCP shifts in metres (+ = away from the satellite): sea GCPs and all GCPs.
+
+    Sea GCPs (raw ``|z| < 1 m``) carry the shift the ships get; land GCPs above
+    the geoid move toward the satellite by hundreds of metres in mountains.
+    """
+    sea = np.array([abs(g[5]) < _S1_SEA_GCP_MAX_ABS_Z_M for g in header["gcps"]])
+
+    def stats(v: np.ndarray) -> dict:
+        if not v.size:
+            return {"n": 0}
+        return {"n": int(v.size), "min": round(float(v.min()), 2),
+                "median": round(float(np.median(v)), 2), "max": round(float(v.max()), 2)}
+
+    return {"sea": stats(shift_m[sea]), "all": stats(shift_m)}
+
+
+def _s1_window_stem(pol: str, rwin: dict) -> str:
+    """File stem of a cached radar window; names the geocoding its GCPs carry.
+
+    A window cached under another geocoding is downloaded again, not relabelled:
+    its embedded GCPs would be wrong, and rewriting them in place could expose a
+    half-written file to a concurrent reader.
+    """
+    return (f"{pol}_c{rwin['col_off']}_r{rwin['row_off']}_{rwin['width']}x{rwin['height']}"
+            f"_g{_s1_geocoding_id()}")
+
+
+def _s1_radar_window(header: dict, epsg: int, aoi_px: tuple,
+                     sea: tuple[list[list], np.ndarray] | None = None) -> dict:
+    """Radar-geometry window (col, row, width, height) covering the AOI + margin.
+
+    Also returns the radar line of the AOI centre (``aoi_center_row``, float;
+    clamped to the scene when an AOI only partly covered by this slice has its
+    centre outside it), the scene's line count (``lines``), which date the
+    AOI within the slice, and the GCP shifts onto the sea surface
+    (``gcp_shift_m``). Uses the sea-surface GCPs; ``sea`` is
+    ``_s1_sea_surface(header)`` when the caller already has it.
+    """
+    gcps, shift = sea if sea is not None else _s1_sea_surface(header)
+    tps = _s1_gcp_tps(gcps)
+    lon, lat = _s1_aoi_outline_lonlat(epsg, aoi_px)
+    rows, cols = tps.rowcol(lon, lat, op=float)
+    # Guard: the inverse TPS must agree with the forward TPS on the AOI outline.
+    lon2, lat2 = tps.xy(rows, cols, offset="ul")
+    err_m = float(np.max(haversine_m(lon, lat, lon2, lat2)))
+    if err_m > _S1_TPS_ROUNDTRIP_TOL_M:
+        raise FetchError(f"{header['scene_id']}: TPS round-trip error {err_m:.1f} m on the "
+                         f"AOI outline exceeds {_S1_TPS_ROUNDTRIP_TOL_M} m")
+    m = _S1_RADAR_MARGIN_PX
+    c0 = max(math.floor(np.min(cols)) - m, 0)
+    r0 = max(math.floor(np.min(rows)) - m, 0)
+    c1 = min(math.ceil(np.max(cols)) + m, header["width"])
+    r1 = min(math.ceil(np.max(rows)) + m, header["height"])
+    if c1 <= c0 or r1 <= r0:
+        raise FetchError(f"{header['scene_id']}: AOI maps outside the radar raster")
+    return {"col_off": c0, "row_off": r0, "width": c1 - c0, "height": r1 - r0,
+            "tps_roundtrip_max_m": round(err_m, 3),
+            "aoi_center_row": _s1_centre_line(tps, epsg, aoi_px, header["height"]),
+            "lines": header["height"],
+            "gcp_shift_m": _s1_shift_stats(shift, header)}
+
+
+def _s1_centre_line(tps, epsg: int, aoi_px: tuple, lines: int) -> float:
+    """Radar line of the centre of ``aoi_px`` (inverse TPS), clamped to ``[0, lines]``."""
+    from pyproj import Transformer
+
+    g = S1_VESSEL_GSD_M
+    lon_c, lat_c = Transformer.from_crs(epsg, 4326, always_xy=True).transform(
+        (aoi_px[0] + aoi_px[2]) / 2 * g, (aoi_px[1] + aoi_px[3]) / 2 * -g)
+    row_c, _ = tps.rowcol(lon_c, lat_c, op=float)
+    return round(float(min(max(row_c, 0.0), lines)), 3)
+
+
+def _s1_aoi_centre_line(header: dict, epsg: int, aoi_px: tuple) -> float:
+    """``_s1_centre_line`` from a cached scene header (no network), sea-surface GCPs."""
+    return _s1_centre_line(_s1_gcp_tps(_s1_sea_surface_gcps(header)), epsg, aoi_px,
+                           header["height"])
+
+
+def _s1_sparse_scene_vrt(item, pol: str, epsg: int, aoi_px: tuple, scene_dir: Path,
+                         signed) -> tuple[Path, dict, int, Any]:
+    """Cache the radar window and wrap it in a full-size VRT with all GCPs.
+
+    Both carry the sea-surface GCPs (``_s1_sea_surface_gcps``); the window
+    file's name holds the geocoding id, so a window cached with other GCPs is
+    never reused.
+
+    Returns ``(vrt_path, radar_window, step1_epsg, signed_item_or_None)``.
+    """
+    import rasterio
+    from rasterio.control import GroundControlPoint
+    from rasterio.windows import Window
+
+    header, signed = _s1_scene_header(item, pol, scene_dir, signed)
+    sea = _s1_sea_surface(header)                   # once per scene and polarisation
+    rwin = _s1_radar_window(header, epsg, aoi_px, sea)
+    sea_gcps = sea[0]
+    stem = _s1_window_stem(pol, rwin)
+    win_path, vrt_path = scene_dir / f"{stem}.tif", scene_dir / f"{stem}.vrt"
+    if not win_path.exists():
+        from .data import mpc_s1, s1_shared
+
+        signed = signed or mpc_s1.sign_item(item)
+        href = dict(zip(_S1_POLARISATIONS, s1_shared.pick_measurement_urls(signed), strict=True))[pol]
+        window = Window(rwin["col_off"], rwin["row_off"], rwin["width"], rwin["height"])
+        with rasterio.Env(**_S1_GDAL_ENV), rasterio.open(href) as src:
+            data = src.read(1, window=window)
+        # Self-describing crop: the GCPs shifted into the crop's pixel space.
+        shifted = [GroundControlPoint(row=r - rwin["row_off"], col=c - rwin["col_off"],
+                                      x=x, y=y, z=z, id=i)
+                   for i, c, r, x, y, z in sea_gcps]
+        tmp = _private_tmp(win_path)
+        try:
+            with rasterio.open(tmp, "w", driver="GTiff", width=data.shape[1],
+                               height=data.shape[0], count=1, dtype=data.dtype,
+                               nodata=header["nodata"], compress="zstd", tiled=True,
+                               blockxsize=512, blockysize=512,
+                               gcps=shifted, crs=header["gcp_crs"]) as dst:
+                dst.write(data, 1)
+                dst.update_tags(SCENE_ID=header["scene_id"], SOURCE_HREF=header["href"],
+                                COL_OFF=str(rwin["col_off"]), ROW_OFF=str(rwin["row_off"]))
+            os.replace(tmp, win_path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        print(f"    [S1 vessels] cached radar window {win_path} "
+              f"({data.shape[1]}x{data.shape[0]} px)")
+    _atomic_write_text(vrt_path, _s1_sparse_vrt_xml(header, rwin, win_path.name, sea_gcps))
+    first = sea_gcps[0]
+    return vrt_path, rwin, _ai2_utm_epsg(first[3], first[4]), signed
+
+
+_GDAL_DATA_TYPES = {"uint16": "UInt16"}     # GRD measurement TIFFs are uint16
+
+
+def _s1_sparse_vrt_xml(header: dict, rwin: dict, window_file: str,
+                       gcps: list[list] | None = None) -> str:
+    """GDAL VRT: the full scene's size and sea-surface GCPs, real pixels only in the window.
+
+    ``gcps`` is ``_s1_sea_surface_gcps(header)`` when the caller already has it.
+    Built with ElementTree so the GCP CRS (possibly WKT with quotes) and every
+    other value is XML-escaped.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        gdal_type = _GDAL_DATA_TYPES[header["dtype"]]
+    except KeyError:
+        raise FetchError(f"{header['scene_id']}: GRD data type {header['dtype']!r} is not "
+                         f"supported (expected one of {sorted(_GDAL_DATA_TYPES)})") from None
+    root = ET.Element("VRTDataset", rasterXSize=str(header["width"]),
+                      rasterYSize=str(header["height"]))
+    gcp_list = ET.SubElement(root, "GCPList", Projection=header["gcp_crs"])
+    for i, c, r, x, y, z in gcps if gcps is not None else _s1_sea_surface_gcps(header):
+        ET.SubElement(gcp_list, "GCP", Id=str(i), Pixel=repr(c), Line=repr(r),
+                      X=repr(x), Y=repr(y), Z=repr(z))
+    band = ET.SubElement(root, "VRTRasterBand", dataType=gdal_type, band="1")
+    if header["nodata"] is not None:
+        ET.SubElement(band, "NoDataValue").text = repr(header["nodata"])
+    src = ET.SubElement(band, "SimpleSource")
+    ET.SubElement(src, "SourceFilename", relativeToVRT="1").text = window_file
+    ET.SubElement(src, "SourceBand").text = "1"
+    w, h = str(rwin["width"]), str(rwin["height"])
+    ET.SubElement(src, "SrcRect", xOff="0", yOff="0", xSize=w, ySize=h)
+    ET.SubElement(src, "DstRect", xOff=str(rwin["col_off"]), yOff=str(rwin["row_off"]),
+                  xSize=w, ySize=h)
+    ET.indent(root)
+    return ET.tostring(root, encoding="unicode") + "\n"
+
+
+def _s1_grd_to_window_grid(src_path: str | Path, step1_epsg: int, epsg: int,
+                           window_px: tuple, aoi_px: tuple) -> np.ndarray:
+    """rslearn's ingest + materialise warps over the full request; returns the AOI.
+
+    Step 1 is ``DefaultTileStore.write_raster_file`` (TPS, cubic, GDAL-suggested
+    grid, uint16); step 2 is ``GeotiffRasterFormat.decode_raster`` onto the
+    whole window (cubic, the tile's nodata). Both are whole-dataset reads, as in
+    rslearn, so GDAL chunks them exactly as it does there.
+
+    Returns:
+        (H, W) uint16 on ``aoi_px``.
+    """
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.io import MemoryFile
+    from rasterio.transform import Affine
+    from rasterio.vrt import WarpedVRT
+
+    with rasterio.open(src_path) as src:
+        nodata = src.nodata
+        with WarpedVRT(src, crs=f"EPSG:{step1_epsg}", resampling=Resampling.cubic,
+                       MAX_GCP_ORDER="-1") as vrt:
+            step1 = vrt.read()
+            profile = {"driver": "GTiff", "width": vrt.width, "height": vrt.height, "count": 1,
+                       "dtype": step1.dtype, "crs": vrt.crs, "transform": vrt.transform,
+                       "nodata": nodata, "tiled": True, "blockxsize": 512, "blockysize": 512,
+                       "SPARSE_OK": True}
+    g = S1_VESSEL_GSD_M
+    c0, r0, c1, r1 = window_px
+    with MemoryFile() as mf:
+        with mf.open(**profile) as tile:
+            tile.write(step1)
+        del step1
+        with mf.open() as tile, WarpedVRT(
+                tile, crs=f"EPSG:{epsg}",
+                transform=Affine(g, 0, c0 * g, 0, -g, r0 * -g),
+                width=c1 - c0, height=r1 - r0, resampling=Resampling.cubic) as vrt:
+            step2 = vrt.read(1)
+    a0, b0, a1, b1 = aoi_px
+    return step2[b0 - r0:b1 - r0, a0 - c0:a1 - c0].copy()
+
+
+def _write_s1_vessel_cache(tif_path: Path, meta_path: Path, scenes: S1VesselScenes) -> None:
+    """Persist the model input (uint16, 4 bands) and its record sidecar (written last).
+
+    The sidecar is the completion marker: a cache hit needs both files, and it
+    is published only after the raster. Concurrent writers of one key each
+    use a private temp file; the key is a hash of every input, so they write
+    identical bytes and whichever ``os.replace`` lands last leaves a
+    consistent raster/sidecar pair.
+    """
+    import dataclasses
+
+    import rasterio
+
+    if scenes.target.dtype != np.uint16 or scenes.historical.dtype != np.uint16:
+        raise TypeError(f"S1 vessel input must be uint16 DN, got {scenes.target.dtype} / "
+                        f"{scenes.historical.dtype}")
+    geo = scenes.geo
+    tif_path.parent.mkdir(parents=True, exist_ok=True)
+    stack = np.concatenate([scenes.target, scenes.historical])
+    tmp = _private_tmp(tif_path)
+    try:
+        with rasterio.open(tmp, "w", driver="GTiff", width=stack.shape[2],
+                           height=stack.shape[1], count=4, dtype="uint16", crs=geo.crs,
+                           transform=geo.transform, nodata=0, compress="zstd", tiled=True,
+                           blockxsize=512, blockysize=512) as dst:
+            dst.write(stack)
+            dst.descriptions = ("target_vv", "target_vh", "historical_vv", "historical_vh")
+        os.replace(tmp, tif_path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    _atomic_write_text(meta_path, json.dumps({
+        "target_scene": dataclasses.asdict(scenes.target_scene),
+        "historical_scene": dataclasses.asdict(scenes.historical_scene),
+        "target_slices": [dataclasses.asdict(s) for s in scenes.target_slices],
+        "historical_slices": [dataclasses.asdict(s) for s in scenes.historical_slices],
+        "scene_time_utc": scenes.scene_time_utc,
+        "geo": {"crs": geo.crs, "transform": list(geo.transform)[:6],
+                "bounds_projected": geo.bounds_projected, "bounds_wgs84": geo.bounds_wgs84,
+                "shape": list(geo.shape)},
+        "provenance": scenes.provenance,
+    }, indent=1))
+    print(f"    [S1 vessels] saved {tif_path}")
+
+
+def _load_s1_vessel_cache(tif_path: Path, meta_path: Path) -> S1VesselScenes:
+    """Read a cached request back exactly as it was written (uint16 DN)."""
+    import rasterio
+    from rasterio.transform import Affine
+
+    meta = json.loads(meta_path.read_text())
+    with rasterio.open(tif_path) as src:
+        stack = src.read()
+    g = meta["geo"]
+    geo = GeoContext(crs=g["crs"], transform=Affine(*g["transform"]),
+                     bounds_projected=g["bounds_projected"], bounds_wgs84=g["bounds_wgs84"],
+                     shape=tuple(g["shape"]))
+    return S1VesselScenes(
+        target=stack[:2], historical=stack[2:], geo=geo,
+        target_scene=S1SceneInfo(**meta["target_scene"]),
+        historical_scene=S1SceneInfo(**meta["historical_scene"]),
+        scene_time_utc=meta["scene_time_utc"],
+        provenance=meta["provenance"],
+        target_slices=[S1SceneInfo(**s) for s in meta["target_slices"]],
+        historical_slices=[S1SceneInfo(**s) for s in meta["historical_slices"]],
+    )
+
+
+def _fetch_tci_scl_batch(
+    conn,
+    projected_coords: dict,
+    temporal: list[str],
+) -> list[tuple[str, dict, np.ndarray, "GeoContext"]]:
+    """Fetch B02+B03+B04+SCL for ALL dates in a temporal range in one call.
+
+    Returns per-date tuples so the caller can screen cloud and run
+    vessel detection without additional DES calls.
+
+    Args:
+        conn: Authenticated openEO connection.
+        projected_coords: EPSG:3006 bbox dict with ``"crs"`` key.
+        temporal: ``[start, end)`` ISO date pair for the range.
+
+    Returns:
+        List of ``(date_str, bands_dict, scl, geo)`` sorted by date.
+        *bands_dict* has uppercase keys ``{"B02", "B03", "B04"}`` as
+        float32 reflectance.
+    """
+    import re
+    import tarfile
+    import rasterio
+    from .utils import dn_to_reflectance, des_to_imint_bands
+
+    tci_band_names = ["b02", "b03", "b04"]
+
+    # Multi-date payload arrives as tar.gz of per-date GeoTIFFs — let the
+    # helper assemble + download, then handle the per-date split here.
+    data, _, _ = _load_s2_cube(
+        conn,
+        projected_coords=projected_coords,
+        temporal=temporal,
+        collection_id=COLLECTION,
+        bands_10m=tci_band_names,
+        scl_band=BANDS_20M_CATEGORICAL,
+        return_bytes=True,
+        empty_msg="DES returned empty TCI+SCL batch data",
+    )
+
+    _DATE_RE = re.compile(r"out_(\d{4})_(\d{2})_(\d{2})T")
+    results: dict[str, tuple[dict, np.ndarray, "GeoContext"]] = {}
+
+    if isinstance(data, bytes) and data[:2] == b"\x1f\x8b":
+        tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+        for member in tf.getmembers():
+            if not member.name.lower().endswith((".tif", ".tiff")):
+                continue
+            m = _DATE_RE.search(member.name)
+            if not m:
+                continue
+            date_str = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            f = tf.extractfile(member)
+            if f is None:
+                continue
+            try:
+                with rasterio.open(io.BytesIO(f.read())) as src:
+                    raw = src.read()  # (4, H, W): b02, b03, b04, scl
+                    crs = src.crs
+                    transform = src.transform
+            except Exception:
+                continue
+
+            bands = {}
+            for i, name in enumerate(tci_band_names):
+                bands[name] = dn_to_reflectance(raw[i], source="des")
+            imint_bands = des_to_imint_bands(bands)
+            scl = raw[len(tci_band_names)].astype(np.uint8)
+
+            proj_bounds = {k: v for k, v in projected_coords.items() if k != "crs"}
+            geo = GeoContext(
+                crs=str(crs),
+                transform=transform,
+                bounds_projected=proj_bounds,
+                bounds_wgs84=None,
+                shape=(raw.shape[1], raw.shape[2]),
+            )
+            results[date_str] = (imint_bands, scl, geo)
+        tf.close()
+    elif isinstance(data, bytes):
+        # Single-date result (plain GeoTIFF, not tar.gz)
+        with rasterio.open(io.BytesIO(data)) as src:
+            raw = src.read()
+            crs = src.crs
+            transform = src.transform
+        bands = {}
+        for i, name in enumerate(tci_band_names):
+            bands[name] = dn_to_reflectance(raw[i], source="des")
+        imint_bands = des_to_imint_bands(bands)
+        scl = raw[len(tci_band_names)].astype(np.uint8)
+        proj_bounds = {k: v for k, v in projected_coords.items() if k != "crs"}
+        geo = GeoContext(
+            crs=str(crs), transform=transform,
+            bounds_projected=proj_bounds, bounds_wgs84=None,
+            shape=(raw.shape[1], raw.shape[2]),
+        )
+        # Use start date as fallback
+        results[temporal[0]] = (imint_bands, scl, geo)
+
+    return [(d, *results[d]) for d in sorted(results)]
+
+
+def fetch_vessel_heatmap(
+    coords: dict,
+    date_start: str,
+    date_end: str,
+    output_dir: str | Path,
+    *,
+    cloud_threshold: float = 0.3,
+    scene_cloud_max: float = 50.0,
+    gaussian_sigma: float = 5.0,
+    prefix: str = "",
+    analyzer_type: str = "yolo",
+    predict_attributes: bool = False,
+) -> dict:
+    """Fetch all cloud-free Sentinel-2 images in a date range, run vessel
+    detection on each, and aggregate into a heatmap.
+
+    Pipeline (single DES call per month — no STAC):
+
+    1. For each calendar month, batch-fetch spectral bands + SCL for ALL
+       available dates in one openEO call.
+    2. Screen per-date AOI cloud fraction from the downloaded SCL.
+    3. Run the selected vessel detector on each cloud-free date (already
+       in memory — no extra fetch needed).
+    4. Accumulate detection centroids into a (H, W) grid and smooth
+       with a Gaussian kernel.
+    5. Save the heatmap as a colormapped RGBA PNG.
+
+    Args:
+        coords: WGS84 bounding box ``{west, south, east, north}``.
+        date_start: Start of search period (ISO date, e.g. ``"2025-07-01"``).
+        date_end: End of search period (ISO date, e.g. ``"2025-07-31"``).
+        output_dir: Directory for output files.
+        cloud_threshold: Maximum AOI cloud fraction (0.0–1.0). Dates with
+            higher cloud coverage are skipped. Default: 0.3 (30%).
+        scene_cloud_max: Unused (kept for CLI compatibility).
+        gaussian_sigma: Standard deviation (in pixels, 1 px = 10 m) for
+            Gaussian smoothing of the raw detection grid. Default: 5.0.
+        prefix: Date prefix for output filenames (e.g. ``"2025-07-10_"``).
+        analyzer_type: ``"yolo"`` for YOLO11s or ``"ai2"`` for the Allen AI
+            rslearn Swin V2 + Faster R-CNN model. Default: ``"yolo"``.
+        predict_attributes: If ``True``, run the AI2 attribute model on
+            each detection to predict speed, heading, length, width, and
+            vessel type. Requires fetching all 9 bands (forces per-date
+            mode). Default: ``False``.
+
+    Returns:
+        Dict with keys ``heatmap``, ``dates_used``, ``dates_skipped``,
+        ``total_detections``, ``per_date``, ``heatmap_path``.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    from scipy.ndimage import gaussian_filter
+    from .exporters.export import save_vessel_heatmap_png, save_ai2_vessel_overlay
+    from .analyzers.ai2_vessels import (
+        _load_attribute_model, _predict_attributes,
+        _bands_dict_to_9ch, _DEFAULT_ATTR_CKPT, BAND_ORDER,
+    )
+    from .utils import bands_to_rgb
+    import json as _json
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    projected_coords = _to_nmd_grid(coords)
+    conn = _connect()
+
+    # Select analyzer
+    _use_ai2 = analyzer_type.lower() == "ai2"
+    _want_attrs = predict_attributes or _use_ai2  # AI2 always predicts attributes
+    if _use_ai2:
+        from .analyzers.ai2_vessels import AI2VesselAnalyzer
+        analyzer = AI2VesselAnalyzer(config={"water_filter": True})
+        print("[vessel-heatmap] Using AI2 rslearn detector (Swin V2 B + Faster R-CNN)")
+    else:
+        from .analyzers.marine_vessels import MarineVesselAnalyzer
+        analyzer = MarineVesselAnalyzer(config={
+            "confidence": 0.286,
+            "water_filter": True,
+        })
+        print("[vessel-heatmap] Using YOLO11s detector")
+        if _want_attrs:
+            print("[vessel-heatmap] + AI2 attribute prediction (speed/heading/type)")
+
+    # Lazy-loaded attribute model (shared across all dates)
+    _attr_model = [None]  # mutable container for closure access
+
+    def _ensure_attr_model():
+        if _attr_model[0] is None:
+            attr_ckpt = str(_DEFAULT_ATTR_CKPT)
+            if not Path(attr_ckpt).exists():
+                print(f"    [attr] Checkpoint not found: {attr_ckpt}")
+                return None
+            _attr_model[0] = _load_attribute_model(attr_ckpt)
+        return _attr_model[0]
+
+    # Generate 2-week windows.  DES limits synchronous jobs to ~20
+    # time steps; with 4 bands (B02+B03+B04+SCL) per date and ~3
+    # Sentinel-2 passes per 2-week window, each call stays well
+    # within the limit.
+    _CHUNK_DAYS = 14
+    _d_start = _dt.strptime(date_start, "%Y-%m-%d")
+    _d_end = _dt.strptime(date_end, "%Y-%m-%d")
+
+    _chunk_ranges: list[tuple[str, str]] = []
+    _cur = _d_start
+    while _cur <= _d_end:
+        _c_end = min(_cur + _td(days=_CHUNK_DAYS), _d_end + _td(days=1))
+        _chunk_ranges.append((_cur.strftime("%Y-%m-%d"), _c_end.strftime("%Y-%m-%d")))
+        _cur = _c_end
+
+    # ── Fetch + detect ──────────────────────────────────────────────
+    # For large areas (> ~2000 px on any side), batch mode times out
+    # on DES synchronous — go straight to per-date fetching.
+    _px_w = (projected_coords["east"] - projected_coords["west"]) / 10
+    _px_h = (projected_coords["north"] - projected_coords["south"]) / 10
+    _use_single_date = max(_px_w, _px_h) > 2000
+    if _use_single_date:
+        print(f"    Large area ({_px_w:.0f}×{_px_h:.0f} px) — using per-date mode")
+    heatmap = None
+    per_date = []
+    dates_used = []
+    dates_skipped = []
+    total_detections = 0
+    # Track best (lowest cloud) date for overlay snapshot
+    _best_snapshot = {"cloud": 1.0, "rgb": None, "regions": None, "date": None}
+
+    def _detect_and_accumulate(date, bands, scl):
+        """Run vessel detection on one date and accumulate into heatmap."""
+        nonlocal heatmap, total_detections
+        cloud = check_cloud_fraction(scl)
+        if cloud > cloud_threshold:
+            dates_skipped.append(date)
+            print(f"    {date}  cloud={cloud:.1%}  ✗")
+            return
+        dates_used.append(date)
+        rgb = bands_to_rgb(bands, scl=scl)
+        result = analyzer.run(rgb, bands=bands, scl=scl)
+        regions = result.outputs.get("regions", []) if result.success else []
+
+        # ── Attribute prediction (hybrid YOLO + AI2 attributes) ──
+        if _want_attrs and regions and not _use_ai2:
+            # AI2 analyzer already predicts attributes internally;
+            # this branch adds attributes to YOLO detections.
+            attr_model = _ensure_attr_model()
+            if attr_model is not None:
+                try:
+                    image_9ch = _bands_dict_to_9ch(bands)
+                    # Convert regions to the format _predict_attributes expects
+                    det_for_attr = []
+                    for r in regions:
+                        bb = r["bbox"]
+                        det_for_attr.append({
+                            "x_min": bb["x_min"], "y_min": bb["y_min"],
+                            "x_max": bb["x_max"], "y_max": bb["y_max"],
+                        })
+                    attrs = _predict_attributes(attr_model, image_9ch, det_for_attr)
+                    for r, attr in zip(regions, attrs):
+                        r["attributes"] = attr
+                    n_attr = sum(1 for a in attrs if a.get("vessel_type"))
+                    print(f"      + attributes predicted for {n_attr}/{len(regions)} detections")
+                except Exception as e:
+                    print(f"      ⚠ attribute prediction failed: {e}")
+
+        n = len(regions)
+        total_detections += n
+        per_date.append({"date": date, "cloud": cloud, "vessels": n})
+        print(f"    {date}  cloud={cloud:.1%}  ✓  vessels={n}")
+        if heatmap is None:
+            heatmap = np.zeros(rgb.shape[:2], dtype=np.float32)
+        for r in regions:
+            bb = r["bbox"]
+            cy = (bb["y_min"] + bb["y_max"]) // 2
+            cx = (bb["x_min"] + bb["x_max"]) // 2
+            if 0 <= cy < heatmap.shape[0] and 0 <= cx < heatmap.shape[1]:
+                heatmap[cy, cx] += 1.0
+        # Keep the clearest date with detections for overlay snapshot
+        if n > 0 and cloud < _best_snapshot["cloud"]:
+            _best_snapshot["cloud"] = cloud
+            _best_snapshot["rgb"] = rgb
+            _best_snapshot["regions"] = regions
+            _best_snapshot["date"] = date
+
+    _band_label = "9 bands" if _want_attrs else "TCI+SCL"
+    print(f"\n[vessel-heatmap] Fetching {_band_label} from DES ({len(_chunk_ranges)} chunks) ...")
+    # Attribute prediction needs 9 bands — the batch TCI+SCL fetcher only
+    # provides 4, so we always use per-date mode when attributes are wanted.
+    if not _use_single_date and _want_attrs:
+        _use_single_date = True
+        print("    Attribute prediction needs 9 bands — using per-date mode")
+    if not _use_single_date:
+        _use_single_date = False  # set True on first batch timeout
+    for _c_start, _c_end in _chunk_ranges:
+        print(f"\n  ── {_c_start} – {_c_end} ──")
+
+        if not _use_single_date:
+            try:
+                batch = _fetch_tci_scl_batch(conn, projected_coords, [_c_start, _c_end])
+                print(f"    {len(batch)} dates returned")
+                for date, bands, scl, geo in batch:
+                    _detect_and_accumulate(date, bands, scl)
+                continue
+            except (FetchError, Exception) as _batch_err:
+                if "504" in str(_batch_err) or "Gateway" in str(_batch_err):
+                    print(f"    Batch too large — switching to per-date mode")
+                    _use_single_date = True
+                elif "no matching dates" in str(_batch_err):
+                    print(f"    (no data)")
+                    continue
+                else:
+                    print(f"    Batch failed: {_batch_err} — switching to per-date mode")
+                    _use_single_date = True
+
+        # Per-date fallback for large areas
+        _c_dt = _dt.strptime(_c_start, "%Y-%m-%d")
+        _e_dt = _dt.strptime(_c_end, "%Y-%m-%d")
+        while _c_dt < _e_dt:
+            date = _c_dt.strftime("%Y-%m-%d")
+            temporal = [date, (_c_dt + _td(days=1)).strftime("%Y-%m-%d")]
+            try:
+                if _want_attrs:
+                    bands, scl, geo = _fetch_ai2_bands(conn, projected_coords, temporal)
+                else:
+                    bands, scl, geo = _fetch_tci_bands(conn, projected_coords, temporal)
+                _detect_and_accumulate(date, bands, scl)
+            except Exception as e:
+                if "empty" not in str(e).lower():
+                    print(f"    {date}  ✗ {e}")
+            _c_dt += _td(days=1)
+
+    print(f"\n    {len(dates_used)} dates used, {len(dates_skipped)} skipped")
+
+    # ── Step 5: Smooth and save ──────────────────────────────────────
+    heatmap_path = None
+    if heatmap is not None and heatmap.max() > 0:
+        heatmap = gaussian_filter(heatmap, sigma=gaussian_sigma)
+        # Cache the raw smoothed array for quick re-export
+        np.save(str(output_dir / f"{prefix}vessel_heatmap.npy"), heatmap)
+        heatmap_path = output_dir / f"{prefix}vessel_heatmap_clean.png"
+        save_vessel_heatmap_png(heatmap, str(heatmap_path))
+
+    # ── Save vessel overlay with attributes (AI2 or YOLO+attributes) ──
+    ai2_overlay_path = None
+    if _want_attrs and _best_snapshot["regions"]:
+        # Check that at least some detections have attributes
+        has_attrs = any(r.get("attributes") for r in _best_snapshot["regions"])
+        if has_attrs:
+            ai2_overlay_path = output_dir / f"{prefix}ai2_vessels_clean.png"
+            save_ai2_vessel_overlay(
+                _best_snapshot["rgb"],
+                _best_snapshot["regions"],
+                str(ai2_overlay_path),
+            )
+            _src = "AI2" if _use_ai2 else "YOLO+attributes"
+            print(f"[vessel-heatmap] {_src} overlay ({_best_snapshot['date']}) → {ai2_overlay_path}")
+
+    # Save summary JSON
+    summary = {
+        "date_start": date_start,
+        "date_end": date_end,
+        "dates_used": dates_used,
+        "dates_skipped": dates_skipped,
+        "total_detections": total_detections,
+        "per_date": per_date,
+        "cloud_threshold": cloud_threshold,
+        "gaussian_sigma": gaussian_sigma,
+        "analyzer": analyzer_type,
+    }
+    summary_path = output_dir / f"{prefix}vessel_heatmap_summary.json"
+    with open(summary_path, "w") as f:
+        _json.dump(summary, f, indent=2)
+    print(f"\n[vessel-heatmap] Summary → {summary_path}")
+
+    return {
+        "heatmap": heatmap,
+        "dates_used": dates_used,
+        "dates_skipped": dates_skipped,
+        "total_detections": total_detections,
+        "per_date": per_date,
+        "heatmap_path": heatmap_path,
+    }
+
+
+# ── Grazing timeseries fetching ──────────────────────────────────────────────
+
+def _process_grazing_tif(
+    tif_bytes: bytes,
+    date_str: str,
+    projected_bbox: dict,
+    polygon_mask: np.ndarray,
+    cloud_threshold: float,
+    clean_dates: list,
+    clean_cloud_fracs: list,
+    clean_bands_stack: list,
+    clean_transforms: list,
+) -> None:
+    """Parse one GeoTIFF from a grazing timeseries fetch.
+
+    Performs grid-snapping, polygon-level cloud check, band reordering,
+    and DN→reflectance conversion. Appends to the clean_* lists if the
+    timestep passes cloud filtering.
+
+    Band order in the downloaded GeoTIFF (from merge order):
+        10m:  b02(0) b03(1) b04(2) b08(3)
+        20m:  b05(4) b06(5) b07(6) b8a(7) b11(8) b12(9)
+        60m:  b01(10) b09(11)
+        cat:  scl(12)
+    """
+    import rasterio
+
+    with rasterio.open(io.BytesIO(tif_bytes)) as src:
+        raw = src.read()  # (13, H, W)
+        crs = src.crs
+        transform = src.transform
+
+    if raw.shape[0] < 13:
+        print(f"    {date_str}  only {raw.shape[0]} bands (expected 13), skip")
+        return
+
+    # Grid-align to NMD grid
+    target_bounds = {k: v for k, v in projected_bbox.items() if k != "crs"}
+    raw, transform = _snap_to_target_grid(
+        raw, transform, crs, target_bounds, pixel_size=NMD_GRID_SIZE,
+    )
+
+    # Extract SCL (band index 12) and check polygon-level cloud
+    scl = raw[12].astype(np.uint8)
+
+    # Ensure mask matches raster dimensions
+    if polygon_mask.shape != scl.shape:
+        # Re-rasterize if grid snapping changed dimensions
+        from rasterio.transform import from_origin
+        from rasterio.features import rasterize as rio_rasterize
+        _mask = np.zeros(scl.shape, dtype=bool)
+        print(f"    {date_str}  mask shape mismatch {polygon_mask.shape} vs "
+              f"{scl.shape}, using full-bbox cloud check")
+        cloud_frac = check_cloud_fraction(scl)
+    else:
+        cloud_frac = _polygon_cloud_fraction(scl, polygon_mask)
+
+    if cloud_frac > cloud_threshold:
+        print(f"    {date_str}  cloud={cloud_frac:.1%}  (skip)")
+        return
+
+    # Reorder spectral bands: download order → GRAZING_BAND_ORDER
+    spectral = raw[_GRAZING_REORDER]  # (12, H, W)
+
+    # Convert DN to reflectance
+    spectral_ref = np.stack([
+        dn_to_reflectance(spectral[i], source="des")
+        for i in range(12)
+    ])  # (12, H, W) float32
+
+    clean_dates.append(date_str)
+    clean_cloud_fracs.append(cloud_frac)
+    clean_bands_stack.append(spectral_ref)
+    clean_transforms.append(transform)
+    print(f"    {date_str}  cloud={cloud_frac:.1%}  OK")
+
+
+def _process_grazing_inline(
+    full_bands: np.ndarray,
+    scl: np.ndarray,
+    date_str: str,
+    projected_bbox: dict,
+    polygon_mask: np.ndarray,
+    cloud_threshold: float,
+    clean_dates: list,
+    clean_cloud_fracs: list,
+    clean_bands_stack: list,
+    clean_transforms: list,
+) -> None:
+    """Process pre-assembled bands from CDSE HTTP for the grazing pipeline.
+
+    Unlike ``_process_grazing_tif`` this receives arrays directly
+    (no GeoTIFF parsing). Band layout matches the openEO download order:
+        10m:  b02(0) b03(1) b04(2) b08(3)
+        20m:  b05(4) b06(5) b07(6) b8a(7) b11(8) b12(9)
+        60m:  b01(10) b09(11)
+        cat:  scl(12)
+
+    Args:
+        full_bands: (13, H, W) float32 — already in reflectance [0, 1].
+        scl: (H, W) uint8 — Scene Classification Layer.
+    """
+    from rasterio.transform import from_origin
+
+    H, W = scl.shape
+
+    # Cloud check (full bbox since HTTP mode has no polygon mask rasterization)
+    cloud_frac = check_cloud_fraction(scl)
+    if cloud_frac > cloud_threshold:
+        print(f"    {date_str}  cloud={cloud_frac:.1%}  (skip)")
+        return
+
+    # Reorder to GRAZING_BAND_ORDER: B01, B02, ..., B12
+    spectral_ref = full_bands[_GRAZING_REORDER]  # (12, H, W)
+
+    # Build transform from projected bbox
+    target_bounds = {k: v for k, v in projected_bbox.items() if k != "crs"}
+    transform = from_origin(
+        target_bounds["west"], target_bounds["north"],
+        NMD_GRID_SIZE, NMD_GRID_SIZE,
+    )
+
+    clean_dates.append(date_str)
+    clean_cloud_fracs.append(cloud_frac)
+    clean_bands_stack.append(spectral_ref)
+    clean_transforms.append(transform)
+    print(f"    {date_str}  cloud={cloud_frac:.1%}  OK  [cdse_http]")
+
+
+# ── LPIS (Jordbruksverket) polygon fetching ──────────────────────────────
+
+def _lpis_bbox_string(bbox, bbox_crs: str | None = None) -> tuple[str, str]:
+    """Convert bbox to WFS bbox parameter string + CRS.
+
+    Auto-detects CRS from coordinate magnitude if *bbox_crs* is None:
+    values with ``|west| < 180`` are treated as WGS84, otherwise EPSG:3006.
+
+    Args:
+        bbox: dict ``{"west","south","east","north"}`` **or** tuple
+            ``(west, south, east, north)``.
+        bbox_crs: Explicit CRS (e.g. ``"EPSG:4326"``).  Auto-detected if
+            *None*.
+
+    Returns:
+        ``(bbox_str, crs_str)`` — e.g. ``("13.4,55.9,13.5,56.0", "EPSG:4326")``.
+    """
+    if isinstance(bbox, dict):
+        w, s, e, n = bbox["west"], bbox["south"], bbox["east"], bbox["north"]
+    elif isinstance(bbox, (tuple, list)) and len(bbox) == 4:
+        w, s, e, n = bbox
+    else:
+        raise ValueError(
+            "bbox must be dict with west/south/east/north or 4-element tuple"
+        )
+
+    if bbox_crs is None:
+        bbox_crs = "EPSG:4326" if abs(w) < 180 and abs(e) < 180 else "EPSG:3006"
+
+    return f"{w},{s},{e},{n},{bbox_crs}", bbox_crs
+
+
+def fetch_lpis_polygons(
+    bbox,
+    *,
+    agoslag: str | list[str] | None = "Bete",
+    bbox_crs: str | None = None,
+    max_features: int = 5000,
+    timeout: int = 60,
+    cache_dir: str | None = None,
+):
+    """Fetch LPIS field boundary polygons from Jordbruksverket WFS.
+
+    Downloads agricultural block polygons (jordbruksblock) for a given
+    bounding box.  By default only pasture blocks (ägoslag = "Bete") are
+    returned — set *agoslag=None* for all land-use types.
+
+    The data is open (CC BY 4.0) and requires no authentication.
+
+    Args:
+        bbox: Bounding box — dict ``{"west","south","east","north"}`` or
+            tuple ``(west, south, east, north)``.  Accepts both WGS84 and
+            EPSG:3006 coordinates (auto-detected from magnitude).
+        agoslag: Land-use filter.  ``"Bete"`` for pasture only, ``None``
+            for all types, or a list like ``["Bete", "Åker"]``.
+        bbox_crs: Explicit CRS for *bbox*.  Auto-detected if *None*.
+        max_features: Maximum number of features to request.  Default 5000.
+        timeout: HTTP timeout in seconds.
+        cache_dir: Directory for caching WFS responses.  If provided,
+            subsequent calls with the same bbox + filter skip the HTTP
+            request.
+
+    Returns:
+        ``geopandas.GeoDataFrame`` with columns ``geometry``, ``blockid``,
+        ``agoslag``, ``kategori``, ``areal``, ``region_kod``, ``arslager``.
+        CRS is EPSG:3006.
+
+    Raises:
+        FetchError: If the WFS request fails.
+    """
+    import geopandas as gpd
+    import hashlib
+    import json
+    import urllib.request
+    import urllib.parse
+
+    bbox_str, _crs = _lpis_bbox_string(bbox, bbox_crs)
+
+    # ── Check cache ───────────────────────────────────────────────
+    cache_path = None
+    if cache_dir:
+        _cache = Path(cache_dir)
+        _cache.mkdir(parents=True, exist_ok=True)
+        _key = f"{bbox_str}|{agoslag}|{max_features}"
+        _hash = hashlib.md5(_key.encode()).hexdigest()[:12]
+        cache_path = _cache / f"lpis_{_hash}.json"
+        if cache_path.exists():
+            print(f"  LPIS cache hit: {cache_path}")
+            gdf = gpd.read_file(str(cache_path))
+            if gdf.crs is None:
+                gdf = gdf.set_crs("EPSG:3006")
+            return gdf
+
+    # ── Build WFS URL ─────────────────────────────────────────────
+    params = {
+        "service": "WFS",
+        "version": "2.0.0",
+        "request": "GetFeature",
+        "typeName": LPIS_LAYER,
+        "outputFormat": "application/json",
+        "srsName": "EPSG:3006",
+        "bbox": bbox_str,
+        "count": str(max_features),
+    }
+    url = f"{LPIS_WFS_URL}?{urllib.parse.urlencode(params)}"
+
+    print(f"  Fetching LPIS polygons from Jordbruksverket WFS …")
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            data = json.loads(raw)
+    except Exception as e:
+        raise FetchError(f"LPIS WFS request failed: {e}") from e
+
+    features = data.get("features", [])
+    if not features:
+        print("  LPIS: no features found in bbox")
+        # Return empty GeoDataFrame with correct schema
+        gdf = gpd.GeoDataFrame(
+            columns=["geometry", "blockid", "agoslag", "kategori",
+                      "areal", "region_kod", "arslager"],
+            geometry="geometry",
+            crs="EPSG:3006",
+        )
+        return gdf
+
+    # ── Parse to GeoDataFrame ─────────────────────────────────────
+    gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:3006")
+    print(f"  LPIS: {len(gdf)} block fetched")
+
+    # ── Filter by ägoslag ─────────────────────────────────────────
+    if agoslag is not None and "agoslag" in gdf.columns:
+        if isinstance(agoslag, str):
+            agoslag = [agoslag]
+        gdf = gdf[gdf["agoslag"].isin(agoslag)].copy()
+        print(f"  LPIS: {len(gdf)} block after ägoslag filter ({agoslag})")
+
+    # ── Cache ─────────────────────────────────────────────────────
+    if cache_path is not None and len(gdf) > 0:
+        tmp = cache_path.with_suffix(".json.tmp")
+        gdf.to_file(str(tmp), driver="GeoJSON")
+        tmp.rename(cache_path)
+        print(f"  LPIS: cached to {cache_path}")
+
+    return gdf
+
+
+def fetch_grazing_lpis(
+    bbox,
+    year: int,
+    *,
+    agoslag: str | list[str] | None = "Bete",
+    bbox_crs: str | None = None,
+    cloud_threshold: float = 0.01,
+    scene_cloud_max: float = 50.0,
+    buffer_m: float = 50.0,
+    chunk_days: int = 5,
+    token: str | None = None,
+    max_features: int = 5000,
+    lpis_cache_dir: str | None = None,
+) -> list:
+    """Fetch LPIS pasture polygons and their Sentinel-2 timeseries.
+
+    Convenience wrapper that combines :func:`fetch_lpis_polygons` with
+    :func:`fetch_grazing_timeseries` in a single call.
+
+    Args:
+        bbox: Bounding box for LPIS polygon search (WGS84 or EPSG:3006).
+        year: Year to fetch Sentinel-2 data (growing season Apr–Oct).
+        agoslag: Land-use filter for LPIS (default ``"Bete"``).
+        bbox_crs: CRS of *bbox* (auto-detected if *None*).
+        cloud_threshold: Max polygon-level cloud fraction.
+        scene_cloud_max: STAC pre-filter for scene cloud %.
+        buffer_m: Buffer around polygon bbox in metres.
+        chunk_days: Temporal chunk size for DES calls.
+        token: DES access token.
+        max_features: Max LPIS polygons to fetch.
+        lpis_cache_dir: Cache directory for WFS responses.
+
+    Returns:
+        List of :class:`GrazingTimeseriesResult`, one per LPIS polygon.
+
+    Raises:
+        FetchError: If LPIS returns no polygons or DES calls fail.
+    """
+    lpis_gdf = fetch_lpis_polygons(
+        bbox,
+        agoslag=agoslag,
+        bbox_crs=bbox_crs,
+        max_features=max_features,
+        cache_dir=lpis_cache_dir,
+    )
+
+    if len(lpis_gdf) == 0:
+        raise FetchError(
+            f"No LPIS polygons found for bbox={bbox} with ägoslag={agoslag}"
+        )
+
+    print(f"  Fetching grazing timeseries for {len(lpis_gdf)} LPIS polygons …")
+    return fetch_grazing_timeseries(
+        lpis_gdf,
+        year,
+        cloud_threshold=cloud_threshold,
+        scene_cloud_max=scene_cloud_max,
+        buffer_m=buffer_m,
+        chunk_days=chunk_days,
+        token=token,
+        polygon_id_col="blockid",
+        polygon_crs="EPSG:3006",
+    )
+
+
+def fetch_grazing_timeseries(
+    polygons,
+    year: int,
+    *,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    cloud_threshold: float = 0.01,
+    scene_cloud_max: float = 50.0,
+    buffer_m: float = 50.0,
+    chunk_days: int = 5,
+    token: str | None = None,
+    polygon_id_col: str | None = None,
+    polygon_crs: str = "EPSG:4326",
+    source: str = "des",
+    n_workers: int = 3,
+) -> list[GrazingTimeseriesResult]:
+    """Fetch multi-date 12-band Sentinel-2 timeseries for polygons.
+
+    For each polygon:
+
+    1. Compute projected bbox from polygon geometry (+buffer)
+    2. Discover available dates via DES STAC (always, regardless of source)
+    3. Fetch all 12 bands + SCL in temporal chunks
+    4. Filter by polygon-level cloud fraction (default 1%)
+    5. Co-register all timesteps (integer + sub-pixel alignment)
+    6. Stack cloud-free dates into (T, 12, H, W) array
+
+    Band order in output: B01, B02, B03, B04, B05, B06, B07, B08,
+                          B8A, B09, B11, B12
+
+    Values are BOA reflectance: (DN − 1000) / 10000, clipped to [0, 1].
+
+    Args:
+        polygons: One of:
+            - shapely Polygon/MultiPolygon geometry (single polygon)
+            - list of shapely geometries
+            - GeoDataFrame with polygon geometries
+        year: Year to fetch (e.g. 2023). Growing season Apr 1 – Oct 21.
+        date_start: Override start date (ISO). Default: ``"{year}-04-01"``.
+        date_end: Override end date (ISO). Default: ``"{year}-10-21"``.
+        cloud_threshold: Max cloud fraction within polygon to keep a
+            timestep. Default: 0.01 (1%).
+        scene_cloud_max: STAC pre-filter for scene-level cloud %.
+            Default: 50%.
+        buffer_m: Buffer in metres around polygon bbox. Default: 50m.
+        chunk_days: Days per temporal chunk for openEO calls. Default: 14.
+        token: Optional DES/CDSE access token.
+        polygon_id_col: Column name in GeoDataFrame to use as polygon ID.
+            If None, uses integer index.
+        polygon_crs: CRS of input polygon geometries. Default: EPSG:4326.
+            Ignored if *polygons* is a GeoDataFrame (uses ``.crs``).
+        source: Data fetch backend. Options:
+
+            - ``"des"`` (default): DES openEO (``openeo.digitalearth.se``).
+              Reliable, full band set, moderate speed.
+            - ``"copernicus"``: CDSE openEO
+              (``openeo.dataspace.copernicus.eu``). Same interface,
+              alternative backend.  Date discovery still uses DES STAC.
+            - ``"cdse_http"``: CDSE Sentinel Hub Process API (HTTP).
+              Fastest option for single-date fetches. Fetches 6 Prithvi
+              bands (B02, B03, B04, B8A, B11, B12) + SCL. Missing bands
+              (B01, B05, B06, B07, B08, B09) are synthesised from
+              available bands where possible (B08 ≈ B8A).
+
+            All sources use DES STAC for date discovery.
+        n_workers: Number of parallel workers for chunk fetching.
+            Default: 3.
+
+    Returns:
+        List of :class:`GrazingTimeseriesResult`, one per polygon.
+
+    Raises:
+        FetchError: If data fetch calls fail.
+        ValueError: If no valid polygons provided or unknown source.
+    """
+    import re
+    import tarfile
+    from datetime import datetime as _dt, timedelta as _td
+    from rasterio.transform import from_origin
+    from rasterio.crs import CRS
+    from rasterio.warp import transform_bounds as _tb
+
+    from .coregistration import coregister_to_reference
+
+    # ── Normalise polygon input ──────────────────────────────────────
+    if hasattr(polygons, "geometry") and hasattr(polygons, "crs"):
+        # GeoDataFrame
+        _crs = str(polygons.crs) if polygons.crs else polygon_crs
+        geom_list = []
+        for idx, row in polygons.iterrows():
+            pid = (
+                row[polygon_id_col]
+                if polygon_id_col and polygon_id_col in row.index
+                else idx
+            )
+            geom_list.append((pid, row.geometry))
+    elif hasattr(polygons, "geom_type"):
+        # Single shapely geometry
+        _crs = polygon_crs
+        geom_list = [(0, polygons)]
+    elif isinstance(polygons, list):
+        _crs = polygon_crs
+        geom_list = [(i, g) for i, g in enumerate(polygons)]
+    else:
+        raise ValueError(
+            "polygons must be a shapely geometry, list of geometries, "
+            "or GeoDataFrame"
+        )
+    if not geom_list:
+        raise ValueError("No valid polygons provided")
+
+    # ── Temporal range ───────────────────────────────────────────────
+    _start = date_start or f"{year}-04-01"
+    _end = date_end or f"{year}-10-21"
+
+    # ── Connect to backend ─────────────────────────────────────────────
+    if source in ("des", "copernicus"):
+        if source == "des":
+            conn = _connect(token=token)
+            _collection = COLLECTION
+        else:
+            conn = _connect_cdse()
+            _collection = CDSE_COLLECTION
+    elif source == "cdse_http":
+        conn = None  # HTTP mode — no openEO connection
+        _collection = None
+    else:
+        raise ValueError(
+            f"Unknown source '{source}'. "
+            f"Use 'des', 'copernicus', or 'cdse_http'."
+        )
+    results: list[GrazingTimeseriesResult] = []
+
+    _DATE_RE = re.compile(r"out_(\d{4})_(\d{2})_(\d{2})T")
+
+    for poly_idx, (pid, geom) in enumerate(geom_list):
+        print(f"\n[grazing] Polygon {poly_idx + 1}/{len(geom_list)} "
+              f"(id={pid})")
+
+        # ── Project polygon bbox to EPSG:3006 ────────────────────────
+        projected_bbox = _polygon_to_projected_bbox(
+            geom, src_crs=_crs, buffer_m=buffer_m,
+        )
+        proj_bounds = {k: v for k, v in projected_bbox.items()
+                       if k != "crs"}
+
+        # ── Project polygon geometry for rasterization ───────────────
+        if _crs != TARGET_CRS:
+            import pyproj
+            from shapely.ops import transform as shapely_transform
+            _proj = pyproj.Transformer.from_crs(
+                _crs, TARGET_CRS, always_xy=True,
+            ).transform
+            geom_3006 = shapely_transform(_proj, geom)
+        else:
+            geom_3006 = geom
+
+        polygon_mask = _rasterize_polygon(
+            geom_3006, proj_bounds, pixel_size=NMD_GRID_SIZE,
+        )
+
+        # ── STAC date discovery ──────────────────────────────────────
+        # Need WGS84 bbox for STAC
+        w84 = _tb(
+            CRS.from_epsg(3006), CRS.from_epsg(4326),
+            proj_bounds["west"], proj_bounds["south"],
+            proj_bounds["east"], proj_bounds["north"],
+        )
+        wgs84_coords = {
+            "west": w84[0], "south": w84[1],
+            "east": w84[2], "north": w84[3],
+        }
+        stac_dates = _stac_available_dates(
+            wgs84_coords, _start, _end, scene_cloud_max,
+        )
+        print(f"  [STAC] {len(stac_dates)} dates with scene cloud "
+              f"<= {scene_cloud_max:.0f}%")
+
+        if not stac_dates:
+            H, W = polygon_mask.shape
+            results.append(GrazingTimeseriesResult(
+                data=np.empty((0, 12, H, W), dtype=np.float32),
+                dates=[], cloud_fractions=[], polygon_id=pid,
+                geo=GeoContext(
+                    crs=TARGET_CRS,
+                    transform=from_origin(
+                        proj_bounds["west"], proj_bounds["north"],
+                        NMD_GRID_SIZE, NMD_GRID_SIZE),
+                    bounds_projected=proj_bounds,
+                    bounds_wgs84=wgs84_coords,
+                    shape=(H, W),
+                ),
+                shape_hw=(H, W),
+            ))
+            continue
+
+        # ── Generate 14-day chunk windows ────────────────────────────
+        _d_start = _dt.strptime(_start, "%Y-%m-%d")
+        _d_end = _dt.strptime(_end, "%Y-%m-%d")
+        _chunk_ranges: list[tuple[str, str]] = []
+        _cur = _d_start
+        while _cur <= _d_end:
+            _c_end = min(_cur + _td(days=chunk_days),
+                         _d_end + _td(days=1))
+            _chunk_ranges.append((
+                _cur.strftime("%Y-%m-%d"),
+                _c_end.strftime("%Y-%m-%d"),
+            ))
+            _cur = _c_end
+
+        # ── Fetch per chunk (parallel with configurable workers) ────
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        _chunk_lock = threading.Lock()
+        clean_dates: list[str] = []
+        clean_cloud_fracs: list[float] = []
+        clean_bands_stack: list[np.ndarray] = []
+        clean_transforms: list = []
+
+        def _fetch_chunk_openeo(c_start_end):
+            """Fetch a temporal chunk via openEO (DES or CDSE)."""
+            c_start, c_end = c_start_end
+            chunk_dates = []
+            chunk_fracs = []
+            chunk_bands = []
+            chunk_tfs = []
+            print(f"  -- {c_start} to {c_end} [{source}] --", flush=True)
+            try:
+                # Band names differ between DES (lowercase) and CDSE (uppercase)
+                if source == "des":
+                    _b10m = BANDS_10M
+                    _b20m = BANDS_20M_SPECTRAL
+                    _b60m = BANDS_60M_ALL
+                    _bscl = BANDS_20M_CATEGORICAL
+                else:
+                    _b10m = CDSE_BANDS_10M
+                    _b20m = CDSE_BANDS_20M_SPECTRAL
+                    _b60m = CDSE_BANDS_60M
+                    _bscl = CDSE_BANDS_20M_CATEGORICAL
+
+                # 10m bands
+                cube_10m = conn.load_collection(
+                    collection_id=_collection,
+                    spatial_extent=projected_bbox,
+                    temporal_extent=[c_start, c_end],
+                    bands=_b10m,
+                )
+                # 20m spectral → bilinear resample to 10m
+                cube_20m = conn.load_collection(
+                    collection_id=_collection,
+                    spatial_extent=projected_bbox,
+                    temporal_extent=[c_start, c_end],
+                    bands=_b20m,
+                )
+                cube_20m = cube_20m.resample_cube_spatial(
+                    target=cube_10m, method="bilinear",
+                )
+                # 60m bands (B01 + B09) → bilinear resample to 10m
+                cube_60m = conn.load_collection(
+                    collection_id=_collection,
+                    spatial_extent=projected_bbox,
+                    temporal_extent=[c_start, c_end],
+                    bands=_b60m,
+                )
+                cube_60m = cube_60m.resample_cube_spatial(
+                    target=cube_10m, method="bilinear",
+                )
+                # SCL → nearest resample to 10m
+                cube_scl = conn.load_collection(
+                    collection_id=_collection,
+                    spatial_extent=projected_bbox,
+                    temporal_extent=[c_start, c_end],
+                    bands=_bscl,
+                )
+                cube_scl = cube_scl.resample_cube_spatial(
+                    target=cube_10m, method="near",
+                )
+                # Merge all and download
+                cube = (cube_10m.merge_cubes(cube_20m)
+                        .merge_cubes(cube_60m)
+                        .merge_cubes(cube_scl))
+                data = cube.download(format="gtiff")
+
+                if not data:
+                    print("    (no data)", flush=True)
+                    return
+
+                # Parse response — multi-date returns tar.gz
+                if isinstance(data, bytes) and data[:2] == b"\x1f\x8b":
+                    tf = tarfile.open(
+                        fileobj=io.BytesIO(data), mode="r:gz",
+                    )
+                    for member in tf.getmembers():
+                        if not member.name.lower().endswith(
+                            (".tif", ".tiff")
+                        ):
+                            continue
+                        m = _DATE_RE.search(member.name)
+                        if not m:
+                            continue
+                        d_str = (f"{m.group(1)}-{m.group(2)}-"
+                                 f"{m.group(3)}")
+                        f = tf.extractfile(member)
+                        if f is None:
+                            continue
+                        _process_grazing_tif(
+                            f.read(), d_str, projected_bbox,
+                            polygon_mask, cloud_threshold,
+                            chunk_dates, chunk_fracs,
+                            chunk_bands, chunk_tfs,
+                        )
+                    tf.close()
+                elif isinstance(data, bytes):
+                    _process_grazing_tif(
+                        data, c_start, projected_bbox,
+                        polygon_mask, cloud_threshold,
+                        chunk_dates, chunk_fracs,
+                        chunk_bands, chunk_tfs,
+                    )
+            except Exception as e:
+                print(f"    Chunk {c_start}–{c_end} failed: {e}",
+                      flush=True)
+                return
+
+            # Merge results into shared lists under lock
+            with _chunk_lock:
+                clean_dates.extend(chunk_dates)
+                clean_cloud_fracs.extend(chunk_fracs)
+                clean_bands_stack.extend(chunk_bands)
+                clean_transforms.extend(chunk_tfs)
+
+        def _fetch_chunk_cdse_http(c_start_end):
+            """Fetch dates in a chunk via CDSE Sentinel Hub HTTP API.
+
+            Fetches 6 Prithvi bands + SCL per date. Missing bands
+            (B01, B05, B06, B07, B08, B09) are filled: B08 ≈ B8A,
+            others set to zero.
+            """
+            from .data.cdse_s2 import fetch_s2_scene
+
+            c_start, c_end = c_start_end
+            chunk_dates = []
+            chunk_fracs = []
+            chunk_bands = []
+            chunk_tfs = []
+            print(f"  -- {c_start} to {c_end} [cdse_http] --", flush=True)
+
+            # Which STAC dates fall in this chunk?
+            chunk_stac = [
+                (d, cf) for d, cf in stac_dates
+                if c_start <= d < c_end
+            ]
+
+            for d_str, _scene_cf in chunk_stac:
+                try:
+                    result = fetch_s2_scene(
+                        west=proj_bounds["west"],
+                        south=proj_bounds["south"],
+                        east=proj_bounds["east"],
+                        north=proj_bounds["north"],
+                        date=d_str,
+                        size_px=(polygon_mask.shape[0],
+                                 polygon_mask.shape[1]),
+                        cloud_threshold=1.0,  # we do our own filtering
+                        haze_threshold=1.0,
+                    )
+                    if result is None:
+                        continue
+                    spectral, scl, _cf = result
+                    # spectral: (6, H, W) — B02, B03, B04, B8A, B11, B12
+                    # Expand to (13, H, W) matching openEO band order:
+                    # 10m: b02(0) b03(1) b04(2) b08(3)
+                    # 20m: b05(4) b06(5) b07(6) b8a(7) b11(8) b12(9)
+                    # 60m: b01(10) b09(11)
+                    # cat: scl(12)
+                    H_s, W_s = spectral.shape[1], spectral.shape[2]
+                    full = np.zeros((13, H_s, W_s), dtype=np.float32)
+                    # Map Prithvi bands to openEO positions
+                    full[0] = spectral[0]   # B02
+                    full[1] = spectral[1]   # B03
+                    full[2] = spectral[2]   # B04
+                    full[3] = spectral[3]   # B8A → proxy for B08
+                    full[7] = spectral[3]   # B8A
+                    full[8] = spectral[4]   # B11
+                    full[9] = spectral[5]   # B12
+                    full[12] = scl.astype(np.float32)
+
+                    # Convert to tif-like bytes for _process_grazing_tif
+                    # or process inline
+                    _process_grazing_inline(
+                        full, scl, d_str, projected_bbox,
+                        polygon_mask, cloud_threshold,
+                        chunk_dates, chunk_fracs,
+                        chunk_bands, chunk_tfs,
+                    )
+                except Exception as e:
+                    print(f"    {d_str} [cdse_http] failed: {e}",
+                          flush=True)
+                    continue
+
+            with _chunk_lock:
+                clean_dates.extend(chunk_dates)
+                clean_cloud_fracs.extend(chunk_fracs)
+                clean_bands_stack.extend(chunk_bands)
+                clean_transforms.extend(chunk_tfs)
+
+        # Select fetch function based on source
+        if source == "cdse_http":
+            _fetch_fn = _fetch_chunk_cdse_http
+        else:
+            _fetch_fn = _fetch_chunk_openeo
+
+        print(f"  Fetching {len(_chunk_ranges)} chunks with "
+              f"{n_workers} workers [{source}] ...", flush=True)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_fetch_fn, cr): cr
+                for cr in _chunk_ranges
+            }
+            for future in as_completed(futures):
+                future.result()  # Propagate exceptions
+
+        # ── Co-registration ──────────────────────────────────────────
+        # First cloud-free timestep is the reference; align all others.
+        if len(clean_bands_stack) >= 2:
+            ref_bands = clean_bands_stack[0]   # (12, H, W)
+            ref_tf = clean_transforms[0]
+            ref_tf_list = list(ref_tf)[:6] if hasattr(ref_tf, '__iter__') else None
+
+            aligned_stack = [ref_bands]
+            for i in range(1, len(clean_bands_stack)):
+                cur_bands = clean_bands_stack[i]
+                cur_tf = clean_transforms[i]
+                cur_tf_list = list(cur_tf)[:6] if hasattr(cur_tf, '__iter__') else None
+
+                # Transpose (12, H, W) → (H, W, 12) for coregister
+                cur_hwc = np.transpose(cur_bands, (1, 2, 0))
+                ref_hwc = np.transpose(ref_bands, (1, 2, 0))
+
+                try:
+                    aligned_cur, _aligned_ref, meta = coregister_to_reference(
+                        target=cur_hwc,
+                        reference=ref_hwc,
+                        target_transform=cur_tf_list,
+                        reference_transform=ref_tf_list,
+                        subpixel=True,
+                        reference_band=3,  # B04 (red) in GRAZING order
+                    )
+                    # Transpose back (H, W, 12) → (12, H, W)
+                    aligned_stack.append(
+                        np.transpose(aligned_cur, (2, 0, 1))
+                    )
+                    sub = meta.get("subpixel_offset", (0, 0))
+                    intg = meta.get("integer_offset", (0, 0))
+                    if abs(intg[0]) + abs(intg[1]) > 0 or abs(sub[0]) + abs(sub[1]) > 0.05:
+                        print(f"    [coreg] {clean_dates[i]}: "
+                              f"int=({intg[0]},{intg[1]}) "
+                              f"sub=({sub[0]:.3f},{sub[1]:.3f})")
+                except Exception as e:
+                    print(f"    [coreg] {clean_dates[i]} failed: {e}, "
+                          f"using grid-snapped version")
+                    aligned_stack.append(cur_bands)
+
+            # After co-registration, all arrays must have the same shape.
+            # Crop to the minimum common shape.
+            min_h = min(a.shape[1] for a in aligned_stack)
+            min_w = min(a.shape[2] for a in aligned_stack)
+            clean_bands_stack = [
+                a[:, :min_h, :min_w] for a in aligned_stack
+            ]
+
+        # ── Stack result ─────────────────────────────────────────────
+        if clean_bands_stack:
+            # Sort by date
+            order = sorted(range(len(clean_dates)),
+                           key=lambda i: clean_dates[i])
+            data_array = np.stack(
+                [clean_bands_stack[i] for i in order], axis=0,
+            )  # (T, 12, H, W)
+            sorted_dates = [clean_dates[i] for i in order]
+            sorted_fracs = [clean_cloud_fracs[i] for i in order]
+        else:
+            H, W = polygon_mask.shape
+            data_array = np.empty((0, 12, H, W), dtype=np.float32)
+            sorted_dates = []
+            sorted_fracs = []
+
+        H_out, W_out = data_array.shape[2], data_array.shape[3] if data_array.size else polygon_mask.shape
+        geo = GeoContext(
+            crs=TARGET_CRS,
+            transform=from_origin(
+                proj_bounds["west"], proj_bounds["north"],
+                NMD_GRID_SIZE, NMD_GRID_SIZE,
+            ),
+            bounds_projected=proj_bounds,
+            bounds_wgs84=wgs84_coords,
+            shape=(H_out, W_out),
+        )
+
+        result = GrazingTimeseriesResult(
+            data=data_array,
+            dates=sorted_dates,
+            cloud_fractions=sorted_fracs,
+            polygon_id=pid,
+            geo=geo,
+            shape_hw=(H_out, W_out),
+        )
+        results.append(result)
+        print(f"  [grazing] Polygon {pid}: {len(sorted_dates)} clean "
+              f"dates out of {len(stac_dates)} available, "
+              f"shape={data_array.shape}")
+
+    return results
+
+
+# ── Cloud-free baseline fetching ─────────────────────────────────────────────
+
+def fetch_cloud_free_baseline(
+    date: str,
+    coords: dict,
+    search_start_days: int = 30,
+    search_end_days: int = 90,
+    scan_interval_days: int = 7,
+    cloud_threshold: float = 0.1,
+    token: str | None = None,
+) -> FetchResult:
+    """Fetch a cloud-free Sentinel-2 image for use as a change detection baseline.
+
+    Three-phase STAC-guided approach:
+    1. STAC discovery — find all available dates in the search window
+    2. SCL screening — compute AOI-specific cloud fraction per date
+    3. COT ranking — run COT on top 5 to pick best visibility
+
+    Args:
+        date: ISO date string of the analysis (e.g. "2024-07-15").
+        coords: WGS84 bounding box dict.
+        search_start_days: Start of search window (days before date). Default: 30.
+        search_end_days: End of search window (days before date). Default: 90.
+        scan_interval_days: Ignored (kept for API compatibility).
+        cloud_threshold: Maximum acceptable cloud fraction. Default: 0.1.
+        token: Optional DES access token.
+
+    Returns:
+        FetchResult for the image with best visibility.
+
+    Raises:
+        FetchError: If no candidate below cloud_threshold is found.
+    """
+    from datetime import datetime, timedelta
+
+    dt = datetime.strptime(date, "%Y-%m-%d")
+    start = (dt - timedelta(days=search_end_days)).strftime("%Y-%m-%d")
+    end = (dt - timedelta(days=search_start_days)).strftime("%Y-%m-%d")
+
+    # Phase 1: STAC discovery
+    print(f"    [STAC] Querying available dates {start} to {end}...")
+    stac_dates = _stac_available_dates(coords, start, end, scene_cloud_max=80.0)
+    print(f"    [STAC] {len(stac_dates)} dates with scene cloud <= 80%")
+
+    if not stac_dates:
+        raise FetchError(
+            f"No Sentinel-2 data available in baseline window "
+            f"({search_start_days}-{search_end_days} days back). "
+            f"STAC returned no results."
+        )
+
+    # Phase 2: SCL screening per STAC date
+    conn = _connect(token=token)
+    projected_coords = _to_nmd_grid(coords)
+
+    scl_results: list[tuple[str, float, float]] = []  # (date, aoi_cloud, scene_cloud)
+
+    for i, (candidate_date, scene_cloud) in enumerate(stac_dates, 1):
+        candidate_dt = datetime.strptime(candidate_date, "%Y-%m-%d")
+        temporal = [
+            candidate_date,
+            (candidate_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+        ]
+        try:
+            _scl, aoi_cloud, _crs, _transform = _fetch_scl(
+                conn, projected_coords, temporal, date_window=0
+            )
+            print(f"    [{i}/{len(stac_dates)}] {candidate_date}  "
+                  f"scene={scene_cloud:.1f}%  AOI(SCL)={aoi_cloud:.1%}")
+            scl_results.append((candidate_date, aoi_cloud, scene_cloud))
+        except Exception:
+            print(f"    [{i}/{len(stac_dates)}] {candidate_date}  -> no data")
+            continue
+
+    if not scl_results:
+        raise FetchError("All SCL fetches failed — no baseline candidates")
+
+    # Sort by AOI cloud fraction
+    scl_results.sort(key=lambda x: x[1])
+
+    # Phase 3: COT on top 5 for visibility ranking
+    top_n = min(5, len(scl_results))
+    top_dates = scl_results[:top_n]
+
+    # Only run COT if we have multiple good candidates to choose from
+    best_date = top_dates[0][0]
+    best_cloud = top_dates[0][1]
+
+    if top_n >= 2 and top_dates[0][1] < cloud_threshold:
+        try:
+            from imint.analyzers.cot import COTAnalyzer
+            import rasterio
+
+            analyzer = COTAnalyzer(config={"device": "cpu"})
+            print(f"    [COT] Ranking top {top_n} by visibility...")
+
+            cot_scores: list[tuple[str, float, float]] = []  # (date, clear_frac, cot_mean)
+
+            for candidate_date, aoi_cloud, _scene_cloud in top_dates:
+                candidate_dt = datetime.strptime(candidate_date, "%Y-%m-%d")
+                temporal = [
+                    candidate_date,
+                    (candidate_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+                ]
+                try:
+                    # Full spectral fetch for COT
+                    cube_10m = conn.load_collection(
+                        collection_id=COLLECTION,
+                        spatial_extent=projected_coords,
+                        temporal_extent=temporal,
+                        bands=BANDS_10M,
+                    )
+                    cube_20m = conn.load_collection(
+                        collection_id=COLLECTION,
+                        spatial_extent=projected_coords,
+                        temporal_extent=temporal,
+                        bands=BANDS_20M_SPECTRAL,
+                    )
+                    cube_20m = cube_20m.resample_cube_spatial(
+                        target=cube_10m, method="bilinear"
+                    )
+                    cube_60m = conn.load_collection(
+                        collection_id=COLLECTION,
+                        spatial_extent=projected_coords,
+                        temporal_extent=temporal,
+                        bands=BANDS_60M,
+                    )
+                    cube_60m = cube_60m.resample_cube_spatial(
+                        target=cube_10m, method="bilinear"
+                    )
+                    cube = cube_10m.merge_cubes(cube_20m).merge_cubes(cube_60m)
+                    data = cube.download(format="gtiff")
+
+                    with rasterio.open(io.BytesIO(data)) as src:
+                        raw = src.read()
+
+                    spectral_names = BANDS_10M + BANDS_20M_SPECTRAL + BANDS_60M
+                    bands = des_to_imint_bands(
+                        {n.lower(): dn_to_reflectance(raw[j], source="des")
+                         for j, n in enumerate(spectral_names)}
+                    )
+
+                    rgb_dummy = np.zeros((*raw.shape[1:], 3), dtype=np.float32)
+                    result = analyzer.analyze(
+                        rgb=rgb_dummy, bands=bands, date=candidate_date,
+                        output_dir="/tmp",
+                    )
+                    if result.success:
+                        cf = result.outputs["stats"]["clear_fraction"]
+                        cm = result.outputs["stats"]["cot_mean"]
+                        print(f"      {candidate_date}  clear={cf:.1%}  COT={cm:.6f}")
+                        cot_scores.append((candidate_date, cf, cm))
+                except Exception as e:
+                    print(f"      {candidate_date}  COT failed: {e}")
+
+            if cot_scores:
+                # Best visibility: highest clear_fraction, then lowest cot_mean
+                cot_scores.sort(key=lambda x: (-x[1], x[2]))
+                best_date = cot_scores[0][0]
+                print(f"    [COT] Best visibility: {best_date} "
+                      f"(clear={cot_scores[0][1]:.1%}, COT={cot_scores[0][2]:.6f})")
+
+        except ImportError:
+            print("    [COT] COT analyzer not available, using SCL ranking")
+
+    # Check threshold
+    if best_cloud > cloud_threshold and best_date == top_dates[0][0]:
+        raise FetchError(
+            f"No cloud-free baseline found. "
+            f"Best AOI cloud: {best_cloud:.1%} (threshold: {cloud_threshold:.0%})"
+        )
+
+    # Phase 4: Full fetch for the best date
+    print(f"    Selected baseline: {best_date}")
+    return fetch_des_data(
+        date=best_date,
+        coords=coords,
+        cloud_threshold=1.0,  # already verified
+        token=token,
+        include_scl=True,
+        date_window=0,
+    )
+
+
+STAC_SEARCH_URL = "https://explorer.digitalearth.se/stac/search"
+
+
+def _stac_best_date(coords: dict, date: str, window: int) -> str:
+    """Find best available date via STAC within date ± window.
+
+    Queries STAC for all Sentinel-2 L2A dates in the window and returns
+    the one with lowest scene-level cloud cover.
+
+    Args:
+        coords: WGS84 bounding box dict.
+        date: Target ISO date string.
+        window: Days before/after date to search.
+
+    Returns:
+        ISO date string of the best available date.
+
+    Raises:
+        FetchError: If no data available in the window.
+    """
+    from datetime import datetime, timedelta
+
+    dt = datetime.strptime(date, "%Y-%m-%d")
+    start = (dt - timedelta(days=window)).strftime("%Y-%m-%d")
+    end = (dt + timedelta(days=window)).strftime("%Y-%m-%d")
+
+    stac_dates = _stac_available_dates(coords, start, end, scene_cloud_max=100.0)
+    if not stac_dates:
+        raise FetchError(
+            f"No Sentinel-2 data available for {date} ±{window} days "
+            f"(STAC query returned no results)"
+        )
+
+    best_date, best_cloud = stac_dates[0]  # already sorted by cloud asc
+    print(f"    [STAC] {len(stac_dates)} dates in {start}/{end}, "
+          f"best: {best_date} (scene cloud {best_cloud:.1f}%)")
+    return best_date
+
+
+@dataclass
+class BaselineCandidate:
+    """A candidate baseline image with cloud statistics and RGB thumbnail."""
+    date: str
+    cloud_fraction: float        # SCL-based, within AOI
+    scene_cloud_fraction: float  # Scene-level from STAC metadata
+    rgb_thumbnail: np.ndarray    # (H, W, 3) float32 [0, 1]
+    shape: tuple                 # (H, W)
+    cot_stats: dict | None = None  # COT analysis: clear_fraction, cot_mean, etc.
+
+
+_STAC_BACKENDS = {
+    "des": {
+        "url": STAC_SEARCH_URL,
+        "collection": "s2_msi_l2a",
+        # explorer.digitalearth.se catalogue starts in 2018.
+    },
+    "earth-search": {
+        "url": "https://earth-search.aws.element84.com/v1/search",
+        "collection": "sentinel-2-l2a",
+        # AWS-hosted, anonymous; covers all S2 history (S2A from 2015).
+        # Use when the DES catalogue gap matters (e.g. pre-2018 windows).
+    },
+}
+
+# Safety bound on STAC pagination (200 features/page). A ~6-month window
+# over a 5x5 km AOI yields a few hundred features; 50 pages (10k) is ample
+# headroom while preventing an unbounded loop on a misbehaving catalogue.
+_STAC_MAX_PAGES = 50
+
+
+def _stac_available_dates(
+    coords: dict,
+    date_start: str,
+    date_end: str,
+    scene_cloud_max: float = 80.0,
+    *,
+    backend: str = "des",
+) -> list[tuple[str, float]]:
+    """Query a STAC catalogue for available Sentinel-2 L2A dates.
+
+    Returns deduplicated dates sorted by scene cloud cover ascending.
+    Multiple tiles/orbits on the same date are merged (lowest cloud kept).
+    The granule-level ``eo:cloud_cover`` is coarse (~100×100 km tile-wide
+    average) and most callers should ignore it — the rank+SCL pipeline
+    relies on ERA5 overpass + SCL for accurate per-AOI filtering. The
+    tuple shape is retained for backward compatibility with existing
+    callers that still consume the value.
+
+    Args:
+        coords: WGS84 bounding box dict ``{west, south, east, north}``.
+        date_start: ISO start date (inclusive).
+        date_end: ISO end date (inclusive).
+        scene_cloud_max: Discard dates with scene cloud > this %.
+        backend: STAC catalogue to query. ``"des"`` (default;
+            ``explorer.digitalearth.se``, S2 from 2018 onward) or
+            ``"earth-search"`` (``earth-search.aws.element84.com``,
+            full S2 history). For pre-2018 windows use ``"earth-search"``.
+
+    Returns:
+        List of ``(date_str, scene_cloud_pct)`` sorted by cloud ascending.
+
+    Raises:
+        ValueError: If ``backend`` is not in :data:`_STAC_BACKENDS`.
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+
+    if backend not in _STAC_BACKENDS:
+        raise ValueError(
+            f"Unknown STAC backend {backend!r}. "
+            f"Supported: {sorted(_STAC_BACKENDS)}."
+        )
+    cfg = _STAC_BACKENDS[backend]
+    # earth-search enforces RFC3339 timestamps; DES STAC accepts date-only.
+    # Send full RFC3339 in both cases — DES treats it identically.
+    dt_range = f"{date_start}T00:00:00Z/{date_end}T23:59:59Z"
+    params = urllib.parse.urlencode({
+        "collections": cfg["collection"],
+        "bbox": f"{coords['west']},{coords['south']},{coords['east']},{coords['north']}",
+        "datetime": dt_range,
+        "limit": 200,
+    })
+    url: str | None = f"{cfg['url']}?{params}"
+
+    # Paginate via STAC ``links[rel=next]``. A single page (limit=200) can
+    # truncate a wide window — the catalogue orders chronologically, so the
+    # dropped tail is the LATEST dates, which silently starves the last
+    # (late-summer) slot. Follow ``next`` until exhausted so the full window
+    # is seen. _STAC_MAX_PAGES bounds the loop (200 * pages features).
+    date_cloud: dict[str, float] = {}
+    for _ in range(_STAC_MAX_PAGES):
+        if not url:
+            break
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+
+        # Deduplicate: keep lowest cloud per date
+        for feat in data.get("features", []):
+            props = feat.get("properties", {})
+            dt_str = (props.get("datetime") or props.get("start_datetime") or "")[:10]
+            if not dt_str:
+                continue
+            cc = props.get("eo:cloud_cover", props.get("cloud_cover"))
+            if cc is None:
+                cc = 100.0
+            if dt_str not in date_cloud or cc < date_cloud[dt_str]:
+                date_cloud[dt_str] = cc
+
+        # Advance to the next page if the catalogue offers one (GET href).
+        url = next(
+            (lk.get("href") for lk in data.get("links", [])
+             if lk.get("rel") == "next" and lk.get("href")),
+            None,
+        )
+
+    # Filter and sort by cloud ascending
+    result = [
+        (d, c) for d, c in date_cloud.items()
+        if c <= scene_cloud_max
+    ]
+    result.sort(key=lambda x: x[1])
+    return result
+
+
+def scan_baseline_candidates(
+    date: str,
+    coords: dict,
+    search_start_days: int = 30,
+    search_end_days: int = 90,
+    scene_cloud_max: float = 80.0,
+    token: str | None = None,
+) -> list[BaselineCandidate]:
+    """Scan all available dates via STAC API, then fetch RGB+SCL for AOI cloud %.
+
+    Two-phase approach:
+    1. Query STAC for all dates with data (fast HTTP call)
+    2. Fetch RGB+SCL only for dates with scene cloud < threshold
+
+    Args:
+        date: ISO date string of the analysis (e.g. "2018-07-24").
+        coords: WGS84 bounding box dict.
+        search_start_days: Start of search window (days before date).
+        search_end_days: End of search window (days before date).
+        scene_cloud_max: Skip dates with scene cloud above this %.
+        token: Optional DES access token.
+
+    Returns:
+        List of BaselineCandidate sorted by cloud_fraction ascending.
+    """
+    from datetime import datetime, timedelta
+
+    dt = datetime.strptime(date, "%Y-%m-%d")
+    start = (dt - timedelta(days=search_end_days)).strftime("%Y-%m-%d")
+    end = (dt - timedelta(days=search_start_days)).strftime("%Y-%m-%d")
+
+    # Phase 1: STAC discovery
+    print(f"  [STAC] Querying available dates {start} to {end}...")
+    stac_dates = _stac_available_dates(coords, start, end, scene_cloud_max)
+    print(f"  [STAC] {len(stac_dates)} dates with scene cloud <= {scene_cloud_max:.0f}%")
+
+    if not stac_dates:
+        return []
+
+    # Phase 2: Fetch RGB+SCL per date
+    conn = _connect(token=token)
+    projected_coords = _to_nmd_grid(coords)
+
+    results = []
+    for i, (candidate_date, scene_cloud) in enumerate(stac_dates, 1):
+        candidate_dt = datetime.strptime(candidate_date, "%Y-%m-%d")
+        temporal = [
+            candidate_date,
+            (candidate_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+        ]
+
+        try:
+            rgb, aoi_cloud, shape = _fetch_rgb_and_scl(
+                conn, projected_coords, temporal
+            )
+            print(f"    [{i}/{len(stac_dates)}] {candidate_date}  "
+                  f"scene={scene_cloud:.1f}%  AOI(SCL)={aoi_cloud:.1%}  "
+                  f"[{shape[1]}x{shape[0]}]")
+
+            results.append(BaselineCandidate(
+                date=candidate_date,
+                cloud_fraction=aoi_cloud,
+                scene_cloud_fraction=scene_cloud,
+                rgb_thumbnail=rgb,
+                shape=shape,
+            ))
+
+        except Exception as e:
+            print(f"    [{i}/{len(stac_dates)}] {candidate_date}  "
+                  f"scene={scene_cloud:.1f}%  -> failed ({e})")
+            continue
+
+    results.sort(key=lambda c: c.cloud_fraction)
+    return results
+
+
+def _fetch_rgb_and_scl(conn, projected_coords: dict, temporal: list):
+    """Fetch B02/B03/B04 + SCL for a single date. Lightweight RGB thumbnail.
+
+    Returns:
+        Tuple of (rgb_array, cloud_fraction, shape).
+    """
+    import rasterio
+
+    cube_rgb = conn.load_collection(
+        collection_id=COLLECTION,
+        spatial_extent=projected_coords,
+        temporal_extent=temporal,
+        bands=["b02", "b03", "b04"],
+    )
+
+    cube_scl = conn.load_collection(
+        collection_id=COLLECTION,
+        spatial_extent=projected_coords,
+        temporal_extent=temporal,
+        bands=BANDS_20M_CATEGORICAL,
+    )
+    cube_scl = cube_scl.resample_cube_spatial(target=cube_rgb, method="near")
+
+    cube = cube_rgb.merge_cubes(cube_scl)
+    data = cube.download(format="gtiff")
+
+    if not data:
+        raise FetchError("DES returned empty data")
+
+    with rasterio.open(io.BytesIO(data)) as src:
+        raw = src.read()  # (4, H, W): b02, b03, b04, scl
+
+    b02 = dn_to_reflectance(raw[0], source="des")
+    b03 = dn_to_reflectance(raw[1], source="des")
+    b04 = dn_to_reflectance(raw[2], source="des")
+    scl = raw[3].astype(np.uint8)
+
+    cloud_frac = check_cloud_fraction(scl)
+
+    band_dict = {"B02": b02, "B03": b03, "B04": b04}
+    rgb = bands_to_rgb(band_dict, scl=scl)
+    shape = rgb.shape[:2]
+
+    return rgb, cloud_frac, shape
+
+
+def run_cot_on_candidates(
+    candidates: list[BaselineCandidate],
+    coords: dict,
+    top_n: int = 5,
+    token: str | None = None,
+) -> list[BaselineCandidate]:
+    """Fetch full bands for top N candidates and run COT analysis.
+
+    Fetches all 11 spectral bands needed by COT, runs the analyzer,
+    and populates the ``cot_stats`` field. Returns candidates re-sorted
+    by best visibility (highest clear_fraction, then lowest cot_mean).
+
+    Args:
+        candidates: Pre-sorted by cloud_fraction (from scan_baseline_candidates).
+        coords: WGS84 bounding box dict.
+        top_n: How many top candidates to run COT on.
+        token: Optional DES access token.
+
+    Returns:
+        The top_n candidates with cot_stats populated, sorted by visibility.
+    """
+    from datetime import datetime, timedelta
+    from imint.analyzers.cot import COTAnalyzer
+    import rasterio
+
+    top = candidates[:top_n]
+    if not top:
+        return []
+
+    conn = _connect(token=token)
+    projected_coords = _to_nmd_grid(coords)
+
+    analyzer = COTAnalyzer(config={"device": "cpu"})
+    print(f"\n  [COT] Running visibility analysis on top {len(top)} candidates...")
+
+    for i, c in enumerate(top, 1):
+        dt = datetime.strptime(c.date, "%Y-%m-%d")
+        temporal = [c.date, (dt + timedelta(days=1)).strftime("%Y-%m-%d")]
+
+        try:
+            # Full spectral fetch (all 11 bands)
+            cube_10m = conn.load_collection(
+                collection_id=COLLECTION,
+                spatial_extent=projected_coords,
+                temporal_extent=temporal,
+                bands=BANDS_10M,
+            )
+            cube_20m = conn.load_collection(
+                collection_id=COLLECTION,
+                spatial_extent=projected_coords,
+                temporal_extent=temporal,
+                bands=BANDS_20M_SPECTRAL,
+            )
+            cube_20m = cube_20m.resample_cube_spatial(
+                target=cube_10m, method="bilinear"
+            )
+            cube_60m = conn.load_collection(
+                collection_id=COLLECTION,
+                spatial_extent=projected_coords,
+                temporal_extent=temporal,
+                bands=BANDS_60M,
+            )
+            cube_60m = cube_60m.resample_cube_spatial(
+                target=cube_10m, method="bilinear"
+            )
+            cube = cube_10m.merge_cubes(cube_20m).merge_cubes(cube_60m)
+            data = cube.download(format="gtiff")
+
+            with rasterio.open(io.BytesIO(data)) as src:
+                raw = src.read()
+
+            spectral_names = BANDS_10M + BANDS_20M_SPECTRAL + BANDS_60M
+            bands = {}
+            for j, name in enumerate(spectral_names):
+                bands[name.upper()] = dn_to_reflectance(raw[j], source="des")
+            # B8A uppercase fix
+            if "B8A" not in bands and "b8a".upper() in bands:
+                pass  # already uppercase
+            bands = des_to_imint_bands(
+                {n.lower(): dn_to_reflectance(raw[j], source="des")
+                 for j, n in enumerate(spectral_names)}
+            )
+
+            # Run COT
+            rgb_dummy = c.rgb_thumbnail
+            result = analyzer.analyze(
+                rgb=rgb_dummy, bands=bands, date=c.date, output_dir="/tmp",
+            )
+
+            if result.success:
+                c.cot_stats = result.outputs["stats"]
+                cf = c.cot_stats["clear_fraction"]
+                cm = c.cot_stats["cot_mean"]
+                print(f"    [{i}/{len(top)}] {c.date}  "
+                      f"clear={cf:.1%}  COT_mean={cm:.6f}")
+            else:
+                print(f"    [{i}/{len(top)}] {c.date}  COT failed: {result.error}")
+
+        except Exception as e:
+            print(f"    [{i}/{len(top)}] {c.date}  COT fetch failed: {e}")
+
+    # Sort by visibility: highest clear_fraction, then lowest cot_mean
+    def _visibility_key(c):
+        if c.cot_stats is None:
+            return (0.0, 1.0)
+        return (c.cot_stats["clear_fraction"], -c.cot_stats["cot_mean"])
+
+    top.sort(key=_visibility_key, reverse=True)
+    return top
+
+
+def _baseline_area_key(coords: dict) -> str:
+    """Stable string key from bbox (matches change_detection._area_key)."""
+    return f"{coords['west']}_{coords['south']}_{coords['east']}_{coords['north']}"
+
+
+def ensure_baseline(
+    date: str,
+    coords: dict,
+    output_dir: str,
+    search_start_days: int = 30,
+    search_end_days: int = 90,
+    cloud_threshold: float = 0.1,
+    token: str | None = None,
+) -> str | None:
+    """Ensure a cloud-free baseline exists for this area.
+
+    Checks if a baseline .npy file already exists at the expected path
+    (matching the area naming used by ChangeDetectionAnalyzer).
+    If not, fetches a cloud-free image from DES and saves it.
+
+    Args:
+        date: ISO date string of the analysis.
+        coords: WGS84 bounding box dict.
+        output_dir: The job's output directory (baselines stored at ../baselines/).
+        search_start_days: Start of search window in days before date.
+        search_end_days: End of search window in days before date.
+        cloud_threshold: Maximum acceptable cloud fraction for baseline.
+        token: Optional DES access token.
+
+    Returns:
+        Path to the baseline .npy file (existing or newly created),
+        or None if fetching failed (logged as warning, not raised).
+    """
+    area = _baseline_area_key(coords)
+    baseline_dir = os.path.join(output_dir, "..", "baselines")
+    baseline_path = os.path.join(baseline_dir, f"{area}.npy")
+
+    if os.path.exists(baseline_path):
+        print(f"  [baseline] Using existing baseline: {baseline_path}")
+        return baseline_path
+
+    try:
+        print(f"  [baseline] No baseline found for area {area}")
+        print(f"  [baseline] Scanning {search_start_days}-{search_end_days} days back...")
+        result = fetch_cloud_free_baseline(
+            date=date,
+            coords=coords,
+            search_start_days=search_start_days,
+            search_end_days=search_end_days,
+            cloud_threshold=cloud_threshold,
+            token=token,
+        )
+
+        os.makedirs(baseline_dir, exist_ok=True)
+        np.save(baseline_path, result.rgb)
+        if result.scl is not None:
+            scl_path = baseline_path.replace(".npy", "_scl.npy")
+            np.save(scl_path, result.scl)
+
+        # Save multispectral bands stack for dNBR / change detection
+        _CHANGE_BANDS = ["B02", "B03", "B04", "B08", "B11", "B12"]
+        if result.bands and all(b in result.bands for b in _CHANGE_BANDS):
+            bands_stack = np.stack(
+                [result.bands[b] for b in _CHANGE_BANDS], axis=-1
+            ).astype(np.float32)
+            bands_path = baseline_path.replace(".npy", "_bands.npy")
+            np.save(bands_path, bands_stack)
+            print(f"  [baseline] Saved multispectral bands: {bands_path}")
+
+        # Save geospatial transform so change detection can align grids
+        if result.geo and result.geo.transform:
+            import json as _json
+            geo_path = baseline_path.replace(".npy", "_geo.json")
+            with open(geo_path, "w") as _f:
+                _json.dump({
+                    "transform": list(result.geo.transform)[:6],
+                    "crs": str(result.geo.crs),
+                    "shape": list(result.rgb.shape[:2]),
+                }, _f, indent=2)
+            print(f"  [baseline] Saved geo transform: {geo_path}")
+
+        print(f"  [baseline] Saved cloud-free baseline: {baseline_path}")
+        return baseline_path
+
+    except FetchError as e:
+        print(f"  [baseline] WARNING: Could not fetch baseline: {e}")
+        print(f"  [baseline] Change detection will create baseline from current image.")
+        return None
+
+
+# ── NMD (Nationellt Marktäckedata) ────────────────────────────────────────────
+
+# Default cache directory (project root/.nmd_cache)
+NMD_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".nmd_cache"
+)
+
+
+@dataclass
+class NMDFetchResult:
+    """Result of an NMD data fetch.
+
+    Attributes:
+        nmd_raster: 2D uint8 array (H, W) with NMD class codes.
+        crs: Coordinate reference system from the GeoTIFF.
+        transform: Affine transform from the GeoTIFF.
+        from_cache: True if loaded from local cache.
+    """
+    nmd_raster: np.ndarray
+    crs: Any | None = None
+    transform: Any | None = None
+    from_cache: bool = False
+
+
+def _nmd_cache_key(coords: dict) -> str:
+    """Generate a deterministic cache key from bounding box coordinates.
+
+    Args:
+        coords: Bounding box dict with keys: west, south, east, north.
+
+    Returns:
+        Hex string suitable for use as a filename.
+    """
+    key_str = f"{coords['west']:.6f}_{coords['south']:.6f}_{coords['east']:.6f}_{coords['north']:.6f}"
+    return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+
+def _resample_nearest(arr: np.ndarray, target_shape: tuple) -> np.ndarray:
+    """Resample a 2D categorical array to target_shape using nearest-neighbor.
+
+    Uses scipy.ndimage.zoom with order=0 (nearest) to preserve category values.
+
+    Args:
+        arr: Input 2D array (H, W).
+        target_shape: Desired (H, W).
+
+    Returns:
+        Resampled array with same dtype as input.
+    """
+    if arr.shape == target_shape:
+        return arr
+
+    from scipy.ndimage import zoom
+
+    zoom_factors = (target_shape[0] / arr.shape[0], target_shape[1] / arr.shape[1])
+    return zoom(arr, zoom_factors, order=0, mode="nearest").astype(arr.dtype)
+
+
+def fetch_nmd_data(
+    coords: dict,
+    target_shape: tuple | None = None,
+    token: str | None = None,
+    cache_dir: str | None = None,
+) -> NMDFetchResult:
+    """Fetch NMD (Nationellt Marktäckedata) from DES via openEO.
+
+    NMD is a static 10m land cover dataset — safe to cache locally.
+    Coords are projected to EPSG:3006 and snapped to the NMD 10m grid
+    before fetching, ensuring pixel-perfect alignment with Sentinel-2.
+
+    The cache is keyed by the snapped EPSG:3006 coordinates for stability.
+
+    Args:
+        coords: WGS84 bounding box dict with keys: west, south, east, north.
+        target_shape: Optional (H, W) to resample the NMD raster to.
+                      Uses nearest-neighbor to preserve category values.
+        token: Optional DES access token. Falls back to env/file/OIDC.
+        cache_dir: Directory for the NMD cache. Defaults to .nmd_cache/.
+
+    Returns:
+        NMDFetchResult with nmd_raster (uint8 class codes).
+
+    Raises:
+        FetchError: If NMD data fetching fails.
+    """
+    import rasterio
+
+    # Project and snap to NMD grid — same grid as Sentinel-2
+    projected_coords = _to_nmd_grid(coords)
+
+    resolved_cache = cache_dir or NMD_CACHE_DIR
+    # Cache key based on snapped EPSG:3006 coords (deterministic, no float drift)
+    cache_key = _nmd_cache_key(projected_coords)
+    cache_path = os.path.join(resolved_cache, f"nmd_{cache_key}.npy")
+
+    # Check cache first — NMD is static, safe to cache indefinitely
+    if os.path.exists(cache_path):
+        nmd_raster = np.load(cache_path)
+        result_raster = nmd_raster
+        if target_shape and nmd_raster.shape != target_shape:
+            result_raster = _resample_nearest(nmd_raster, target_shape)
+        return NMDFetchResult(
+            nmd_raster=result_raster,
+            from_cache=True,
+        )
+
+    # Fetch from DES using projected, snapped coords
+    conn = _connect(token=token)
+
+    try:
+        load_kwargs = dict(
+            collection_id=NMD_COLLECTION,
+            spatial_extent=projected_coords,
+            bands=[NMD_BAND],
+        )
+        if NMD_TEMPORAL is not None:
+            load_kwargs["temporal_extent"] = NMD_TEMPORAL
+
+        cube = conn.load_collection(**load_kwargs)
+
+        # Reduce temporal dimension if present (NMD has one time step
+        # but openEO may still return a temporal axis)
+        try:
+            cube = cube.reduce_dimension(dimension="t", reducer="first")
+        except Exception:
+            pass  # No temporal dimension — that's fine for static NMD
+
+        data = cube.download(format="gtiff")
+
+        if not data:
+            raise FetchError("DES returned empty NMD data")
+
+    except FetchError:
+        raise
+    except Exception as e:
+        raise FetchError(f"NMD fetch failed: {e}")
+
+    # Parse GeoTIFF
+    try:
+        with rasterio.open(io.BytesIO(data)) as src:
+            raw = src.read(1)  # Single band
+            crs = src.crs
+            transform = src.transform
+    except Exception as e:
+        raise FetchError(f"Failed to parse NMD GeoTIFF: {e}")
+
+    nmd_raster = raw.astype(np.uint8)
+
+    # Cache the raw (unresampled) raster
+    os.makedirs(resolved_cache, exist_ok=True)
+    np.save(cache_path, nmd_raster)
+
+    # Resample to target if needed
+    result_raster = nmd_raster
+    if target_shape and nmd_raster.shape != target_shape:
+        result_raster = _resample_nearest(nmd_raster, target_shape)
+
+    return NMDFetchResult(
+        nmd_raster=result_raster,
+        crs=crs,
+        transform=transform,
+        from_cache=False,
+    )
+
+
+# ── Sjökort (Nautical chart from SLU GET) ─────────────────────────────────────
+
+# SLU GET API for ordering S-57 nautical chart data from Sjöfartsverket.
+# Requires a Shibboleth-authenticated session (browser cookies).
+# Chart data is in S-57 (.000) vector format, delivered in EPSG:4326.
+# Max area per order: ~2.5 km² (workload 2 = "orange" in SLU GET UI).
+# For larger areas the bbox must be tiled into ≤2.5 km² pieces.
+
+SLU_GET_BASE_URL = "https://maps.slu.se/get"
+SLU_GET_DOWNLOAD_URL = "https://maps.slu.se/get/done"
+SLU_GET_JOB_ID = "sjokort_vektor"
+SLU_GET_MAX_AREA_M2 = 2_500_000  # ~2.5 km²
+SLU_GET_DEFAULT_MARGIN_M = 1000  # 1 km margin around bbox
+
+# Default cache directory (project root/.sjokort_cache)
+SJOKORT_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".sjokort_cache"
+)
+
+# S-57 layer rendering config — IHO S-52 inspired colour scheme
+# Depth ranges (DRVAL1/DRVAL2 midpoint) → hex colour
+_S57_DEPTH_COLOURS = [
+    (0,   3,   "#B0DEF5"),   # Very shallow — bright cyan-blue
+    (3,   6,   "#C2E6F8"),   # Shallow
+    (6,   10,  "#D0ECF9"),   # Moderate shallow
+    (10,  20,  "#DDF2FB"),   # Moderate
+    (20,  30,  "#E6F5FC"),   # Deeper
+    (30,  50,  "#EDF8FD"),   # Deep
+    (50,  999, "#EDF8FD"),   # Very deep — same as BG (no visible border)
+]
+_S57_LAND_COLOUR = "#F5E6C8"       # Warm tan/sand
+_S57_COASTLINE_COLOUR = "#2C2C2C"  # Near-black
+_S57_DEPCNT_COLOUR = "#7CADC8"     # Blue-grey contour lines
+_S57_FAIRWAY_COLOUR = "#C9ABE0"    # Light purple
+_S57_BG_COLOUR = "#EDF8FD"         # Default sea — matches DEPARE 30-50 m
+_S57_BUILDING_COLOUR = "#C8AD8A"   # Darker tan for buildings
+_S57_ROAD_COLOUR = "#999999"       # Grey for roads
+_S57_SLCONS_COLOUR = "#555555"     # Dark grey for shoreline constructions
+_S57_BRIDGE_COLOUR = "#444444"     # Dark for bridges
+_S57_NAVLNE_COLOUR = "#AA5599"     # Magenta for navigation lines
+_S57_SOUNDG_COLOUR = "#3366AA"     # Blue for sounding labels
+_S57_OBSTRN_COLOUR = "#CC3333"     # Red for obstructions
+_S57_WRECKS_COLOUR = "#333333"     # Dark for wrecks
+
+# S-57 COLOUR attribute mapping (IHO S-57 Appendix A, Chapter 2)
+_S57_COLOUR_MAP = {
+    "1": "#FFFFFF",   # white
+    "2": "#000000",   # black
+    "3": "#FF0000",   # red
+    "4": "#00AA00",   # green
+    "5": "#0000FF",   # blue
+    "6": "#FFCC00",   # yellow
+    "7": "#888888",   # grey
+    "8": "#8B4513",   # brown
+    "9": "#FFBF00",   # amber
+    "10": "#8B008B",  # violet
+    "11": "#FF8800",  # orange
+    "12": "#FF00FF",  # magenta
+    "13": "#FFB6C1",  # pink
+}
+
+# Rendering colours for light sectors (semi-transparent fills)
+_SECTOR_FILL = {
+    "3": (1.0, 0.0, 0.0, 0.18),   # red
+    "4": (0.0, 0.7, 0.0, 0.18),   # green
+    "1": (1.0, 1.0, 0.6, 0.12),   # white (pale yellow tint)
+    "6": (1.0, 0.8, 0.0, 0.15),   # yellow
+}
+_SECTOR_EDGE = {
+    "3": "#CC0000",
+    "4": "#006600",
+    "1": "#AA8800",
+    "6": "#CC8800",
+}
+
+
+def _load_svg_symbol(svg_path: str, flip_y: bool = True):
+    """Parse an OpenSeaMap SVG file into a normalised matplotlib Path.
+
+    Extracts all ``<path d="...">`` elements, combines them, centres on
+    the origin, and scales to the range *-1 … 1*.  Y is flipped by
+    default because SVG has *y-down* while matplotlib markers use *y-up*.
+
+    Returns ``None`` if the file cannot be read or contains no paths.
+    """
+    import re
+    import numpy as np
+    from svgpath2mpl import parse_path
+    from matplotlib.path import Path as MPath
+
+    try:
+        with open(svg_path) as fh:
+            svg = fh.read()
+    except OSError:
+        return None
+
+    paths_data = re.findall(r'<path[^>]*\bd="([^"]+)"', svg)
+    if not paths_data:
+        return None
+
+    all_verts: list[np.ndarray] = []
+    all_codes: list[int] = []
+    for d in paths_data:
+        try:
+            p = parse_path(d)
+            all_verts.append(p.vertices.copy())
+            all_codes.extend(list(p.codes))
+        except Exception:
+            continue
+
+    if not all_verts:
+        return None
+
+    verts = np.vstack(all_verts)
+    xmin, ymin = verts.min(axis=0)
+    xmax, ymax = verts.max(axis=0)
+    cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
+    scale = max(xmax - xmin, ymax - ymin) / 2
+    if scale < 1e-6:
+        scale = 1.0
+    verts = (verts - [cx, cy]) / scale
+    if flip_y:
+        verts[:, 1] *= -1
+
+    return MPath(verts, all_codes)
+
+
+def _int1_symbols() -> dict:
+    """Load INT1/S-52 nautical chart symbols from OpenSeaMap SVGs.
+
+    Returns a dict mapping symbol name → ``matplotlib.path.Path`` usable
+    as a ``marker`` in ``ax.scatter()`` / ``ax.plot()``.
+
+    Symbols are loaded from ``data/symbols/*.svg`` (OpenSeaMap renderer
+    project, archived 2021).  Each SVG is parsed with *svgpath2mpl* and
+    normalised to the coordinate range -1 … 1.
+
+    If an SVG file is missing a simple hand-coded fallback is used so
+    the renderer never crashes.
+    """
+    import os
+    import math
+    from matplotlib.path import Path as MPath
+
+    MOVETO = MPath.MOVETO
+    LINETO = MPath.LINETO
+    CLOSEPOLY = MPath.CLOSEPOLY
+
+    symbols: dict[str, MPath] = {}
+
+    # ── Locate SVG directory ────────────────────────────────────────
+    svg_dir = os.path.join(os.path.dirname(__file__), "..", "data", "symbols")
+    svg_dir = os.path.normpath(svg_dir)
+
+    def _svg(name: str):
+        return _load_svg_symbol(os.path.join(svg_dir, f"{name}.svg"))
+
+    # ── Buoys (pillar / spar pole symbols) ─────────────────────────
+    symbols["buoy_can"]      = _svg("Pillar")     # port / lateral
+    symbols["buoy_cone"]     = _svg("Spar")       # starboard / lateral
+    symbols["buoy_cardinal"] = _svg("Pillar")     # cardinal
+    symbols["buoy_special"]  = _svg("Float")      # special purpose
+
+    # ── Beacon ──────────────────────────────────────────────────────
+    symbols["beacon"] = _svg("Beacon")
+
+    # ── Light ───────────────────────────────────────────────────────
+    symbols["light"] = _svg("Light")
+
+    # ── Wreck ───────────────────────────────────────────────────────
+    symbols["wreck"] = _svg("WreckD")
+
+    # ── Rock ────────────────────────────────────────────────────────
+    symbols["rock"] = _svg("Rock")
+
+    # ── Obstruction ─────────────────────────────────────────────────
+    # Reuse rock cross — good + symbol
+    symbols["obstruction"] = _svg("Rock")
+
+    # ── Landmark ────────────────────────────────────────────────────
+    symbols["landmark"] = _svg("Tower") or _svg("Church")
+
+    # ── Mooring / bollard ───────────────────────────────────────────
+    symbols["mooring"] = _svg("Bollard")
+
+    # ── Harbour ─────────────────────────────────────────────────────
+    symbols["harbour"] = _svg("Harbour")
+
+    # ── Topmarks ────────────────────────────────────────────────────
+    symbols["topmark"]       = _svg("Top_Can")
+    symbols["topmark_can"]   = _svg("Top_Can")
+    symbols["topmark_cone"]  = _svg("Top_Cone")
+    symbols["topmark_x"]     = _svg("Top_X")
+    symbols["topmark_north"] = _svg("Top_North")
+    symbols["topmark_south"] = _svg("Top_South")
+
+    # ── Fallbacks for any missing SVGs ──────────────────────────────
+    # Simple cross for rock / obstruction
+    _cross = MPath(
+        [(0, -0.8), (0, 0.8), (0, 0),
+         (-0.8, 0), (0.8, 0), (0, 0)],
+        [MOVETO, LINETO, MOVETO,
+         MOVETO, LINETO, MOVETO],
+    )
+    # Simple triangle for beacon / generic
+    _tri = MPath(
+        [(0, -1), (0, 0.1), (-0.5, 0.1), (0, 0.9),
+         (0.5, 0.1), (-0.5, 0.1)],
+        [MOVETO, LINETO, MOVETO, LINETO, LINETO, CLOSEPOLY],
+    )
+    # Simple filled circle for buoys
+    import numpy as _np
+    _circ_pts = [(0.8 * math.cos(t), 0.8 * math.sin(t))
+                 for t in _np.linspace(0, 2 * math.pi, 20)]
+    _circ_codes = [MOVETO] + [LINETO] * 18 + [CLOSEPOLY]
+    _circ = MPath(_circ_pts, _circ_codes)
+
+    _fallbacks = {
+        "buoy_can": _circ, "buoy_cone": _circ,
+        "buoy_cardinal": _circ, "buoy_special": _circ,
+        "beacon": _tri, "light": _tri,
+        "wreck": _cross, "rock": _cross,
+        "obstruction": _cross, "landmark": _tri,
+        "mooring": _circ, "harbour": _cross,
+        "topmark": _tri, "topmark_can": _tri,
+        "topmark_cone": _tri, "topmark_x": _cross,
+        "topmark_north": _tri, "topmark_south": _tri,
+    }
+    for key, fallback in _fallbacks.items():
+        if symbols.get(key) is None:
+            symbols[key] = fallback
+
+    return symbols
+
+
+@dataclass
+class SjokortTile:
+    """A single sjökort order tile with SWEREF99 TM bounds.
+
+    Attributes:
+        north: Max Y in EPSG:3006.
+        south: Min Y in EPSG:3006.
+        east:  Max X in EPSG:3006.
+        west:  Min X in EPSG:3006.
+        uuid:  Server-assigned UUID after successful order (None before).
+        area_m2: Tile area in square meters.
+    """
+    north: int
+    south: int
+    east: int
+    west: int
+    uuid: str | None = None
+    area_m2: int = 0
+
+    def __post_init__(self):
+        self.area_m2 = (self.east - self.west) * (self.north - self.south)
+
+
+@dataclass
+class SjokortFetchResult:
+    """Result of a sjökort fetch operation.
+
+    Attributes:
+        s57_paths: Deduplicated list of unique S-57 file paths (one per ENC cell).
+        tiles:     List of SjokortTile objects with order metadata.
+        bbox_wgs84: Original WGS84 bounding box (without margin).
+        bbox_sweref: NMD-aligned SWEREF99 TM bounding box (without margin).
+        bbox_sweref_padded: SWEREF99 TM bbox including margin (used for ordering).
+        rendered_png: Path to rendered PNG if ``render=True`` was used, else None.
+        from_cache: True if loaded from local cache.
+    """
+    s57_paths: list[Path]
+    tiles: list[SjokortTile]
+    bbox_wgs84: dict
+    bbox_sweref: dict
+    bbox_sweref_padded: dict | None = None
+    rendered_png: Path | None = None
+    from_cache: bool = False
+
+
+def _sjokort_cache_key(coords: dict) -> str:
+    """Generate a deterministic cache key from SWEREF99 TM coordinates."""
+    key_str = f"sjokort_{coords['west']}_{coords['south']}_{coords['east']}_{coords['north']}"
+    return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+
+def _tile_sjokort_bbox(projected_coords: dict, max_area: int = SLU_GET_MAX_AREA_M2) -> list[SjokortTile]:
+    """Split a SWEREF99 TM bbox into tiles that fit under the SLU GET area limit.
+
+    Tiles are aligned to the NMD 10m grid. The number of columns and rows is
+    chosen to keep each tile under ``max_area`` while using the fewest splits.
+
+    Args:
+        projected_coords: SWEREF99 TM bbox with keys west, south, east, north.
+        max_area: Maximum tile area in m² (default ~2.5 km²).
+
+    Returns:
+        List of SjokortTile objects covering the full bbox.
+    """
+    W = projected_coords["west"]
+    S = projected_coords["south"]
+    E = projected_coords["east"]
+    N = projected_coords["north"]
+    total_w = E - W
+    total_h = N - S
+    total_area = total_w * total_h
+
+    if total_area <= max_area:
+        return [SjokortTile(north=N, south=S, east=E, west=W)]
+
+    # Find minimum number of columns and rows
+    grid = NMD_GRID_SIZE
+    n_cols = 1
+    n_rows = 1
+    while True:
+        tile_w = total_w / n_cols
+        tile_h = total_h / n_rows
+        if tile_w * tile_h <= max_area:
+            break
+        # Split along the longer dimension
+        if tile_w >= tile_h:
+            n_cols += 1
+        else:
+            n_rows += 1
+
+    # Calculate tile dimensions snapped to NMD grid
+    col_width = math.floor(total_w / n_cols / grid) * grid
+    row_height = math.floor(total_h / n_rows / grid) * grid
+
+    tiles = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            tile_w = W + c * col_width
+            tile_e = W + (c + 1) * col_width if c < n_cols - 1 else E
+            tile_s = S + r * row_height
+            tile_n = S + (r + 1) * row_height if r < n_rows - 1 else N
+            tiles.append(SjokortTile(north=tile_n, south=tile_s, east=tile_e, west=tile_w))
+
+    return tiles
+
+
+def _order_sjokort_tile(
+    tile: SjokortTile,
+    email: str,
+    session: Any,
+) -> SjokortTile:
+    """Submit a single sjökort order via the SLU GET API.
+
+    Args:
+        tile: SjokortTile with SWEREF99 TM bounds.
+        email: E-mail address for the download link.
+        session: ``requests.Session`` with Shibboleth cookies.
+
+    Returns:
+        The same tile with ``uuid`` populated on success.
+
+    Raises:
+        FetchError: If the order submission fails.
+    """
+    url = (
+        f"{SLU_GET_BASE_URL}/api/job/{SLU_GET_JOB_ID}"
+        f"/{tile.north}/{tile.south}/{tile.east}/{tile.west}/{email}"
+    )
+    try:
+        resp = session.post(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        uuid = data.get("Uuid")
+        if not uuid:
+            raise FetchError(f"SLU GET order failed — no Uuid in response: {data}")
+        tile.uuid = uuid
+        return tile
+    except FetchError:
+        raise
+    except Exception as e:
+        raise FetchError(f"SLU GET order request failed: {e}")
+
+
+def _download_sjokort_zip(
+    uuid: str,
+    dest_dir: Path,
+    session: Any | None = None,
+    max_retries: int = 20,
+    retry_delay: float = 30.0,
+) -> Path:
+    """Download a processed sjökort ZIP from SLU GET.
+
+    Polls the download URL until the ZIP is ready (server returns HTML
+    while processing, ZIP when done).  Uses the same Shibboleth session
+    as the ordering step (maps.slu.se requires it).
+
+    Args:
+        uuid: Order UUID from the API response.
+        dest_dir: Directory to save the ZIP file.
+        session: ``requests.Session`` with Shibboleth cookies (recommended).
+                 Falls back to a plain ``requests.get`` if None.
+        max_retries: Maximum number of download attempts.
+        retry_delay: Seconds between retries.
+
+    Returns:
+        Path to the downloaded ZIP file.
+
+    Raises:
+        FetchError: If download fails after all retries.
+    """
+    import time
+    import requests
+
+    url = f"{SLU_GET_DOWNLOAD_URL}/{uuid}.zip"
+    zip_path = dest_dir / f"{uuid}.zip"
+    getter = session if session is not None else requests
+
+    for attempt in range(max_retries):
+        try:
+            resp = getter.get(url, timeout=60)
+            resp.raise_for_status()
+            # SLU returns HTML while processing, ZIP when ready
+            content_type = resp.headers.get("Content-Type", "")
+            if "html" in content_type or resp.content[:4] != b"PK\x03\x04":
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                raise FetchError(
+                    f"Sjökort ZIP not ready after {max_retries * retry_delay:.0f}s "
+                    f"for UUID {uuid}"
+                )
+            zip_path.write_bytes(resp.content)
+            return zip_path
+        except FetchError:
+            raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+            raise FetchError(f"Failed to download sjökort ZIP {uuid}: {e}")
+
+    raise FetchError(f"Sjökort download exhausted retries for {uuid}")
+
+
+def _extract_s57_from_zip(zip_path: Path, dest_dir: Path) -> list[Path]:
+    """Extract S-57 (.000) files from a sjökort ZIP archive.
+
+    Args:
+        zip_path: Path to the ZIP file.
+        dest_dir: Directory to extract S-57 files into.
+
+    Returns:
+        List of extracted S-57 file paths.
+    """
+    import zipfile
+
+    s57_paths = []
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for name in zf.namelist():
+            if name.endswith(".000"):
+                extracted = dest_dir / Path(name).name
+                extracted.write_bytes(zf.read(name))
+                s57_paths.append(extracted)
+
+    return s57_paths
+
+
+def _pad_sweref_bbox(coords: dict, margin_m: int) -> dict:
+    """Expand a SWEREF99 TM bbox by ``margin_m`` metres on each side, snapped to NMD grid.
+
+    Args:
+        coords: SWEREF99 TM bbox with keys west, south, east, north.
+        margin_m: Margin in metres to add on each side.
+
+    Returns:
+        Expanded bbox dict (same format, re-snapped to NMD 10m grid).
+    """
+    grid = NMD_GRID_SIZE
+    return {
+        "west": math.floor((coords["west"] - margin_m) / grid) * grid,
+        "south": math.floor((coords["south"] - margin_m) / grid) * grid,
+        "east": math.ceil((coords["east"] + margin_m) / grid) * grid,
+        "north": math.ceil((coords["north"] + margin_m) / grid) * grid,
+        "crs": coords.get("crs", TARGET_CRS),
+    }
+
+
+def _deduplicate_s57(s57_paths: list[Path]) -> list[Path]:
+    """Remove duplicate S-57 files across tiles (same ENC cell name).
+
+    SLU GET delivers full ENC cells for every overlapping tile order. This
+    function keeps only one copy per unique filename (stem), preferring the
+    first occurrence.
+
+    Args:
+        s57_paths: All extracted S-57 file paths (may contain duplicates).
+
+    Returns:
+        Deduplicated list of paths (one per unique ENC cell).
+    """
+    seen: dict[str, Path] = {}
+    for p in s57_paths:
+        if p.stem not in seen:
+            seen[p.stem] = p
+    return sorted(seen.values())
+
+
+def _depth_colour(drval1: float | None, drval2: float | None) -> str:
+    """Map S-57 DEPARE depth range to an IHO-inspired colour hex string."""
+    mid = ((drval1 or 0) + (drval2 or 0)) / 2.0
+    for lo, hi, col in _S57_DEPTH_COLOURS:
+        if lo <= mid < hi:
+            return col
+    return _S57_BG_COLOUR
+
+
+def _best_scale_prefix(s57_paths: list, bbox_wgs84: dict) -> str | None:
+    """Auto-select the most detailed ENC scale whose data covers the AOI.
+
+    Swedish ENC cells use prefixes that encode the navigational purpose:
+
+        SE2 — Overview        (1:1 000 000)
+        SE3 — General         (1:350 000)
+        SE4 — Harbour/Approach (1:90 000)
+        SE5 — Berthing        (1:22 000)
+
+    The function groups the supplied S-57 files by prefix, then tests
+    each group starting from the most detailed (highest number).  For
+    each scale the DEPARE (depth area) and LNDARE (land area) polygons
+    are unioned and intersected with the AOI.  If the coverage ratio
+    is ≥ 95 % the scale is selected.
+
+    Actual geometry coverage is checked — not the cell metadata extent
+    (M_COVR) — so scales with gaps in depth data (e.g. open water
+    outside a harbour cell) are correctly rejected.
+
+    Returns:
+        The chosen prefix string (e.g. ``"SE4"``) or ``None`` if no
+        single scale covers the AOI sufficiently.
+    """
+    import fiona
+    import geopandas as gpd
+    from collections import defaultdict
+    from shapely.geometry import box as _box
+    from shapely.ops import unary_union
+
+    W = bbox_wgs84["west"]
+    S = bbox_wgs84["south"]
+    E = bbox_wgs84["east"]
+    N = bbox_wgs84["north"]
+    aoi = _box(W, S, E, N)
+    aoi_area = aoi.area
+
+    # Gruppera filer per prefix (SE2, SE3, SE4, SE5, …)
+    groups: dict[str, list] = defaultdict(list)
+    for p in s57_paths:
+        stem = Path(p).stem.upper()
+        prefix = stem[:3]           # "SE4", "SE3", etc.
+        groups[prefix].append(p)
+
+    # Testa varje grupp — högsta nummer (mest detaljerad) först
+    for prefix in sorted(groups.keys(), reverse=True):
+        paths = groups[prefix]
+        dep_polys = []
+        lnd_polys = []
+        for p in paths:
+            try:
+                lyrs = fiona.listlayers(str(p))
+                if "DEPARE" in lyrs:
+                    gdf = gpd.read_file(str(p), layer="DEPARE",
+                                        bbox=(W, S, E, N))
+                    if not gdf.empty:
+                        dep_polys.extend(
+                            g for g in gdf.geometry if g and g.is_valid
+                        )
+                if "LNDARE" in lyrs:
+                    gdf = gpd.read_file(str(p), layer="LNDARE",
+                                        bbox=(W, S, E, N))
+                    if not gdf.empty:
+                        lnd_polys.extend(
+                            g for g in gdf.geometry if g and g.is_valid
+                        )
+            except Exception:
+                continue
+
+        if not dep_polys and not lnd_polys:
+            continue
+
+        # Union av DEPARE + LNDARE klippt mot AOI
+        all_polys = dep_polys + lnd_polys
+        coverage = unary_union(all_polys).intersection(aoi)
+        ratio = coverage.area / aoi_area if aoi_area > 0 else 0
+
+        if ratio >= 0.95:
+            return prefix
+
+    return None          # Ingen skala täcker ≥95 %
+
+
+def render_sjokort_png(
+    s57_paths: list[Path],
+    bbox_wgs84: dict | None,
+    output_path: Path,
+    img_w: int = 0,
+    img_h: int = 0,
+    *,
+    scale_prefix: str | None = None,
+) -> Path:
+    """Render S-57 nautical chart data to a PNG image.
+
+    Reads key layers from ENC cell files and renders them with IHO S-52
+    inspired colours, clipped to the given WGS84 bounding box.
+
+    **CRS handling — critical for pixel alignment:**
+
+    S-57 ENC data is natively in WGS84 (EPSG:4326), but the Sentinel-2
+    RGB image is in SWEREF99 TM (EPSG:3006).  If the sjökort were rendered
+    directly in WGS84, its pixel grid would not align with the RGB because
+    the two coordinate systems distort space differently (geographic degrees
+    vs projected metres).
+
+    To guarantee exact pixel alignment the function:
+
+    1. Reads S-57 features using the WGS84 bbox (native CRS of the ENC
+       files) and clips them to the AOI.
+    2. Reprojects every GeoDataFrame to the target CRS read from
+       ``bands_meta.json`` (normally ``EPSG:3006``).  Fiona-based point
+       features (lights, buoys, labels) are transformed via ``pyproj``.
+    3. Sets the matplotlib axes to the **projected bounds** from the
+       metadata (``bounds_projected``) so that the rendered image covers
+       exactly the same metric rectangle as the RGB.
+
+    If ``bands_meta.json`` is unavailable, projected bounds are computed
+    on-the-fly from the WGS84 bbox using ``pyproj``.
+
+    If *bbox_wgs84* is ``None``, or *img_w*/*img_h* are 0, the
+    function reads ``bands_meta.json`` from the same output directory
+    (using the date prefix from *output_path*) and uses its
+    ``bounds_wgs84`` and ``shape`` so that the chart matches the
+    Sentinel-2 RGB pixel grid exactly.
+
+    Rendering order (bottom to top):
+        1. Sea background
+        2. DEPARE — depth areas (polygon fills, colour by depth)
+        3. FAIRWY — fairway areas (semi-transparent)
+        4. DRGARE — dredged areas
+        5. LNDARE — land areas (warm tan fill)
+        6. BUISGL — buildings on land
+        7. DEPCNT — depth contour lines
+        8. SLCONS — shoreline constructions (piers, breakwaters)
+        9. COALNE — coastline
+        10. ROADWY — roads
+        11. BRIDGE — bridges
+        12. NAVLNE — navigation lines
+        13. SOUNDG — depth soundings (point text labels)
+        14. OBSTRN — obstructions (markers)
+        15. WRECKS — wrecks (markers)
+
+    Args:
+        s57_paths: Deduplicated list of S-57 (.000) file paths.
+        bbox_wgs84: WGS84 bounding box ``{west, south, east, north}``,
+            or ``None`` to read from bands_meta.json.
+        output_path: Where to save the output PNG.
+        img_w: Target image width in pixels (0 = read from meta).
+        img_h: Target image height in pixels (0 = read from meta).
+        scale_prefix: Optional ENC scale prefix filter (e.g. "SE5") —
+            only files whose stem starts with this prefix are rendered.
+
+    Returns:
+        Path to the rendered PNG file.
+
+    Raises:
+        FetchError: If rendering fails (e.g. no data within bbox).
+    """
+    import warnings
+
+    try:
+        import geopandas as gpd
+        import pandas as pd
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyArrowPatch, Wedge
+        from shapely.geometry import box, MultiPoint
+        from PIL import Image
+        import math
+    except ImportError as e:
+        raise FetchError(
+            f"Sjökort rendering requires geopandas, matplotlib and Pillow: {e}"
+        )
+
+    warnings.filterwarnings("ignore", message=".*Skipping field.*")
+    warnings.filterwarnings("ignore", category=UserWarning)
+
+    # ── Read bands_meta.json for rendering parameters ────────────
+    # Always read meta for projected bounds (CRS alignment).  Also use
+    # it as fallback for bbox / image dimensions when not supplied.
+    import json as _json
+    _out_dir = Path(output_path).parent
+    _meta_candidates = sorted(_out_dir.glob("bands/*bands_meta.json"))
+    _bm: dict = {}
+    _geo: dict = {}
+    if _meta_candidates:
+        with open(_meta_candidates[0]) as _mf:
+            _bm = _json.load(_mf)
+        _geo = _bm.get("geo", {})
+    elif bbox_wgs84 is None or img_w == 0 or img_h == 0:
+        raise FetchError(
+            "bbox_wgs84 is None and no bands_meta.json found in "
+            f"{_out_dir}/bands/"
+        )
+
+    if bbox_wgs84 is None:
+        bbox_wgs84 = (
+            _bm.get("bounds_wgs84")
+            or _geo.get("bounds_wgs84")
+            or _bm.get("coords")
+        )
+    if img_w == 0 or img_h == 0:
+        _shape = _bm.get("shape") or _geo.get("shape") or [573, 324]
+        img_h, img_w = _shape[0], _shape[1]
+
+    # Projected CRS + bounds — the RGB image is in EPSG:3006 (SWEREF99 TM).
+    # The sjökort MUST render in the same CRS so pixels align perfectly.
+    target_crs = _geo.get("crs", "EPSG:3006")
+    _proj_bounds = _geo.get("bounds_projected")
+
+    # ── Filter paths by scale prefix ──────────────────────────────
+    all_s57_paths = list(s57_paths)
+    if scale_prefix:
+        s57_paths = [
+            p for p in s57_paths
+            if Path(p).stem.upper().startswith(scale_prefix.upper())
+        ]
+        # Fallback cells: coarser scales for gap-fill (e.g. SE3 behind SE4)
+        _fallback_paths = [p for p in all_s57_paths if p not in s57_paths]
+    else:
+        _fallback_paths = []
+    if not s57_paths:
+        raise FetchError(
+            f"No S-57 files match scale_prefix={scale_prefix!r}"
+        )
+
+    # WGS84 bbox — used ONLY as a spatial filter when reading S-57 data
+    # (the native CRS of ENC files).  NOT used for clipping — see below.
+    W = bbox_wgs84["west"]
+    S_ = bbox_wgs84["south"]
+    E = bbox_wgs84["east"]
+    N = bbox_wgs84["north"]
+
+    # Projected rendering bounds (e.g. EPSG:3006 / SWEREF99 TM).
+    # These define the matplotlib axes so the output pixel grid matches
+    # the Sentinel-2 RGB exactly.  Prefer the snapped bounds stored in
+    # bands_meta.json; fall back to a pyproj transform if unavailable.
+    if _proj_bounds:
+        pW = _proj_bounds["west"]
+        pS = _proj_bounds["south"]
+        pE = _proj_bounds["east"]
+        pN = _proj_bounds["north"]
+    else:
+        from pyproj import Transformer as _Tr
+        _t = _Tr.from_crs("EPSG:4326", target_crs, always_xy=True)
+        pW, pS = _t.transform(W, S_)
+        pE, pN = _t.transform(E, N)
+
+    # Clip box in the PROJECTED CRS.  Clipping must happen after
+    # reprojection — clipping in WGS84 then reprojecting creates curved
+    # edges that leave thin gaps at the image border.
+    clip_box = box(pW, pS, pE, pN)
+
+    # ── Helper: read & clip one layer ─────────────────────────────
+    def _read_layer(
+        path: Path,
+        layer: str,
+        geom_types: list[str] | None = None,
+    ) -> gpd.GeoDataFrame:
+        import fiona
+        try:
+            if layer not in fiona.listlayers(str(path)):
+                return gpd.GeoDataFrame()
+            # Read with WGS84 bbox as spatial filter (S-57 native CRS).
+            gdf = gpd.read_file(str(path), layer=layer,
+                                bbox=(W, S_, E, N))
+            if gdf.empty:
+                return gdf
+            gdf = gdf[gdf.geometry.notna()]
+            if geom_types and not gdf.empty:
+                gdf = gdf[gdf.geometry.geom_type.isin(geom_types)]
+            # Reproject WGS84 → target CRS (e.g. EPSG:3006 SWEREF99 TM)
+            # BEFORE clipping.  Clipping in WGS84 then reprojecting
+            # produces curved edges that don't align with the projected
+            # axis limits, leaving thin gaps at the image border.
+            if not gdf.empty:
+                if gdf.crs is None:
+                    gdf = gdf.set_crs("EPSG:4326")
+                gdf = gdf.to_crs(target_crs)
+            # Clip in the projected CRS — straight edges match the axes.
+            if not gdf.empty:
+                gdf = gpd.clip(gdf, clip_box)
+            return gdf
+        except Exception:
+            return gpd.GeoDataFrame()
+
+    # ── Helper: accumulate a layer from all files ─────────────────
+    def _collect(layer: str, geom_types: list[str] | None = None):
+        parts = []
+        for f in s57_paths:
+            gdf = _read_layer(f, layer, geom_types)
+            if not gdf.empty:
+                parts.append(gdf)
+        if parts:
+            return pd.concat(parts, ignore_index=True)
+        return gpd.GeoDataFrame()
+
+    # ── Collect all layers ────────────────────────────────────────
+    poly_t = ["Polygon", "MultiPolygon"]
+    line_t = ["LineString", "MultiLineString"]
+    point_t = ["Point", "MultiPoint"]
+
+    # ── Polygon layers (bottom) ───────────────────────────────────
+    dep_gdf = _collect("DEPARE", poly_t)     # Depth areas
+    fwy_gdf = _collect("FAIRWY", poly_t)     # Fairways
+    drg_gdf = _collect("DRGARE", poly_t)     # Dredged areas
+    swp_gdf = _collect("SWPARE", poly_t)     # Swept areas
+    res_gdf = _collect("RESARE", poly_t)     # Restricted areas
+    ctn_gdf = _collect("CTNARE", poly_t)     # Caution areas
+    ach_gdf = _collect("ACHARE", poly_t)     # Anchorage areas
+    mar_gdf = _collect("MARCUL", poly_t)     # Marine cultivation
+    tes_gdf = _collect("TESARE", poly_t)     # Territorial sea
+    lnd_gdf = _collect("LNDARE", poly_t)     # Land areas
+    bua_gdf = _collect("BUAARE", poly_t)     # Built-up areas
+    bui_gdf = _collect("BUISGL", poly_t)     # Buildings
+
+    # ── Line layers (middle) ──────────────────────────────────────
+    dpc_gdf = _collect("DEPCNT", line_t)     # Depth contours
+    slc_gdf = _collect("SLCONS", line_t)     # Shoreline constructions
+    coa_gdf = _collect("COALNE", line_t)     # Coastline
+    rwy_gdf = _collect("ROADWY", line_t)     # Roads
+    brg_gdf = _collect("BRIDGE", line_t)     # Bridges
+    nav_gdf = _collect("NAVLNE", line_t)     # Navigation lines
+    rec_gdf = _collect("RECTRC", line_t)     # Recommended tracks
+    fer_gdf = _collect("FERYRT", line_t)     # Ferry routes
+    cbs_gdf = _collect("CBLSUB", line_t)     # Submarine cables
+    cbo_gdf = _collect("CBLOHD", line_t)     # Overhead cables
+    pip_gdf = _collect("PIPSOL", line_t)     # Pipelines
+    elv_gdf = _collect("LNDELV", line_t)     # Land elevation contours
+    rdl_gdf = _collect("RDOCAL", line_t)     # Radio calling lines
+
+    # ── Point layers (top) ────────────────────────────────────────
+    snd_gdf = _collect("SOUNDG", point_t)    # Soundings (depth values)
+    uwr_gdf = _collect("UWTROC", point_t)    # Underwater rocks
+    obs_gdf = _collect("OBSTRN", point_t)    # Obstructions
+    wrk_gdf = _collect("WRECKS", point_t)    # Wrecks
+    # ── Fiona-based readers for layers with List-type attributes ──
+    import fiona as _fiona
+    _LITCHR_MAP = {1: "F", 2: "Fl", 3: "LFl", 4: "Q", 5: "VQ",
+                   6: "UQ", 7: "Oc", 8: "Iso", 9: "Mo"}
+    _COL_LETTER = {"1": "W", "3": "R", "4": "G", "6": "Y"}
+
+    def _fiona_points(layer):
+        """Read point features via fiona (handles List[str] COLOUR)."""
+        results = []
+        for fp in s57_paths:
+            try:
+                if layer not in _fiona.listlayers(str(fp)):
+                    continue
+                with _fiona.open(str(fp), layer=layer) as src:
+                    for feat in src:
+                        geom = feat.get("geometry")
+                        if not geom or geom["type"] != "Point":
+                            continue
+                        x, y = geom["coordinates"][:2]
+                        if not (W <= x <= E and S_ <= y <= N):
+                            continue
+                        p = feat["properties"]
+                        col_list = p.get("COLOUR") or []
+                        results.append({"x": x, "y": y, "props": p,
+                                        "colour": col_list})
+            except Exception:
+                pass
+        return results
+
+    # Lights (with sectors/characteristics)
+    lit_features = []
+    for item in _fiona_points("LIGHTS"):
+        p = item["props"]
+        col_code = item["colour"][0] if item["colour"] else "1"
+        lit_features.append({
+            "x": item["x"], "y": item["y"],
+            "sectr1": p.get("SECTR1"), "sectr2": p.get("SECTR2"),
+            "colour": col_code,
+            "valnmr": p.get("VALNMR"), "litchr": p.get("LITCHR"),
+            "sigper": p.get("SIGPER"), "siggrp": p.get("SIGGRP"),
+            "objnam": p.get("OBJNAM"),
+        })
+
+    # Buoys with colour (BOYLAT, BOYSPP, BOYCAR)
+    buoy_features = []
+    for layer in ("BOYLAT", "BOYSPP", "BOYCAR"):
+        for item in _fiona_points(layer):
+            col_code = item["colour"][0] if item["colour"] else "0"
+            buoy_features.append({
+                "x": item["x"], "y": item["y"],
+                "colour": col_code, "layer": layer,
+            })
+
+    # Place names (LNDRGN, SEAARE)
+    place_labels = []
+    for layer in ("LNDRGN", "SEAARE"):
+        for item in _fiona_points(layer):
+            nm = item["props"].get("OBJNAM", "")
+            if nm:
+                place_labels.append({
+                    "x": item["x"], "y": item["y"],
+                    "name": nm, "type": layer,
+                })
+    bcn_gdf = _collect("BCNSPP", point_t)    # Beacons
+    blt_gdf = _collect("BOYLAT", point_t)    # Lateral buoys
+    bsp_gdf = _collect("BOYSPP", point_t)    # Special purpose buoys
+    bca_gdf = _collect("BOYCAR", point_t)    # Cardinal buoys
+    top_gdf = _collect("TOPMAR", point_t)    # Topmarks
+    lmk_gdf = _collect("LNDMRK", point_t)   # Landmarks
+    lrg_gdf = _collect("LNDRGN", point_t)    # Land region
+    sea_gdf = _collect("SEAARE", point_t)    # Sea area names
+    sba_gdf = _collect("SBDARE", point_t)    # Seabed area
+    mor_gdf = _collect("MORFAC", point_t)    # Mooring facility
+    ber_gdf = _collect("BERTHS", point_t)    # Berths
+    hbr_gdf = _collect("HRBFAC", point_t)    # Harbour facility
+    sil_gdf = _collect("SILTNK", point_t)    # Silo/tank
+    pil_gdf = _collect("PILPNT", point_t)    # Pile/post
+    abr_gdf = _collect("ACHBRT", point_t)    # Anchor berth
+
+    # ── Reproject fiona-based point data (WGS84 → target CRS) ──
+    # Lights, buoys and place labels are read via fiona (not geopandas)
+    # to handle List-type attributes.  Their (x, y) coordinates are
+    # still in WGS84 and must be transformed to the projected CRS so
+    # they land on the correct pixel when plotted on the projected axes.
+    from pyproj import Transformer as _Transformer
+    _wgs_to_proj = _Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+    for lf in lit_features:
+        lf["x"], lf["y"] = _wgs_to_proj.transform(lf["x"], lf["y"])
+    for bf in buoy_features:
+        bf["x"], bf["y"] = _wgs_to_proj.transform(bf["x"], bf["y"])
+    for pl in place_labels:
+        pl["x"], pl["y"] = _wgs_to_proj.transform(pl["x"], pl["y"])
+
+    # ── Figure setup ──────────────────────────────────────────────
+    # Axes use projected bounds (pW, pS, pE, pN) so the pixel grid
+    # matches the Sentinel-2 RGB image exactly.  aspect="auto" lets
+    # matplotlib stretch the projected rectangle to fill img_w × img_h.
+    dpi = 200
+    fig_w = img_w / dpi
+    fig_h = img_h / dpi
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1])  # axes fills entire figure — no margins
+    ax.set_xlim(pW, pE)
+    ax.set_ylim(pS, pN)
+    ax.set_aspect("auto")
+    ax.axis("off")
+    fig.patch.set_facecolor(_S57_BG_COLOUR)
+    ax.set_facecolor(_S57_BG_COLOUR)
+
+    # ── Plot helpers ──────────────────────────────────────────────
+    def _plot_poly(gdf, colour, edgecolour="none", alpha=1.0, lw=0):
+        if gdf.empty:
+            return
+        gpd.GeoDataFrame(gdf, geometry="geometry").plot(
+            ax=ax, color=colour, edgecolor=edgecolour,
+            alpha=alpha, linewidth=lw,
+        )
+
+    def _plot_line(gdf, colour, lw=0.4, alpha=1.0, ls="-"):
+        if gdf.empty:
+            return
+        gpd.GeoDataFrame(gdf, geometry="geometry").plot(
+            ax=ax, color=colour, linewidth=lw, alpha=alpha, linestyle=ls,
+        )
+
+    def _plot_points(gdf, colour, marker="o", size=4, lw=0.4,
+                     alpha=0.9, zorder=10, edgecolor=None):
+        if gdf.empty:
+            return
+        xs = [g.x for g in gdf.geometry
+              if g and g.geom_type == "Point"]
+        ys = [g.y for g in gdf.geometry
+              if g and g.geom_type == "Point"]
+        if xs:
+            kw = dict(c=colour, s=size, marker=marker,
+                      linewidths=lw, zorder=zorder, alpha=alpha)
+            if edgecolor:
+                kw["edgecolors"] = edgecolor
+            ax.scatter(xs, ys, **kw)
+
+    # Load INT1 symbol markers
+    int1 = _int1_symbols()
+    ms = max(4, img_w / 100)  # base marker size (compact for clean chart look)
+
+    # ══════════════════════════════════════════════════════════════
+    # RENDER ORDER — bottom to top
+    # ══════════════════════════════════════════════════════════════
+
+    # ── 0. Fallback base layer (coarser ENC cells) ──────────────
+    # Render DEPARE + LNDARE + COALNE from fallback cells first so
+    # that gaps in the primary (harbour-scale) data are filled with
+    # coarser but complete coverage.
+    if _fallback_paths:
+        for fp in _fallback_paths:
+            _fb_dep = _read_layer(fp, "DEPARE", poly_t)
+            if not _fb_dep.empty:
+                _fb_dep = gpd.GeoDataFrame(_fb_dep, geometry="geometry")
+                _fb_dep["_colour"] = _fb_dep.apply(
+                    lambda r: _depth_colour(r.get("DRVAL1"), r.get("DRVAL2")),
+                    axis=1,
+                )
+                for colour in _fb_dep["_colour"].unique():
+                    subset = _fb_dep[_fb_dep["_colour"] == colour]
+                    subset.plot(ax=ax, color=colour, edgecolor="none")
+            _fb_lnd = _read_layer(fp, "LNDARE", poly_t)
+            if not _fb_lnd.empty:
+                _plot_poly(_fb_lnd, _S57_LAND_COLOUR)
+            _fb_coa = _read_layer(fp, "COALNE", line_t)
+            if not _fb_coa.empty:
+                gpd.GeoDataFrame(_fb_coa, geometry="geometry").plot(
+                    ax=ax, color="#000000", linewidth=0.15, alpha=0.5,
+                )
+
+    # ── 1. Depth areas (DEPARE) ───────────────────────────────────
+    if not dep_gdf.empty:
+        dep_gdf = gpd.GeoDataFrame(dep_gdf, geometry="geometry")
+        dep_gdf["_colour"] = dep_gdf.apply(
+            lambda r: _depth_colour(r.get("DRVAL1"), r.get("DRVAL2")),
+            axis=1,
+        )
+        for colour in dep_gdf["_colour"].unique():
+            subset = dep_gdf[dep_gdf["_colour"] == colour]
+            subset.plot(ax=ax, color=colour, edgecolor="none")
+
+    # ── 2. Swept areas (SWPARE) ───────────────────────────────────
+    _plot_poly(swp_gdf, "#D0E8F0", edgecolour="#90B8D0", alpha=0.4, lw=0.3)
+
+    # ── 3. Fairways (FAIRWY) ─────────────────────────────────────
+    _plot_poly(fwy_gdf, _S57_FAIRWAY_COLOUR, alpha=0.35,
+               edgecolour=_S57_FAIRWAY_COLOUR, lw=0.3)
+
+    # ── 4. Dredged areas (DRGARE) ────────────────────────────────
+    _plot_poly(drg_gdf, "#C5E0F0", edgecolour="#8BB8D9", alpha=0.5, lw=0.3)
+
+    # ── 5. Restricted areas (RESARE) ─────────────────────────────
+    _plot_poly(res_gdf, "none", edgecolour="#CC4444", alpha=0.5, lw=0.6)
+
+    # ── 6. Caution areas (CTNARE) ────────────────────────────────
+    _plot_poly(ctn_gdf, "#FFEE88", edgecolour="#CCAA00", alpha=0.15, lw=0.4)
+
+    # ── 7. Anchorage areas (ACHARE) ──────────────────────────────
+    _plot_poly(ach_gdf, "#E0D0F0", edgecolour="#9977BB", alpha=0.2, lw=0.4)
+
+    # ── 8. Marine cultivation (MARCUL) ───────────────────────────
+    _plot_poly(mar_gdf, "#A8D8A8", edgecolour="#66AA66", alpha=0.3, lw=0.4)
+
+    # ── 9. Territorial sea (TESARE) ──────────────────────────────
+    _plot_poly(tes_gdf, "none", edgecolour="#666699", alpha=0.3, lw=0.3)
+
+    # ── 10. Land (LNDARE) ────────────────────────────────────────
+    _plot_poly(lnd_gdf, _S57_LAND_COLOUR)
+
+    # ── 11. Built-up areas (BUAARE) ──────────────────────────────
+    _plot_poly(bua_gdf, "#E8D8B0", edgecolour="#B8A880", alpha=0.7, lw=0.2)
+
+    # ── 12. Buildings (BUISGL) ───────────────────────────────────
+    _plot_poly(bui_gdf, _S57_BUILDING_COLOUR, edgecolour="#8A7A5A", lw=0.2)
+
+    # ── 13. Land elevation contours (LNDELV) ─────────────────────
+    _plot_line(elv_gdf, "#C0A880", lw=0.2, alpha=0.4)
+
+    # ── 14. Depth contours (DEPCNT) ──────────────────────────────
+    _plot_line(dpc_gdf, _S57_DEPCNT_COLOUR, lw=0.25, alpha=0.6)
+
+    # ── 15. Submarine cables (CBLSUB) ────────────────────────────
+    _plot_line(cbs_gdf, "#CC44CC", lw=0.3, alpha=0.5, ls="--")
+
+    # ── 16. Overhead cables (CBLOHD) ─────────────────────────────
+    _plot_line(cbo_gdf, "#CC2222", lw=0.3, alpha=0.5, ls="--")
+
+    # ── 17. Pipelines (PIPSOL) ───────────────────────────────────
+    _plot_line(pip_gdf, "#44AA44", lw=0.3, alpha=0.5, ls="--")
+
+    # ── 18. Shoreline constructions (SLCONS) ─────────────────────
+    _plot_line(slc_gdf, _S57_SLCONS_COLOUR, lw=0.3)
+
+    # ── 19. Coastline (COALNE) ───────────────────────────────────
+    _plot_line(coa_gdf, _S57_COASTLINE_COLOUR, lw=0.25)
+
+    # ── 20. Roads (ROADWY) ───────────────────────────────────────
+    _plot_line(rwy_gdf, _S57_ROAD_COLOUR, lw=0.3, alpha=0.7)
+
+    # ── 21. Bridges (BRIDGE) ─────────────────────────────────────
+    _plot_line(brg_gdf, _S57_BRIDGE_COLOUR, lw=0.8)
+
+    # ── 22. Navigation lines (NAVLNE) ────────────────────────────
+    _plot_line(nav_gdf, _S57_NAVLNE_COLOUR, lw=0.4, alpha=0.6, ls="--")
+
+    # ── 23. Recommended tracks (RECTRC) ──────────────────────────
+    _plot_line(rec_gdf, "#228833", lw=0.5, alpha=0.6)
+
+    # ── 24. Ferry routes (FERYRT) ────────────────────────────────
+    _plot_line(fer_gdf, "#8844AA", lw=0.5, alpha=0.6, ls="-.")
+
+    # ── 25. Radio calling lines (RDOCAL) ─────────────────────────
+    _plot_line(rdl_gdf, "#996633", lw=0.3, alpha=0.4, ls=":")
+
+    # ── 26. Soundings — depth labels (SOUNDG) ────────────────────
+    if not snd_gdf.empty:
+        pts = []
+        for _, row in snd_gdf.iterrows():
+            geom = row.geometry
+            if geom is None:
+                continue
+            if geom.geom_type == "MultiPoint":
+                for pt in geom.geoms:
+                    pts.append(pt)
+            else:
+                pts.append(geom)
+        snd_fs = max(2.0, min(3.5, img_w / 200))
+        for pt in pts:
+            if pt.has_z:
+                depth = abs(pt.z)
+            else:
+                continue
+            depth_str = f"{depth:.1f}" if depth % 1 else f"{int(depth)}"
+            ax.text(pt.x, pt.y, depth_str,
+                    fontsize=snd_fs, color=_S57_SOUNDG_COLOUR,
+                    ha="center", va="center", zorder=16)
+
+    # ── 27. Underwater rocks (UWTROC) — INT1 K.14 cross ──────────
+    _plot_points(uwr_gdf, "#333333", marker="+", size=ms * 0.6,
+                 lw=0.4, alpha=0.7)
+
+    # ── 28. Seabed area type (SBDARE) ────────────────────────────
+    _plot_points(sba_gdf, "#8899AA", marker=".", size=ms * 0.3,
+                 alpha=0.3, zorder=5)
+
+    # ── 29. Obstructions (OBSTRN) — INT1 K.40 cross-in-circle ───
+    _plot_points(obs_gdf, _S57_OBSTRN_COLOUR, marker=int1["obstruction"],
+                 size=ms * 0.9, lw=0.3, alpha=0.8)
+
+    # ── 30. Wrecks (WRECKS) — INT1 K.20 hull outline ────────────
+    _plot_points(wrk_gdf, _S57_WRECKS_COLOUR, marker=int1["wreck"],
+                 size=ms * 1.0, lw=0.3, alpha=0.85)
+
+    # ── 31. Lights (LIGHTS) — sector arc outlines + symbol + labels ─
+    if lit_features:
+        from collections import defaultdict
+        light_groups = defaultdict(list)
+        for lf in lit_features:
+            key = (round(lf["x"], 1), round(lf["y"], 1))
+            light_groups[key].append(lf)
+
+        # Arc radius in projected metres.  Because we render in a
+        # metric CRS (SWEREF99 TM) the radius is simply a fraction of
+        # the north–south extent — no cos(lat) correction is needed
+        # (unlike WGS84 where longitude degrees are shorter than latitude).
+        sector_r = (pN - pS) * 0.035
+        sector_r_lg = (pN - pS) * 0.055
+
+        _SECTOR_LINE = {"3": "#CC0000", "4": "#006600", "1": "#888888", "6": "#CC8800"}
+
+        def _arc_points(cx, cy, r, brg1, brg2, n_pts=40):
+            """Return (xs, ys) for a circular arc in projected (metric) coords."""
+            if brg2 <= brg1:
+                brg2 += 360.0
+            xs, ys = [], []
+            for i in range(n_pts + 1):
+                brg = math.radians(brg1 + (brg2 - brg1) * i / n_pts)
+                xs.append(cx + r * math.sin(brg))
+                ys.append(cy + r * math.cos(brg))
+            return xs, ys
+
+        label_fs = max(3.0, min(5.0, img_w / 130))
+
+        for (lx, ly), feats in light_groups.items():
+            has_sectors = any(
+                f["sectr1"] is not None and f["sectr2"] is not None
+                for f in feats
+            )
+            if has_sectors:
+                # Draw arc outline per sector
+                for f in feats:
+                    if f["sectr1"] is None or f["sectr2"] is None:
+                        continue
+                    col_code = f["colour"]
+                    r = sector_r if not (f.get("valnmr") and f["valnmr"] >= 6) else sector_r_lg
+                    colour = _SECTOR_LINE.get(col_code, "#888888")
+                    xs, ys = _arc_points(lx, ly, r, f["sectr1"], f["sectr2"])
+                    ax.plot(xs, ys, color=colour, linewidth=0.8,
+                            alpha=0.85, zorder=14, solid_capstyle="round")
+                    # Tick lines at sector boundaries
+                    for bx, by in [(xs[0], ys[0]), (xs[-1], ys[-1])]:
+                        ax.plot([lx, bx], [ly, by], color=colour,
+                                linewidth=0.3, alpha=0.5, zorder=13)
+
+                # Light symbol at center
+                ax.scatter([lx], [ly], c="#000000", s=ms * 2.0,
+                           marker=int1["light"], zorder=16,
+                           edgecolors="none", linewidths=0)
+
+                # Light characteristic label
+                # Collect unique colours across all sectors
+                all_cols = sorted(set(
+                    _COL_LETTER.get(f["colour"], "") for f in feats
+                    if f["sectr1"] is not None
+                ))
+                col_str = "".join(all_cols)
+                f0 = feats[0]
+                chr_str = _LITCHR_MAP.get(f0.get("litchr"), "")
+                per_str = f"{f0['sigper']:.0f}s" if f0.get("sigper") else ""
+                rng_str = f"{f0['valnmr']:.0f}M" if f0.get("valnmr") else ""
+                nm = f0.get("objnam") or ""
+                parts = [p for p in [chr_str, col_str, per_str, rng_str] if p]
+                label = " ".join(parts)
+                if nm:
+                    # Name on one line, characteristic below
+                    ax.text(lx, ly - (pN - pS) * 0.018, nm,
+                            fontsize=label_fs, fontweight="bold",
+                            color="#000000", ha="center", va="top", zorder=17)
+                    ax.text(lx, ly - (pN - pS) * 0.035, label,
+                            fontsize=label_fs * 0.85,
+                            color="#000000", ha="center", va="top", zorder=17)
+                elif label:
+                    ax.text(lx, ly - (pN - pS) * 0.018, label,
+                            fontsize=label_fs * 0.85,
+                            color="#000000", ha="center", va="top", zorder=17)
+            else:
+                # All-round light — star symbol + label
+                f0 = feats[0]
+                col_code = f0.get("colour", "1")
+                ax.scatter([lx], [ly], c="#000000", s=ms * 1.5,
+                           marker=int1["light"], zorder=15,
+                           edgecolors="none", linewidths=0)
+                # Label: "name\nchr col rngM"
+                nm = f0.get("objnam") or ""
+                chr_str = _LITCHR_MAP.get(f0.get("litchr"), "")
+                col_l = _COL_LETTER.get(col_code, "")
+                rng = f"{f0['valnmr']:.0f}M" if f0.get("valnmr") else ""
+                parts = [p for p in [chr_str, col_l, rng] if p]
+                label = " ".join(parts)
+                if nm or label:
+                    txt = f"{nm}\n{label}" if nm and label else (nm or label)
+                    ax.text(lx, ly - (pN - pS) * 0.015, txt,
+                            fontsize=label_fs * 0.85,
+                            color="#000000", ha="center", va="top", zorder=17)
+
+    # ── 32. Beacons (BCNSPP) — INT1 Q.100 filled black ───────────
+    _plot_points(bcn_gdf, "#000000", marker=int1["beacon"],
+                 size=ms * 1.5, lw=0.3, alpha=0.9, zorder=14,
+                 edgecolor="#000000")
+
+    # ── 33–35. Buoys — colour-correct via fiona data ─────────────
+    _BUOY_COLOURS = {"3": "#CC0000", "4": "#00AA00", "6": "#DDAA00",
+                     "2": "#000000", "1": "#FFFFFF"}
+    _BUOY_MARKERS = {
+        "BOYLAT": {
+            "1": int1["buoy_can"],    # cat 1 = port = can
+            "2": int1["buoy_cone"],   # cat 2 = starboard = cone
+        },
+        "BOYSPP": int1["buoy_special"],
+        "BOYCAR": int1["buoy_cardinal"],
+    }
+    buoy_label_fs = max(2.5, min(4.0, img_w / 150))
+    for bf in buoy_features:
+        col_hex = _BUOY_COLOURS.get(bf["colour"], "#888888")
+        col_letter = _COL_LETTER.get(bf["colour"], "")
+        layer = bf["layer"]
+        if layer == "BOYLAT":
+            # Determine can vs cone based on colour (port=red=can, stbd=green=cone)
+            mkr = int1["buoy_can"] if bf["colour"] == "3" else int1["buoy_cone"]
+        elif layer == "BOYSPP":
+            mkr = int1["buoy_special"]
+        else:
+            mkr = int1["buoy_cardinal"]
+
+        edge = "#880000" if bf["colour"] == "3" else (
+               "#006600" if bf["colour"] == "4" else "#666600")
+        ax.scatter([bf["x"]], [bf["y"]], c=col_hex, s=ms * 1.0,
+                   marker=mkr, zorder=13, edgecolors=edge,
+                   linewidths=0.3, alpha=0.9)
+        # Colour letter label
+        if col_letter:
+            ax.text(bf["x"], bf["y"] - (pN - pS) * 0.008, col_letter,
+                    fontsize=buoy_label_fs, fontweight="bold",
+                    color=col_hex, ha="center", va="top", zorder=14)
+
+    # ── 36. Topmarks (TOPMAR) — INT1 Q.9 day mark ───────────────
+    _plot_points(top_gdf, "#DD4444", marker=int1["topmark"],
+                 size=ms * 0.7, lw=0.3, alpha=0.75, zorder=12)
+
+    # ── 37. Landmarks (LNDMRK) — INT1 E.10 tower/spire ──────────
+    _plot_points(lmk_gdf, "#885522", marker=int1["landmark"],
+                 size=ms * 0.8, lw=0.3, alpha=0.75, zorder=11)
+
+    # ── 38. Mooring facilities (MORFAC) — bollard symbol ─────────
+    _plot_points(mor_gdf, "#4466AA", marker=int1["mooring"],
+                 size=ms * 0.7, lw=0.3, alpha=0.75, zorder=11)
+
+    # ── 39. Harbour facilities (HRBFAC) — INT1 F.10 anchor ──────
+    _plot_points(hbr_gdf, "#664499", marker=int1["harbour"],
+                 size=ms * 1.0, lw=0.3, alpha=0.75, zorder=11)
+
+    # ── 40. Berths (BERTHS) ──────────────────────────────────────
+    _plot_points(ber_gdf, "#4488AA", marker="s", size=ms * 0.5,
+                 lw=0.2, alpha=0.6, zorder=11)
+
+    # ── 41. Silo/tank (SILTNK) ───────────────────────────────────
+    _plot_points(sil_gdf, "#998877", marker="o", size=ms * 0.4,
+                 lw=0.2, alpha=0.5, zorder=8)
+
+    # ── 42. Pile/post (PILPNT) ───────────────────────────────────
+    _plot_points(pil_gdf, "#666666", marker="|", size=ms * 0.5,
+                 lw=0.2, alpha=0.6, zorder=9)
+
+    # ── 43. Anchor berth (ACHBRT) ────────────────────────────────
+    _plot_points(abr_gdf, "#7755AA", marker="P", size=ms * 0.7,
+                 lw=0.2, alpha=0.6, zorder=10)
+
+    # ── 44. Place name labels (LNDRGN + SEAARE) — disabled ────────
+    # Names omitted to keep the chart clean at small sizes.
+
+    # ── Save ──────────────────────────────────────────────────────
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(
+        output_path, dpi=dpi, pad_inches=0,
+        facecolor=_S57_BG_COLOUR,
+    )
+    plt.close(fig)
+
+    # Resize to exact target pixel dimensions
+    img = Image.open(output_path)
+    if (img.width, img.height) != (img_w, img_h):
+        img = img.resize((img_w, img_h), Image.LANCZOS)
+        img.save(output_path)
+
+    return output_path
+
+
+def fetch_sjokort_data(
+    coords: dict,
+    email: str | None = None,
+    session: Any | None = None,
+    cookies: dict | None = None,
+    cache_dir: str | None = None,
+    max_retries: int = 20,
+    retry_delay: float = 30.0,
+    margin_m: int = SLU_GET_DEFAULT_MARGIN_M,
+    render: bool = False,
+    output_path: str | Path | None = None,
+    img_w: int = 324,
+    img_h: int = 573,
+    s57_dir: str | Path | None = None,
+    scale_prefix: str | None = None,
+) -> SjokortFetchResult:
+    """Fetch sjökort (nautical chart) data from SLU GET for a given bounding box.
+
+    The area is projected to SWEREF99 TM and snapped to the NMD 10m grid,
+    expanded by ``margin_m`` metres on each side (for cropping flexibility),
+    then split into tiles ≤ 2.5 km² for ordering. Each tile is submitted via
+    the SLU GET API, downloaded, and extracted. Duplicate ENC cells across
+    tiles are deduplicated automatically.
+
+    Optionally renders the S-57 data to a PNG image via ``render=True``.
+
+    **Authentication note:**
+    SLU GET (maps.slu.se) uses Shibboleth SSO with httpOnly cookies that
+    cannot be extracted from a browser via JavaScript. There are three
+    ways to supply authentication:
+
+    1. *Pre-extracted S-57 directory* — set ``s57_dir`` to a directory
+       containing .000 files. The order/download steps are skipped entirely.
+       This is the recommended approach when data has been downloaded via
+       a browser session manually or through automation.
+
+    2. *requests.Session with Shibboleth cookies* — pass a ``session``
+       obtained via Selenium/Playwright that has navigated through the
+       Shibboleth login flow, or manually copy cookies into a session.
+
+    3. *Cookie dict* — pass ``cookies`` as a dict; a new session is created.
+
+    S-57 files are cached locally by NMD-aligned (padded) bounding box.
+
+    Args:
+        coords: WGS84 bounding box dict with keys: west, south, east, north.
+        email: E-mail address registered with SLU GET. Required unless
+               ``s57_dir`` is provided or cache exists.
+        session: Optional ``requests.Session`` with Shibboleth cookies.
+                 If not provided, one is created from ``cookies``.
+        cookies: Optional dict of Shibboleth cookies (used if session is None).
+        cache_dir: Directory for the sjökort cache. Defaults to .sjokort_cache/.
+        max_retries: Max download poll attempts per tile (default 20).
+        retry_delay: Seconds between download retries (default 30).
+        margin_m: Margin in metres to expand the bbox before ordering
+                  (default 1000). Set to 0 to order exactly the input bbox.
+        render: If True, render the S-57 data to a PNG at ``output_path``.
+        output_path: Destination for the rendered PNG. Required when
+                     ``render=True``. Accepts str or Path.
+        img_w: Rendered image width in pixels (default 324).
+        img_h: Rendered image height in pixels (default 573).
+        s57_dir: Path to a directory of pre-extracted S-57 (.000) files.
+                 When set, the order and download steps are skipped — the
+                 function only deduplicates and optionally renders.
+        scale_prefix: Optional ENC scale prefix filter (e.g. "SE5") —
+                      only ENC cells whose filename starts with this prefix
+                      are used for rendering. Useful to avoid mixing scales.
+
+    Returns:
+        SjokortFetchResult with S-57 file paths, tile metadata, and
+        optionally the path to the rendered PNG.
+
+    Raises:
+        FetchError: If ordering, downloading, or rendering fails.
+        ValueError: If ``render=True`` but ``output_path`` is not set,
+                    or if no ``email`` / ``s57_dir`` / cache is available.
+    """
+    import logging
+    import requests as req_lib
+
+    log = logging.getLogger(__name__)
+
+    if render and output_path is None:
+        raise ValueError("output_path is required when render=True")
+    if output_path is not None:
+        output_path = Path(output_path)
+
+    # Project and snap to NMD grid
+    projected_coords = _to_nmd_grid(coords)
+    log.info(
+        "Sjökort bbox SWEREF99 TM: W=%d S=%d E=%d N=%d",
+        projected_coords["west"],
+        projected_coords["south"],
+        projected_coords["east"],
+        projected_coords["north"],
+    )
+
+    # Expand by margin for ordering (padded bbox)
+    if margin_m > 0:
+        padded_coords = _pad_sweref_bbox(projected_coords, margin_m)
+        log.info(
+            "Sjökort padded bbox (+%dm): W=%d S=%d E=%d N=%d",
+            margin_m,
+            padded_coords["west"],
+            padded_coords["south"],
+            padded_coords["east"],
+            padded_coords["north"],
+        )
+    else:
+        padded_coords = projected_coords
+
+    resolved_cache = Path(cache_dir or SJOKORT_CACHE_DIR)
+
+    # ── Mode 1: Pre-extracted S-57 directory ──────────────────────────
+    if s57_dir is not None:
+        s57_dir = Path(s57_dir)
+        raw_files = sorted(s57_dir.glob("**/*.000"))
+        if not raw_files:
+            raise FetchError(f"No S-57 (.000) files found in {s57_dir}")
+        unique_files = _deduplicate_s57(raw_files)
+        log.info(
+            "Sjökort from s57_dir: %d raw → %d unique S-57 files",
+            len(raw_files), len(unique_files),
+        )
+        result = SjokortFetchResult(
+            s57_paths=unique_files,
+            tiles=[],
+            bbox_wgs84=coords,
+            bbox_sweref=projected_coords,
+            bbox_sweref_padded=padded_coords if margin_m > 0 else None,
+            from_cache=False,
+        )
+        if render:
+            # Auto-select the most detailed ENC scale that covers the AOI
+            if scale_prefix is None:
+                scale_prefix = _best_scale_prefix(unique_files, coords)
+            result.rendered_png = render_sjokort_png(
+                unique_files, coords, output_path, img_w, img_h,
+                scale_prefix=scale_prefix,
+            )
+            log.info("Sjökort rendered to %s", result.rendered_png)
+        return result
+
+    # ── Mode 2: Cache lookup (keyed on padded bbox) ───────────────────
+    cache_key = _sjokort_cache_key(padded_coords)
+    cache_s57_dir = resolved_cache / cache_key
+
+    if cache_s57_dir.exists():
+        cached_files = sorted(cache_s57_dir.glob("*.000"))
+        if cached_files:
+            unique_files = _deduplicate_s57(cached_files)
+            log.info("Sjökort loaded from cache: %d S-57 files", len(unique_files))
+            result = SjokortFetchResult(
+                s57_paths=unique_files,
+                tiles=[],
+                bbox_wgs84=coords,
+                bbox_sweref=projected_coords,
+                bbox_sweref_padded=padded_coords if margin_m > 0 else None,
+                from_cache=True,
+            )
+            if render:
+                # Auto-select the most detailed ENC scale that covers the AOI
+                if scale_prefix is None:
+                    scale_prefix = _best_scale_prefix(unique_files, coords)
+                result.rendered_png = render_sjokort_png(
+                    unique_files, coords, output_path, img_w, img_h,
+                    scale_prefix=scale_prefix,
+                )
+                log.info("Sjökort rendered to %s", result.rendered_png)
+            return result
+
+    # ── Mode 3: Full order + download via SLU GET ─────────────────────
+    if email is None:
+        raise ValueError(
+            "email is required for SLU GET ordering. Provide email, "
+            "or use s57_dir= for pre-downloaded data, "
+            "or ensure data is cached."
+        )
+
+    # Create session if needed
+    if session is None:
+        session = req_lib.Session()
+        if cookies:
+            session.cookies.update(cookies)
+
+    # Tile the padded area
+    tiles = _tile_sjokort_bbox(padded_coords)
+    log.info(
+        "Sjökort area %.2f km² → %d tile(s)",
+        sum(t.area_m2 for t in tiles) / 1e6,
+        len(tiles),
+    )
+
+    # Submit orders
+    for i, tile in enumerate(tiles):
+        _order_sjokort_tile(tile, email, session)
+        log.info(
+            "  Tile %d/%d ordered: UUID=%s (%.2f km²)",
+            i + 1, len(tiles), tile.uuid, tile.area_m2 / 1e6,
+        )
+
+    # Download and extract
+    cache_s57_dir.mkdir(parents=True, exist_ok=True)
+    zip_dir = resolved_cache / "zips"
+    zip_dir.mkdir(parents=True, exist_ok=True)
+
+    all_s57: list[Path] = []
+    for i, tile in enumerate(tiles):
+        log.info("  Downloading tile %d/%d (UUID=%s)...", i + 1, len(tiles), tile.uuid)
+        zip_path = _download_sjokort_zip(
+            tile.uuid, zip_dir, session=session,
+            max_retries=max_retries, retry_delay=retry_delay,
+        )
+        s57_files = _extract_s57_from_zip(zip_path, cache_s57_dir)
+        all_s57.extend(s57_files)
+        log.info("  Extracted %d S-57 files from tile %d", len(s57_files), i + 1)
+
+    # Deduplicate across tiles
+    unique_files = _deduplicate_s57(all_s57)
+    log.info(
+        "Sjökort fetch complete: %d raw → %d unique S-57 files",
+        len(all_s57), len(unique_files),
+    )
+
+    result = SjokortFetchResult(
+        s57_paths=unique_files,
+        tiles=tiles,
+        bbox_wgs84=coords,
+        bbox_sweref=projected_coords,
+        bbox_sweref_padded=padded_coords if margin_m > 0 else None,
+        from_cache=False,
+    )
+
+    if render:
+        # Auto-select the most detailed ENC scale that covers the AOI
+        if scale_prefix is None:
+            scale_prefix = _best_scale_prefix(unique_files, coords)
+        result.rendered_png = render_sjokort_png(
+            unique_files, coords, output_path, img_w, img_h,
+            scale_prefix=scale_prefix,
+        )
+        log.info("Sjökort rendered to %s", result.rendered_png)
+
+    return result

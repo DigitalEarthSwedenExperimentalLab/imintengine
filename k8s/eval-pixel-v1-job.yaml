@@ -1,0 +1,102 @@
+---
+# Job: eval-pixel-v1 — evaluate best_model.pt with mIoU + per-class metrics
+#
+# Runs train_pixel.py --evaluate-only against the current best checkpoint.
+# Outputs mIoU, mAcc, OA, and a per-class IoU / Acc table.
+#
+# Requires: training-checkpoints PVC with best_model.pt
+#
+# Apply after refetch-missing + build-labels complete (tiles need labels):
+#   kubectl apply -f k8s/eval-pixel-v1-job.yaml
+#   kubectl logs job/eval-pixel-v1 -n prithvi-training-default -f
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-pixel-v1
+  namespace: prithvi-training-default
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600    # 1h — eval on ~8k tiles takes ~20-30 min
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        accelerator: nvidia-h100
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: eval
+          image: nvcr.io/nvidia/pytorch:24.01-py3
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              export PYTHONUNBUFFERED=1
+              echo "=== Pixel Classifier Evaluation (mIoU) ==="
+              echo "Started: $(date)"
+
+              # ── Copy tiles to local NVMe scratch ──────────────────────────
+              SCRATCH=/scratch/unified_v2
+              mkdir -p $SCRATCH
+              echo "Copying tiles to NVMe scratch …"
+              time cp /data/unified_v2/*.npz $SCRATCH/ 2>/dev/null || true
+              N=$(ls $SCRATCH/*.npz 2>/dev/null | wc -l)
+              echo "Tiles on scratch: $N"
+
+              # ── Clone repo ────────────────────────────────────────────────
+              cd /workspace
+              git clone --depth 1 https://github.com/TobiasEdman/ImintEngine.git imintengine
+              cd imintengine
+              pip install --quiet --no-cache-dir \
+                timm numpy Pillow scikit-learn scipy rasterio geopandas \
+                shapely pyproj huggingface_hub
+              pip install -e . --no-deps -q 2>/dev/null || true
+
+              # ── Evaluate ──────────────────────────────────────────────────
+              echo ""
+              python scripts/train_pixel.py \
+                --data-dir  $SCRATCH \
+                --checkpoint-dir /checkpoints/pixel_v1 \
+                --checkpoint     /checkpoints/pixel_v1/best_model.pt \
+                --evaluate-only \
+                --context-px 32 \
+                --use-frame-2016 \
+                --use-aux \
+                --num-workers 4
+
+              echo ""
+              echo "=== Done: $(date) ==="
+
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "64Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: training-data
+              mountPath: /data
+              readOnly: true
+            - name: training-checkpoints
+              mountPath: /checkpoints
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: training-data-cephfs
+        - name: training-checkpoints
+          persistentVolumeClaim:
+            claimName: training-checkpoints
+            readOnly: true
+        - name: dshm
+          emptyDir:
+            medium: Memory

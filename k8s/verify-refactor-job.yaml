@@ -1,0 +1,211 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-refactor
+  namespace: prithvi-training-default
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: python:3.11-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              export PYTHONUNBUFFERED=1
+              echo "=== Verify TileConfig refactor end-to-end ==="
+              apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+              pip install --quiet --no-cache-dir numpy scipy rasterio requests pyproj pyyaml Pillow httpx matplotlib
+
+              mkdir -p /workspace && cd /workspace
+              git clone --depth 1 https://github.com/TobiasEdman/ImintEngine.git imintengine
+              cd /workspace/imintengine
+              pip install --no-cache-dir -e . --no-deps 2>/dev/null || true
+
+              mkdir -p /tmp/verify_256 /tmp/verify_512
+
+              # Known forested tile in Mid-Sweden (Västerbotten)
+              CENTER_E=641280
+              CENTER_N=7201280
+
+              # 1. Fetch one tile at 256 px via the refactored code path
+              echo ""
+              echo "=== Fetching tile_${CENTER_E}_${CENTER_N} at 256 px ==="
+              python3 - <<PYEOF
+              from imint.training.tile_config import TileConfig
+              from imint.data.cdse_s2 import fetch_s2_scene
+              import numpy as np, os
+
+              tile = TileConfig(size_px=256)
+              bbox = tile.bbox_from_center($CENTER_E, $CENTER_N)
+              tile.assert_bbox_matches(bbox)
+              print(f"  tile={tile}  bbox={bbox}")
+
+              # Also test the wrong-bbox catches (must raise)
+              stale = {"west": 100000, "east": 102560, "south": 6500000, "north": 6502560}
+              try:
+                  fetch_s2_scene(stale["west"], stale["south"], stale["east"], stale["north"],
+                                 date="2024-06-15", size_px=512)
+                  print("  ✗ ASSERTION DID NOT FIRE — BUG")
+                  os._exit(2)
+              except ValueError as e:
+                  if "bbox/size_px mismatch" in str(e):
+                      print(f"  ✓ assertion fires correctly on stale bbox")
+                  else:
+                      raise
+
+              # Try many summer dates with ALL cloud filters disabled
+              result = None
+              used_date = None
+              for date in ["2024-07-01", "2024-06-15", "2023-07-10", "2023-06-20",
+                           "2022-07-15", "2022-06-20", "2021-07-10", "2020-07-10"]:
+                  try:
+                      result = fetch_s2_scene(
+                          bbox["west"], bbox["south"], bbox["east"], bbox["north"],
+                          date=date, size_px=256,
+                          cloud_threshold=1.0, haze_threshold=1.0,
+                          nodata_threshold=None,  # disable all gates
+                      )
+                      if result is not None:
+                          used_date = date
+                          print(f"  ✓ 256: fetched date={date}")
+                          break
+                      print(f"  - 256: date={date} returned None")
+                  except Exception as e:
+                      print(f"  ! 256: date={date} err: {e}")
+              if result is None:
+                  print("  ✗ 256: no scene from any date")
+                  import os; os._exit(3)
+              date = used_date
+              spectral, _scl, cloud = result
+              print(f"  ✓ 256: spectral shape={spectral.shape} cloud={cloud:.0%}")
+              assert spectral.shape == (6, 256, 256), f"wrong 256 shape: {spectral.shape}"
+              np.save("/tmp/verify_256/spectral.npy", spectral)
+              np.save("/tmp/verify_256/date.npy", np.array(date))
+              PYEOF
+
+              # 2. Fetch same tile at 512 px
+              echo ""
+              echo "=== Fetching tile_${CENTER_E}_${CENTER_N} at 512 px ==="
+              python3 - <<PYEOF
+              from imint.training.tile_config import TileConfig
+              from imint.data.cdse_s2 import fetch_s2_scene
+              import numpy as np
+
+              tile = TileConfig(size_px=512)
+              bbox = tile.bbox_from_center($CENTER_E, $CENTER_N)
+              tile.assert_bbox_matches(bbox)
+              print(f"  tile={tile}  bbox={bbox}")
+
+              # Use the date that worked for 256 to get a matched comparison
+              import numpy as np
+              date = str(np.load("/tmp/verify_256/date.npy"))
+              print(f"  matching 256 date: {date}")
+              result = fetch_s2_scene(
+                  bbox["west"], bbox["south"], bbox["east"], bbox["north"],
+                  date=date, size_px=512,
+                  cloud_threshold=1.0, haze_threshold=1.0,
+                  nodata_threshold=None,
+              )
+              if result is None:
+                  print(f"  ✗ 512: fetch for matched date {date} failed")
+                  import os; os._exit(3)
+              spectral, _scl, cloud = result
+              print(f"  ✓ 512: spectral shape={spectral.shape} cloud={cloud:.0%}")
+              assert spectral.shape == (6, 512, 512), f"wrong 512 shape: {spectral.shape}"
+              np.save("/tmp/verify_512/spectral.npy", spectral)
+              PYEOF
+
+              # 3. Compare — 256-downsampled-from-512 should closely match 256 fetch
+              echo ""
+              echo "=== Quality check: HF content ratio (256 vs 512-downsampled) ==="
+              python3 - <<PYEOF
+              import numpy as np
+              from scipy.ndimage import laplace
+
+              s256 = np.load("/tmp/verify_256/spectral.npy")  # (6, 256, 256)
+              s512 = np.load("/tmp/verify_512/spectral.npy")  # (6, 512, 512)
+
+              # Downsample 512 by 2× using simple mean pool → compare to 256
+              s512_ds = s512.reshape(6, 256, 2, 256, 2).mean(axis=(2, 4))
+
+              # HF content: Laplacian absolute mean on B02 (blue band)
+              hf_256 = np.abs(laplace(s256[0])).mean()
+              hf_512 = np.abs(laplace(s512[0])).mean()
+              hf_512_ds = np.abs(laplace(s512_ds[0])).mean()
+
+              print(f"  256 fetched  (native):     HF={hf_256:.5f}")
+              print(f"  512 fetched  (native):     HF={hf_512:.5f}")
+              print(f"  512 → downsampled to 256:  HF={hf_512_ds:.5f}")
+              print()
+              # Native 256 should have comparable HF to 512-downsampled (both ~10m GSD).
+              # If 256 was upsampled from lower, its HF would be MUCH lower.
+              if hf_256 < hf_512_ds * 0.5:
+                  print(f"  ✗ 256 fetch looks oversampled (HF much lower than downsampled-512)")
+              else:
+                  print(f"  ✓ 256 fetch HF consistent with downsampled 512 (both at true 10m)")
+
+              # Native 512 HF should be about 2× native 256 (higher resolution = more detail)
+              ratio = hf_512 / max(hf_256, 1e-9)
+              print(f"  512/256 HF ratio: {ratio:.2f}  (expect >1.5 for true 10m both)")
+              if ratio < 1.3:
+                  print(f"  ✗ 512 fetch doesn't look any sharper than 256 — possibly upsampled")
+              else:
+                  print(f"  ✓ 512 fetch captures more spatial detail than 256 as expected")
+              PYEOF
+
+              # Save images to PVC so we can inspect them
+              echo ""
+              echo "=== Writing RGB previews to /data/unified_v2_512/.verify_refactor ==="
+              python3 - <<PYEOF2
+              import numpy as np
+              from PIL import Image
+              import os
+              out_dir = "/data/unified_v2_512/.verify_refactor"
+              os.makedirs(out_dir, exist_ok=True)
+
+              for (sz, path) in [(256, "/tmp/verify_256/spectral.npy"),
+                                 (512, "/tmp/verify_512/spectral.npy")]:
+                  s = np.load(path)
+                  print(f"  {sz}: min={s.min():.4f} max={s.max():.4f} mean={s.mean():.4f}")
+                  for bi, name in enumerate(["B02","B03","B04","B8A","B11","B12"]):
+                      print(f"    {name}: min={s[bi].min():.4f} max={s[bi].max():.4f} mean={s[bi].mean():.4f}")
+                  rgb = np.stack([s[2], s[1], s[0]], axis=-1)
+                  lo, hi = np.percentile(rgb, [2, 98])
+                  rgb = np.clip((rgb - lo) / max(hi - lo, 1e-6), 0, 1)
+                  img = (rgb * 255).astype(np.uint8)
+                  Image.fromarray(img).save(f"{out_dir}/tile_{sz}px.png")
+                  print(f"  wrote {out_dir}/tile_{sz}px.png")
+              PYEOF2
+
+              echo ""
+              echo "=== Verify job done ==="
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: CDSE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cdse-credentials
+                  key: client_id
+            - name: CDSE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cdse-credentials
+                  key: client_secret
+          resources:
+            requests: {cpu: "2", memory: "4Gi"}
+            limits:   {cpu: "2", memory: "4Gi"}
+          volumeMounts:
+            - name: training-data
+              mountPath: /data
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: training-data-cephfs

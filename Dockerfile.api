@@ -1,0 +1,58 @@
+# Dockerfile for the ImintEngine HTTP API (W4.1).
+#
+# Reuses the multi-stage build pattern from the main Dockerfile but:
+#  - CMD runs one uvicorn worker with ASGI lifespan enabled
+#  - Exposes port 8000
+#  - No ColonyOS executor in the image (smaller surface)
+#
+# Build:    docker build -f Dockerfile.api -t imint-engine-api:v0.1.0 .
+# Export IMINT_API_MAX_PIXELS as an operator-validated positive integer first.
+# See imint/api/v1/README.md for calibration and resource-limit caveats.
+# Run:      docker run --rm -p 127.0.0.1:8000:8000 -e IMINT_API_MAX_PIXELS imint-engine-api:v0.1.0
+# Health:   curl http://localhost:8000/v1/health
+
+# Stage 1: Build native wheels (rasterio/GDAL/shapely/numpy)
+FROM python:3.11-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgdal-dev \
+    g++ \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /wheels
+COPY pyproject.toml README.md LICENSE LICENSE-DATA NOTICE THIRD_PARTY_LICENSES.md ./
+COPY imint/ imint/
+RUN pip wheel --no-cache-dir --wheel-dir=/wheels --find-links=/wheels ".[api]"
+
+# Stage 2: Runtime
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgdal36 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /wheels /wheels
+COPY pyproject.toml README.md LICENSE LICENSE-DATA NOTICE THIRD_PARTY_LICENSES.md ./
+COPY imint/ imint/
+RUN pip install --no-cache-dir --no-index --find-links=/wheels \
+    "imint-engine[api]==0.2.0" \
+    && rm -rf /wheels
+
+# Application code
+COPY imint/ imint/
+COPY config/ config/
+
+# Production env defaults — override via -e or K8s env block
+ENV PYTHONUNBUFFERED=1 \
+    PORT=8000
+
+EXPOSE 8000
+
+# Health check uses /v1/health (added by the API itself).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen(f'http://localhost:{__import__(\"os\").environ.get(\"PORT\", \"8000\")}/v1/health', timeout=3).getcode() == 200 else 1)"
+
+CMD ["sh", "-c", "exec uvicorn imint.api.v1:app --host 0.0.0.0 --port ${PORT} --workers 1 --lifespan on"]

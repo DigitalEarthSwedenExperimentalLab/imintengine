@@ -1,0 +1,721 @@
+# Training dashboard server
+#
+# Serves dashboards/unified_training_dashboard.html with live
+# training_log.json from both 300M (256) and 600M (512) runs.
+#
+# Pinned to the H100 node where the training pod runs so the
+# RWO checkpoints PVC can be mounted alongside the trainer.
+# (RWO = ReadWriteOnce per NODE — multiple pods on the same node
+# can mount it simultaneously.)
+#
+# Access:
+#   - From inside cluster:  http://training-dashboard:8080/
+#   - From ICE network:     http://<node-ip>:30808/
+#     (NodePort 30808; node IPs live on 10.10.104.x)
+#   - From your laptop via kubectl: kubectl -n prithvi-training-default \
+#       port-forward svc/training-dashboard 8080:8080
+#       then open http://localhost:8080/
+#   - PUBLIC: the Ingress below (training-dashboard.icedc.se, a public
+#     address, no authentication). Anything a GET returns is published.
+#     2026-10-27: the server listed /cephfs/distill and returned per-plot
+#     NFI feature parquets (plot IDs and coordinates); the Deployment was
+#     scaled to 0 and serve.py now serves bodies only from an allowlist.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: training-dashboard
+  namespace: prithvi-training-default
+  labels:
+    app: training-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: training-dashboard
+  template:
+    metadata:
+      labels:
+        app: training-dashboard
+    spec:
+      # Soft-pin to the same node as the currently-active training pod
+      # so the RWO checkpoints PVC remounts cleanly. If that node has
+      # no capacity, the scheduler may pick another H100 node, in which
+      # case the pod will Pending on Multi-Attach until the trainer
+      # finishes — acceptable trade-off for a dashboard.
+      # Hard-pin to p02r08srv01 because the training-data PVC is RWO
+      # and currently attached there by the 600M training pod. A
+      # preferred (soft) affinity could land us on a different H100
+      # node and stick on Multi-Attach. When 600M finishes and the PVC
+      # detaches, this constraint becomes purely informational; future
+      # training runs will need a similar colocation.
+      nodeSelector:
+        kubernetes.io/hostname: p02r08srv01
+      containers:
+        - name: server
+          image: python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              export PYTHONUNBUFFERED=1
+              echo "=== training dashboard server ==="
+              apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+
+              echo "Cloning ImintEngine for dashboard HTML..."
+              mkdir -p /workspace && cd /workspace
+              # Pinned to the benchmark branch — the same branch every
+              # in-cluster job clones. The default branch does not carry
+              # the ladder dashboard.
+              git clone --depth 1 \
+                --branch main \
+                https://github.com/TobiasEdman/ImintEngine.git imintengine
+
+              echo "Composing /www tree..."
+              mkdir -p /www/300m /www/600m
+              # Each run subdir gets the dashboard HTML + a symlink to
+              # its live training_log.json. The dashboard polls
+              # ./training_log.json (relative) so this works as-is.
+              DASH=/workspace/imintengine/dashboards/unified_training_dashboard.html
+              cp "$DASH" /www/300m/index.html
+              cp "$DASH" /www/600m/index.html
+              ln -sf /checkpoints/prithvi_300m_256/training_log.json /www/300m/training_log.json
+              ln -sf /checkpoints/prithvi_600m_512/training_log.json /www/600m/training_log.json
+
+              # /compare tab — symlinks the inference-comparison output
+              # dir produced by k8s/inference-compare-300m-vs-600m.yaml.
+              # If the dir doesn't exist yet (no inference run done),
+              # the link is dangling and /compare/ returns 404 until
+              # the inference job lands its index.html + prediction JSONs.
+              ln -sfn /checkpoints/compare /www/compare
+
+              # /ladder — the label-source ladder matrix (6 backbones x 4
+              # rungs) + head-to-head. Reads every cell's live
+              # training_log.json through one symlink to the ladder
+              # checkpoint root on cephfs (RWX, so no node-pin needed);
+              # cells whose run has not started 404 and render as
+              # "not started". docs/experiments/label_source_ladder.md
+              mkdir -p /www/ladder
+              cp /workspace/imintengine/dashboards/ladder_dashboard.html \
+                 /www/ladder/index.html
+              ln -sfn /cephfs/checkpoints/ladder /www/ladder/data
+              # Distill-stage outputs: the ROOT, not just heads/ — the
+              # stage row probes <model>_r2/_GATE_OK (queue-unlock marker)
+              # and heads/*.parquet with HEAD requests, and the panel
+              # reads heads/*_distillability.json. Dangling until the
+              # first distill job runs — cells render "—"/waiting.
+              ln -sfn /cephfs/distill /www/ladder/distill
+              # Inference matrix: PNGs + matrix.json written by the
+              # ladder-inference-matrix job. Dangling until its first run —
+              # the panel renders an awaiting-state.
+              ln -sfn /cephfs/ladder_inference /www/ladder/inference
+              # Field truth: NFI and LUCAS standings plus the same-plots
+              # comparison against NMD2023/NMD2018, written by the
+              # ft-<model>-r<rung>, ladder-fieldtruth-standings and
+              # nmd-sameplots-compare jobs. Dangling until those run — the
+              # panel renders an awaiting-state rather than an error.
+              ln -sfn /cephfs/ladder_eval /www/ladder/fieldtruth
+              # Every tree above also holds files that must never be
+              # served (per-plot NFI parquets with plot coordinates,
+              # checkpoints): serve.py's Handler allowlist decides what a
+              # GET may return. The frozen-set NFI inference directory is
+              # deliberately NOT linked; /ladder/nfi_inference.json is
+              # computed from its metadata files instead.
+
+              # Patch 1: null-safe tile-count cells (avoids TypeError when
+              # train_tiles/val_tiles missing from the new schema).
+              # Patch 2: swap CLASS_NAMES + CLASS_COLORS from the dashboard's
+              # old 20-class schema to the real v5 23-class schema. The
+              # original arrays caused: (a) "Top Confused Pairs" mis-labeling
+              # everything from index 15 onwards — e.g. "hygge → korn" was
+              # really `trindsäd → korn`, and "20 → vete" was `råg → vete`;
+              # (b) "Per-class IoU" bars showing wrong colors for slåttervall/
+              # bete/potatis/sockerbetor/trindsäd/råg/majs/hygge.
+              for d in /www/300m /www/600m; do
+                sed -i \
+                  -e "s|data.train_tiles.toLocaleString();|(data.train_tiles ? data.train_tiles.toLocaleString() : '—');|" \
+                  -e "s|data.val_tiles.toLocaleString();|(data.val_tiles ? data.val_tiles.toLocaleString() : '—');|" \
+                  "$d/index.html"
+              done
+
+              # IM-005: server-side dashboard patches (CLASS_NAMES + CLASS_COLORS
+              # + bakgrund-filter) were retired here once PR #13 merged to main.
+              # `dashboards/unified_training_dashboard.html` in the cloned repo
+              # now ships the v5 23-class schema and the bakgrund-filter
+              # natively, so the patches were redundant — and the bakgrund-filter
+              # regex actively crash-looped the pod after merge because the
+              # pre-patched code it expected was gone. Only the sed null-safe
+              # train_tiles wrapper above (IM-003) remains as a server-side
+              # patch until that fix also lands in repo.
+
+              # Top-level wrapper: tabbed UI, one tab per model.
+              # Each tab is an iframe pointing at /<slug>/ which serves
+              # the dashboard + that model's training_log.json. Adding a
+              # new model later = append one entry to the TABS array
+              # (and create /www/<slug>/ with HTML + log symlink earlier
+              # in this startup script).
+              cat > /www/index.html <<'HTML'
+              <!doctype html>
+              <html lang="en">
+              <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>ImintEngine — Ensemble Training</title>
+                <style>
+                  *{margin:0;padding:0;box-sizing:border-box}
+                  html,body{height:100%;background:#0b0e17;color:#d8dae5;
+                    font-family:-apple-system,Segoe UI,Arial,sans-serif}
+                  body{display:flex;flex-direction:column}
+                  .topbar{display:flex;align-items:center;
+                    background:linear-gradient(135deg,#111827,#1e293b);
+                    border-bottom:1px solid #1e293b;padding:0 20px;
+                    height:52px;flex:0 0 52px;gap:20px}
+                  .topbar h1{font-size:14px;font-weight:600;color:#f1f5f9;
+                    letter-spacing:.02em;white-space:nowrap}
+                  .tabs{display:flex;gap:2px;height:100%;align-items:stretch}
+                  .tab{display:flex;align-items:center;gap:8px;
+                    padding:0 18px;cursor:pointer;
+                    background:transparent;border:0;border-bottom:2px solid transparent;
+                    color:#94a3b8;font-size:13px;font-family:inherit;
+                    transition:color .15s,border-color .15s}
+                  .tab:hover{color:#d8dae5}
+                  .tab.active{color:#f1f5f9;border-bottom-color:#3b82f6}
+                  .tab .badge{font-size:10px;padding:2px 7px;border-radius:10px;
+                    background:#0b0e17;border:1px solid #374151;color:#94a3b8;
+                    font-weight:600;letter-spacing:.04em}
+                  .tab.active .badge.live{background:#16a34a22;border-color:#16a34a;color:#86efac}
+                  .tab.active .badge.done{background:#374151;border-color:#475569;color:#cbd5e1}
+                  .tab.active .badge.pending{background:#1e293b;border-color:#475569;color:#94a3b8}
+                  .tab.active .badge.info{background:#1e3a8a22;border-color:#3b82f6;color:#93c5fd}
+                  .meta{margin-left:auto;font-size:11px;color:#64748b}
+                  .frames{position:relative;flex:1;min-height:0}
+                  iframe{position:absolute;inset:0;width:100%;height:100%;
+                    border:0;background:#0b0e17;
+                    visibility:hidden}
+                  iframe.active{visibility:visible}
+                </style>
+              </head>
+              <body>
+                <div class="topbar">
+                  <h1>ImintEngine · Ensemble Training</h1>
+                  <div class="tabs" id="tabs"></div>
+                  <div class="meta" id="meta">live polling · 30s</div>
+                </div>
+                <div class="frames" id="frames"></div>
+                <script>
+                  // Source of truth for which models appear as tabs.
+                  // To add a new model later: append an object here and
+                  // ensure /www/<slug>/ exists on the server side.
+                  const TABS = [
+                    {slug:"600m", label:"Prithvi 600M · 512",
+                     status:"done",    note:"mIoU 0.4769 · /checkpoints/prithvi_600m_512/"},
+                    {slug:"300m", label:"Prithvi 300M · 256",
+                     status:"done",    note:"mIoU 0.4716 · /checkpoints/prithvi_300m_256/"},
+                    {slug:"compare", label:"Predictions · 300M vs 600M",
+                     status:"info",    note:"5 viz tiles · model output thumbnails · 300M + 600M (SLIC/GF columns also present in this view — ignore or scroll past)"},
+                  ];
+                  const STATUS_LABEL = {live:"LIVE", done:"DONE", pending:"PENDING", info:"INFO"};
+
+                  const tabsEl = document.getElementById("tabs");
+                  const framesEl = document.getElementById("frames");
+                  const metaEl = document.getElementById("meta");
+
+                  const iframes = {};
+                  const tabButtons = {};
+
+                  function activate(slug){
+                    for (const s of Object.keys(iframes)){
+                      iframes[s].classList.toggle("active", s===slug);
+                      tabButtons[s].classList.toggle("active", s===slug);
+                    }
+                    const t = TABS.find(t => t.slug===slug);
+                    metaEl.textContent = (t ? t.note + " · " : "") + "live polling · 30s";
+                    if (location.hash !== "#"+slug) history.replaceState(null,"","#"+slug);
+                  }
+
+                  for (const t of TABS){
+                    const btn = document.createElement("button");
+                    btn.className = "tab";
+                    btn.innerHTML = `<span>${t.label}</span>
+                      <span class="badge ${t.status}">${STATUS_LABEL[t.status]||t.status}</span>`;
+                    btn.onclick = () => activate(t.slug);
+                    tabsEl.appendChild(btn);
+                    tabButtons[t.slug] = btn;
+
+                    const f = document.createElement("iframe");
+                    f.src = t.slug + "/";
+                    f.title = t.label;
+                    framesEl.appendChild(f);
+                    iframes[t.slug] = f;
+                  }
+
+                  const initial = (location.hash || "").replace(/^#/,"")
+                    || TABS[0].slug;
+                  activate(TABS.find(t => t.slug===initial) ? initial : TABS[0].slug);
+
+                  window.addEventListener("hashchange", () => {
+                    const slug = (location.hash || "").replace(/^#/,"");
+                    if (slug && iframes[slug]) activate(slug);
+                  });
+                </script>
+              </body>
+              </html>
+              HTML
+
+              # Reproduce UnifiedDataset's 90/10 MD5 split per tile dir,
+              # write to /www/tile_counts.json. Computed once at pod boot
+              # (the dirs change rarely; restarting the dashboard pod
+              # refreshes the counts).
+              python3 - <<'PY'
+              import hashlib, json, pathlib
+              def split(d):
+                  files = sorted(pathlib.Path(d).glob("*.npz"))
+                  val = sum(1 for f in files
+                            if int(hashlib.md5(f.name.encode()).hexdigest(), 16) % 100 < 10)
+                  return {"train": len(files) - val, "val": val, "total": len(files)}
+              counts = {}
+              for slug, d in (("300m", "/data/unified_v2"),
+                              ("600m", "/cephfs/unified_v2_512")):
+                  p = pathlib.Path(d)
+                  if p.exists():
+                      counts[slug] = split(d)
+                      print(f"  {slug}  ({d})  {counts[slug]}")
+                  else:
+                      print(f"  {slug}  ({d})  — dir not present, skipping")
+              pathlib.Path("/www/tile_counts.json").write_text(json.dumps(counts))
+              PY
+
+              echo "Writing schema-normalizing HTTP server..."
+              # train_unified.py emits a newer training_log.json schema than
+              # the dashboard JS understands. Rather than patch either side,
+              # serve a normalized view: when the dashboard fetches
+              # /<slug>/training_log.json we read the file, remap field
+              # names + flatten last-epoch fields back to top level, and
+              # return the result. Static files (HTML, etc.) fall through
+              # to the stdlib SimpleHTTPRequestHandler unchanged.
+              cat > /serve.py <<'PY'
+              import json, os, posixpath, re
+              from datetime import datetime, timezone
+              from urllib.parse import unquote
+              from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+              # Tile counts pre-computed at pod boot via the MD5/90:10 split
+              # used by UnifiedDataset. Keyed by slug (e.g. "300m", "600m").
+              try:
+                  with open("/www/tile_counts.json") as f:
+                      TILE_COUNTS = json.load(f)
+              except Exception:
+                  TILE_COUNTS = {}
+
+              def normalize(raw: dict, slug: str = "") -> dict:
+                  """Map train_unified.py schema -> legacy dashboard schema."""
+                  out = {}
+                  cfg = raw.get("config") or {}
+                  epochs = raw.get("epochs") or []
+                  total = cfg.get("epochs")
+                  # Per-epoch keys the dashboard expects: epoch, val_miou,
+                  # loss, time_s, total. Map from the actual schema.
+                  out_epochs = []
+                  for ep in epochs:
+                      out_epochs.append({
+                          "epoch":     ep.get("epoch"),
+                          "val_miou":  ep.get("val_miou"),
+                          "loss":      ep.get("train_loss"),
+                          "time_s":    ep.get("elapsed_s"),
+                          "total":     total,
+                          "lr":        ep.get("lr"),
+                          # keep per-epoch per-class IoU available for any
+                          # future dashboard that wants it
+                          "per_class_iou": ep.get("per_class_iou") or {},
+                      })
+                  out["epochs"] = out_epochs
+                  out["best_miou"]    = raw.get("best_metric")
+                  out["status"]       = raw.get("status")
+                  out["last_update"]  = raw.get("updated_at")
+                  # Per-class IoU and confusion matrix live on the latest
+                  # epoch in the new schema — surface to top level for the
+                  # dashboard's old top-level lookup.
+                  if epochs:
+                      last = epochs[-1]
+                      out["per_class_iou"]    = last.get("per_class_iou") or {}
+                      if last.get("confusion_matrix") is not None:
+                          out["confusion_matrix"] = last["confusion_matrix"]
+                  # train_tiles / val_tiles aren't in the new schema —
+                  # surface them from the pre-computed split (matches the
+                  # numbers the trainer printed at startup).
+                  c = TILE_COUNTS.get(slug, {})
+                  if "train" in c: out["train_tiles"] = c["train"]
+                  if "val"   in c: out["val_tiles"]   = c["val"]
+                  return out
+
+              # /compare/* HTML files were generated by inference-compare-
+              # 300m-vs-600m.yaml and contain three postproc columns per
+              # model: raw + SLIC 500 + SLIC 3000. The user wants the SLIC
+              # variants out of the rendered view but doesn't want to
+              # regenerate the index (which would also lose the on-PVC
+              # record). Injecting a CSS+JS strip into the served HTML
+              # keeps the PVC content intact and the patch reversible —
+              # remove this block and SLIC reappears.
+              #
+              # Column layout (11 cols): 1 Tile, 2 RGB, 3 NIR-CIR,
+              # 4 Träningsdata, 5 NMD(raw), 6 300M raw, 7 300M+SLIC500,
+              # 8 300M+SLIC3000, 9 600M raw, 10 600M+SLIC500,
+              # 11 600M+SLIC3000 — cols 7,8,10,11 are the SLIC cells; col 5
+              # is NMD(raw), also hidden per request.
+              # The group-hdr row uses colspan=5 on "Reference" and colspan=3
+              # on m300/m600; JS shrinks Reference 5->4 (NMD hidden) and
+              # m300/m600 3->1 (SLIC hidden) so the headers stay aligned.
+              COMPARE_SLIC_STRIP = b"""<style>
+              table th:nth-child(5), table td:nth-child(5),
+              table th:nth-child(7), table td:nth-child(7),
+              table th:nth-child(8), table td:nth-child(8),
+              table th:nth-child(10), table td:nth-child(10),
+              table th:nth-child(11), table td:nth-child(11) { display:none !important; }
+              </style>
+              <script>
+              document.addEventListener("DOMContentLoaded", function(){
+                document.querySelectorAll(".meta ul li").forEach(function(li){
+                  if (/SLIC/.test(li.textContent)) li.remove();
+                });
+                // Drop the NMD (raw) legend note now that its column is hidden.
+                document.querySelectorAll(".meta p, .meta li").forEach(function(el){
+                  if (el.textContent.indexOf("NMD (raw)") !== -1) el.remove();
+                });
+                document.querySelectorAll("tr.group-hdr th.m300, tr.group-hdr th.m600")
+                  .forEach(function(th){ th.setAttribute("colspan", "1"); });
+                // "Reference" group header spanned 5 cols (incl. NMD raw) -> 4.
+                document.querySelectorAll("tr.group-hdr th:first-child")
+                  .forEach(function(th){ th.setAttribute("colspan", "4"); });
+                document.querySelectorAll("h1").forEach(function(h){
+                  h.textContent = h.textContent.replace(" \\u00b7 3 post-processing-varianter", "");
+                });
+              });
+              </script>
+              </head>"""
+
+              def _serve_compare_html(handler, full_path):
+                  """Stream /compare/*.html with the SLIC strip injected."""
+                  try:
+                      with open(full_path, "rb") as f:
+                          body = f.read()
+                  except Exception as e:
+                      handler.send_error(500, f"compare read failed: {e}")
+                      return
+                  # Inject just before </head>. Case-insensitive search,
+                  # but the source HTML always emits lowercase </head>.
+                  body = body.replace(b"</head>", COMPARE_SLIC_STRIP, 1)
+                  handler.send_response(200)
+                  handler.send_header("Content-Type", "text/html; charset=utf-8")
+                  handler.send_header("Content-Length", str(len(body)))
+                  handler.send_header("Cache-Control", "no-store")
+                  handler.end_headers()
+                  handler.wfile.write(body)
+
+              def strip_identity(obj, keys=frozenset({
+                      "tractid", "plotid", "plot_id", "point_id", "easting", "northing",
+                      "lat", "lon", "latitude", "longitude", "x_coord", "y_coord",
+                      "coordinates", "geometry", "bbox"})):
+                  """Drop identity keys at any depth from a JSON value before it is
+                  served: plot ids and coordinates must never leave through this
+                  public server, whatever file they sit in (2026-10-28 private
+                  probe: the inference matrix carried tile-centre coordinates)."""
+                  if isinstance(obj, dict):
+                      return {k: strip_identity(v, keys) for k, v in obj.items()
+                              if str(k).lower() not in keys}
+                  if isinstance(obj, list):
+                      return [strip_identity(v, keys) for v in obj]
+                  return obj
+
+              def nfi_inference_status(directory: str, expected: int) -> dict:
+                  """Publication status of the frozen-set NFI inference cells.
+
+                  Built from the cells' .meta.json files only, and only from
+                  the fields named here: never the prediction parquets, which
+                  carry NFI plot identities, and never a score (the metadata
+                  holds none). A missing directory is the awaiting-state."""
+                  cells = {}
+                  try:
+                      names = sorted(os.listdir(directory))
+                  except OSError:
+                      names = []
+                  manifest = ""
+                  for name in names:
+                      if not name.endswith(".parquet.meta.json"):
+                          continue
+                      path = os.path.join(directory, name)
+                      try:
+                          with open(path) as f:
+                              meta = json.load(f)
+                          stamp = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+                          cells[str(meta["cell"])] = {
+                              "status": str(meta.get("status")),
+                              "plots": int(meta.get("plots_in_crop") or 0),
+                              "prediction_sha256": str(meta.get("prediction_sha256") or "")[:12],
+                              "checkpoint_sha256": str(meta.get("checkpoint_sha256") or "")[:12],
+                              "published_at": stamp.isoformat(timespec="seconds"),
+                          }
+                          manifest = manifest or str(meta.get("holdout_manifest_sha256") or "")[:12]
+                      except (OSError, ValueError, KeyError, TypeError):
+                          continue
+                  return {"expected_cells": expected, "manifest_sha256": manifest,
+                          "published": sum(c["status"] == "success" for c in cells.values()),
+                          "cells": cells}
+
+              class Handler(SimpleHTTPRequestHandler):
+                  # Publication allowlist (2026-10-27). The symlinked PVC trees
+                  # hold per-plot NFI files (TractID, PlotID, Easting, Northing)
+                  # next to the files the dashboards read, and this server is
+                  # reachable through a public ingress. So: never a directory
+                  # listing; file bodies only for these extensions; inside the
+                  # distill tree only the distillability JSON. HEAD stays open
+                  # for the dashboards' existence probes (headers only).
+                  BODY_EXTENSIONS = (".html", ".json", ".png", ".jpg", ".jpeg",
+                                     ".svg", ".css", ".js", ".ico")
+                  DISTILL_BODY = re.compile(r"heads/[A-Za-z0-9_]+_distillability\.json")
+                  NFI_INFERENCE_DIR = "/cephfs/nfi/nfi_inference_2026-10-27"
+                  NFI_INFERENCE_CELLS = 28
+                  SAFE_PATH = re.compile(r"[A-Za-z0-9._~/-]*")
+                  # Served root; __init__ replaces it with the cwd (/www).
+                  directory = "/www"
+
+                  def list_directory(self, path):
+                      self.send_error(404, "Not found")
+                      return None
+
+                  def _unsafe_target(self):
+                      """Canonicalize the request path once, or refuse it.
+
+                      The policy and the file opened must see the same path
+                      (Codex, #114: "//", "/./" and a double-encoded "." passed
+                      a prefix check and were normalized only when the file was
+                      opened). One decode; anything still encoded, a backslash,
+                      a NUL, a ".." segment or a relative target is refused;
+                      repeated slashes and "." segments collapse; self.path is
+                      rewritten so every later step reads the canonical path."""
+                      # Fragments are not part of an HTTP request target.
+                      # Reject raw # before parsing can hide filesystem parts.
+                      if "#" in self.path:
+                          self.send_error(400, "Invalid request target")
+                          return None
+                      raw, sep, query = self.path.partition("?")
+                      decoded = unquote(raw)
+                      # Strict character allowlist after the one decode: an
+                      # encoded "?" or "#" would otherwise end the path only
+                      # when the file is opened (Codex, #114: "matrix.json%3f.png"
+                      # passed as a .png and returned the raw JSON), and "%",
+                      # "\\", spaces and control characters have no place in a
+                      # served path either.
+                      if (self.SAFE_PATH.fullmatch(decoded) is None
+                              or ".." in decoded.split("/") or not decoded.startswith("/")):
+                          self.send_error(400, "Invalid path")
+                          return None
+                      canonical = posixpath.normpath(re.sub(r"/+", "/", decoded))
+                      if decoded.endswith("/") and canonical != "/":
+                          canonical += "/"
+                      self.path = canonical + sep + query
+                      return canonical
+
+                  def _distill_relative(self, request_path):
+                      """Where request_path lands inside the real distill tree, or
+                      None. Resolved on the filesystem, so no URL spelling or
+                      symlink alias reaches the tree without this policy."""
+                      root = os.path.realpath(self.translate_path("/ladder/distill"))
+                      target = os.path.realpath(self.translate_path(request_path))
+                      if target == root:
+                          return ""
+                      if target.startswith(root + os.sep):
+                          return os.path.relpath(target, root)
+                      return None
+
+                  def _body_allowed(self, request_path):
+                      inside = self._distill_relative(request_path)
+                      if inside is not None:
+                          return self.DISTILL_BODY.fullmatch(inside) is not None
+                      if request_path.lower().endswith(self.BODY_EXTENSIONS) or request_path.endswith("/"):
+                          return True   # a listed type, or index.html; listings are refused
+                      return os.path.isdir(self.translate_path(request_path))   # -> redirect to "/"
+
+                  def do_HEAD(self):
+                      if self._unsafe_target() is None:
+                          return
+                      return super().do_HEAD()
+
+                  def do_GET(self):
+                      request_path = self._unsafe_target()
+                      if request_path is None:
+                          return
+                      if request_path == "/ladder/nfi_inference.json":
+                          body = json.dumps(nfi_inference_status(
+                              self.NFI_INFERENCE_DIR, self.NFI_INFERENCE_CELLS)).encode("utf-8")
+                          self.send_response(200)
+                          self.send_header("Content-Type", "application/json")
+                          self.send_header("Content-Length", str(len(body)))
+                          self.send_header("Cache-Control", "no-store")
+                          self.end_headers()
+                          self.wfile.write(body)
+                          return
+                      if not self._body_allowed(request_path):
+                          self.send_error(404, "Not found")
+                          return
+                      # /<slug>/training_log.json → JSON normalization
+                      if self.path.endswith("/training_log.json") or \
+                         self.path.startswith("/") and "training_log.json?" in self.path:
+                          path = self.path.split("?", 1)[0].lstrip("/")
+                          full = os.path.join("/www", path)
+                          if os.path.isfile(full):
+                              try:
+                                  with open(full, "r") as f:
+                                      raw = json.load(f)
+                                  slug = path.split("/", 1)[0] if "/" in path else ""
+                                  body = json.dumps(strip_identity(normalize(raw, slug))).encode("utf-8")
+                                  self.send_response(200)
+                                  self.send_header("Content-Type", "application/json")
+                                  self.send_header("Content-Length", str(len(body)))
+                                  self.send_header("Cache-Control", "no-store")
+                                  self.end_headers()
+                                  self.wfile.write(body)
+                                  return
+                              except Exception as e:
+                                  self.send_error(500, f"normalize failed: {e}")
+                                  return
+                          # fall through to 404
+
+                      # /compare/*.html (including /compare/ → index.html)
+                      # → SLIC-strip injection
+                      path_clean = self.path.split("?", 1)[0]
+                      if path_clean.startswith("/compare/") and \
+                         (path_clean.endswith(".html") or path_clean.endswith("/")):
+                          if path_clean.endswith("/"):
+                              path_clean = path_clean + "index.html"
+                          full = "/www" + path_clean
+                          if os.path.isfile(full):
+                              _serve_compare_html(self, full)
+                              return
+                          # fall through to 404
+
+                      # Every other JSON is re-serialized without identity
+                      # keys (plot ids, coordinates, geometry); a file that
+                      # does not parse is refused rather than passed through.
+                      if request_path.lower().endswith(".json"):
+                          full = self.translate_path(request_path)
+                          try:
+                              with open(full) as f:
+                                  body = json.dumps(strip_identity(json.load(f))).encode("utf-8")
+                          except (OSError, ValueError):
+                              self.send_error(404, "Not found")
+                              return
+                          self.send_response(200)
+                          self.send_header("Content-Type", "application/json")
+                          self.send_header("Content-Length", str(len(body)))
+                          self.send_header("Cache-Control", "no-store")
+                          self.end_headers()
+                          self.wfile.write(body)
+                          return
+
+                      return super().do_GET()
+
+              os.chdir("/www")
+              srv = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+              print("Serving /www on :8080 (with training_log.json normalization)")
+              srv.serve_forever()
+              PY
+              exec python3 /serve.py
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+              readOnly: true
+            # Data PVCs mounted read-only so the startup script can
+            # reproduce UnifiedDataset's deterministic 90/10 MD5-hash
+            # train/val split and surface real tile counts in the
+            # dashboard cards (the trainer doesn't write them to
+            # training_log.json).
+            - name: data256
+              mountPath: /data
+              readOnly: true
+            - name: cephfs
+              mountPath: /cephfs
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: training-checkpoints
+        - name: data256
+          persistentVolumeClaim:
+            claimName: training-data
+        - name: cephfs
+          persistentVolumeClaim:
+            claimName: training-data-cephfs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: training-dashboard
+  namespace: prithvi-training-default
+  labels:
+    app: training-dashboard
+spec:
+  type: NodePort
+  selector:
+    app: training-dashboard
+  ports:
+    - port: 8080
+      targetPort: 8080
+      # nodePort omitted → k8s auto-assigns a free port in 30000-32767.
+      # Read the assigned port from `kubectl get svc training-dashboard`.
+      name: http
+---
+# Public ingress — mirrors the rise-pax-ingress pattern (cert-manager
+# letsencrypt + nginx ingressClass). Hostname `*.icedc.se` is the
+# convention for this namespace's externally-reachable services.
+# Cert-manager auto-issues TLS on first Ingress apply (~30-90s).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: training-dashboard-ingress
+  namespace: prithvi-training-default
+  labels:
+    app: training-dashboard
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    # Increase iframe-friendliness: dashboards embed each other.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: training-dashboard.icedc.se
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: training-dashboard
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - training-dashboard.icedc.se
+      secretName: training-dashboard-icedc-tls

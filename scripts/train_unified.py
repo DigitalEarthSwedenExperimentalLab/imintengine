@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""
+scripts/train_unified.py — Train unified 19-class segmentation model
+
+Trains a UPerNet decoder on frozen Prithvi-EO-2.0 backbone using the
+unified LULC + Crop + Harvest schema (19 classes). Uses UnifiedDataset
+which merges NMD land cover, LPIS crop detail, and SKS harvest data
+from multiple tile directories.
+
+All 10 auxiliary channels enabled by default:
+  height, volume, basal_area, diameter, dem,
+  vpp_sosd, vpp_eosd, vpp_length, vpp_maxv, vpp_minv
+
+Produces checkpoints compatible with the TASK_HEAD_REGISTRY /
+load_segmentation_model() pipeline.
+
+Usage:
+    # Quick local test
+    python scripts/train_unified.py --epochs 2 --batch-size 4 --device mps --limit-tiles 100
+
+    # Full training on H100
+    python scripts/train_unified.py --epochs 50 --batch-size 8 --device cuda \
+        --data-dirs data/lulc_seasonal/tiles,data/crop_tiles \
+        --checkpoint-dir checkpoints/unified
+
+    # Evaluate-only
+    python scripts/train_unified.py --evaluate-only --checkpoint checkpoints/unified/best_model.pt
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from imint.config.env import load_env
+load_env()  # Load config/environments/{IMINT_ENV}.env (default: dev)
+
+from imint.training.config import TrainingConfig
+from imint.training.unified_dataset import UnifiedDataset
+from imint.training.trainer import LULCTrainer
+from imint.training.evaluate import evaluate_model
+from imint.schema.unified_schema import UNIFIED_CLASS_NAMES
+
+
+# Default data directories (comma-separated)
+DEFAULT_DATA_DIRS = "data/lulc_seasonal/tiles,data/crop_tiles"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train Prithvi unified 19-class segmentation model",
+    )
+
+    # Use TrainingConfig defaults for all values
+    _defaults = TrainingConfig()
+
+    # Data
+    parser.add_argument(
+        "--data-dirs", type=str, default=DEFAULT_DATA_DIRS,
+        help="Comma-separated directories with training tiles "
+             "(default: data/lulc_seasonal/tiles,data/crop_tiles)",
+    )
+    parser.add_argument(
+        "--num-classes", type=int, default=19,
+        help="Number of classes (default: 19 for unified schema)",
+    )
+    parser.add_argument(
+        "--limit-tiles", type=int, default=None,
+        help="Limit total tiles loaded (for quick local testing)",
+    )
+    parser.add_argument(
+        "--label-dir", type=str, default=None,
+        help="Optional non-destructive label sidecar directory. When set, "
+             "the label + area-weighting rasters are read from "
+             "<label-dir>/<tile>.npz per tile (spectral/aux/temporal/coords "
+             "still come from the source tile). Tiles without a sidecar are "
+             "dropped at construction. Default None → labels come from the "
+             "source tile (legacy, byte-identical).",
+    )
+    parser.add_argument(
+        "--cohort-dir", type=str, default=None,
+        help="Optional cohort gate: restrict training to tiles that have an "
+             "entry in this directory, WITHOUT reading labels from it. Holds "
+             "the tile set constant across runs that use different label "
+             "sources — the label-source ladder passes the NMD2023 sidecar "
+             "dir here on its rung-1 (in-tile label) runs so all rungs share "
+             "one cohort. Default None → no restriction.",
+    )
+    parser.add_argument(
+        "--era5-dir", type=str, default=None,
+        help="Optional directory with per-tile ERA5-Land .npz sidecars.",
+    )
+    parser.add_argument(
+        "--split-dir", type=str, default=None,
+        help="Optional directory containing persisted split_train.txt and split_val.txt.",
+    )
+
+    # Resolution
+    parser.add_argument("--patch-size", type=int, default=_defaults.patch_pixels,
+                        help="Training crop size (224, 256, or 448)")
+    parser.add_argument("--img-size", type=int, default=_defaults.img_size,
+                        help="ViT input resolution (224, 256, or 448)")
+
+    # Training
+    parser.add_argument("--epochs", type=int, default=_defaults.epochs)
+    parser.add_argument("--seed", type=int, default=_defaults.seed)
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Use deterministic CUDA/DataLoader settings for paired experiments.")
+    parser.add_argument(
+        "--deterministic-warn-only", action="store_true",
+        help="Warn instead of aborting for CUDA ops without a deterministic "
+             "implementation; the setting is recorded in run provenance.",
+    )
+    parser.add_argument(
+        "--preflight-one-batch", action="store_true",
+        help="Build the real model/data/loss route, run exactly one optimizer "
+             "step, assert finite loss/gradients, then exit before validation.",
+    )
+    parser.add_argument("--batch-size", type=int, default=_defaults.batch_size)
+    parser.add_argument("--lr", type=float, default=_defaults.lr)
+    parser.add_argument("--weight-decay", type=float, default=_defaults.weight_decay)
+    parser.add_argument("--patience", type=int, default=_defaults.early_stopping_patience,
+                        help="Early stopping patience")
+    parser.add_argument(
+        "--train-loss-patience", type=int, default=_defaults.train_loss_patience,
+        help="Train-loss convergence window; set above epochs to disable.",
+    )
+    parser.add_argument(
+        "--train-loss-min-delta", type=float, default=_defaults.train_loss_min_delta,
+        help="Train-loss convergence threshold.",
+    )
+    parser.add_argument(
+        "--log-confusion-every-epoch", action="store_true",
+        help="Persist every epoch confusion matrix for fixed-epoch experiments.",
+    )
+    parser.add_argument(
+        "--log-training-exposure", action="store_true",
+        help="Hash and persist the exact sampled tile/random-crop labels for "
+             "paired experiment parity and realized class-support checks.",
+    )
+    parser.add_argument("--num-workers", type=int, default=_defaults.num_workers)
+
+    # Precision
+    parser.add_argument(
+        "--disable-bf16", action="store_true",
+        help="Force FP32 training on CUDA (disables BF16 autocast). "
+             "Use to isolate BF16 as the cause of rare-class IoU collapse.",
+    )
+
+    # Collapse rewind
+    parser.add_argument(
+        "--collapse-rewind", action="store_true",
+        help="On rare-class IoU collapse, restore best checkpoint and "
+             "halve LR (per-group). Up to --collapse-max-rewinds times.",
+    )
+    parser.add_argument(
+        "--collapse-threshold", type=int, default=2,
+        help="Number of NEW classes hitting 0.0 IoU (vs best epoch) "
+             "that triggers a rewind. Default 2.",
+    )
+    parser.add_argument(
+        "--collapse-lr-factor", type=float, default=0.5,
+        help="LR multiplier on each rewind. Default 0.5 (halve).",
+    )
+    parser.add_argument(
+        "--collapse-max-rewinds", type=int, default=3,
+        help="Hard cap on rewinds per run. Default 3.",
+    )
+
+    # Model
+    parser.add_argument(
+        "--backbone-name", type=str, default=None,
+        help="Registry key from imint.fm.registry.MODEL_CONFIGS "
+             "(e.g. prithvi_300m, prithvi_600m, terramind_v1_base, "
+             "clay_v1_5, croma_base, thor_v1_base). When omitted, "
+             "trainer falls back to the legacy `backbone` field "
+             "(default: prithvi_eo_v2_300m_tl).",
+    )
+    parser.add_argument("--decoder-channels", type=int, default=_defaults.decoder_channels)
+    parser.add_argument("--dropout", type=float, default=_defaults.dropout)
+    parser.add_argument("--device", type=str, default=_defaults.device,
+                        help="Device: cuda, mps, cpu (default: auto)")
+    parser.add_argument("--unfreeze-layers", type=int,
+                        default=_defaults.unfreeze_backbone_layers,
+                        help="Unfreeze last N backbone transformer blocks")
+    parser.add_argument("--backbone-lr-factor", type=float,
+                        default=_defaults.backbone_lr_factor,
+                        help="Backbone LR = lr * this factor")
+
+    # Checkpoint
+    parser.add_argument("--checkpoint-dir", type=str,
+                        default="checkpoints/unified")
+    parser.add_argument(
+        "--strict-checkpoint-loading", action="store_true",
+        help="Fail on semantic or learned-key checkpoint mismatches.",
+    )
+    parser.add_argument("--save-every", type=int, default=_defaults.save_every_n_epochs,
+                        help="Save checkpoint every N epochs")
+    parser.add_argument(
+        "--fixed-checkpoint-only", action="store_true",
+        help=(
+            "Persist only scheduled epoch_NNN.pt checkpoints; omit "
+            "best_model.pt and optimizer-heavy last_checkpoint.pt."
+        ),
+    )
+
+    # Loss
+    parser.add_argument("--loss-type", type=str, default=_defaults.loss_type,
+                        choices=["cross_entropy", "focal", "focal_dice"],
+                        help="Loss function")
+    parser.add_argument("--focal-gamma", type=float, default=_defaults.focal_gamma,
+                        help="Focal loss gamma")
+    parser.add_argument("--max-class-weight", type=float, default=_defaults.max_class_weight,
+                        help="Cap for class frequency weights")
+    parser.add_argument("--weighting-method", type=str, default=_defaults.weighting_method,
+                        choices=["inverse", "sqrt", "effective_number"],
+                        help="Class weighting strategy")
+    parser.add_argument("--class-stats", type=str, default=None,
+                        help="class_stats.json for class weights and sampling "
+                             "(default: <first data dir>/class_stats.json)")
+    parser.add_argument("--label-smoothing", type=float, default=_defaults.label_smoothing,
+                        help="Label smoothing for focal loss (0.0 = disabled)")
+    parser.add_argument("--lovasz-weight", type=float, default=_defaults.lovasz_weight,
+                        help="Lovász-softmax loss weight (0.0 = disabled, 0.3 = recommended)")
+
+    # Trädslag fraction head (multi-task continuous crown-cover supervision)
+    parser.add_argument("--enable-tradslag-head", action="store_true",
+                        help="Add a parallel fraction head (Conv2d→4) on the "
+                             "decoder feature, supervised by NMD2023 Trädslag "
+                             "crown-cover targets (masked L1, multi-task). "
+                             "Default OFF → existing paths byte-identical.")
+    parser.add_argument("--frac-dir", type=str, default=None,
+                        help="Trädslag fraction sidecar directory "
+                             "(<frac-dir>/<tile>.npz with keys frac/"
+                             "frac_unreliable). Required for the frac loss to "
+                             "supervise; tiles without a sidecar train on hard "
+                             "labels only.")
+    parser.add_argument("--lambda-frac", type=float, default=_defaults.lambda_frac,
+                        help="Weight on the fraction loss: "
+                             "L = L_hard + lambda_frac * L_frac (default 1.0)")
+    parser.add_argument("--frac-loss-type", type=str,
+                        default=_defaults.frac_loss_type,
+                        choices=["l1", "smooth_l1"],
+                        help="Fraction regression loss (default l1)")
+    parser.add_argument("--aux-fusion", type=str,
+                        default=_defaults.aux_fusion,
+                        choices=["concat", "gated"],
+                        help="Tessera-only aux fusion mode: 'concat' "
+                             "(default, historical) projects aux and "
+                             "concatenates with the smoothed embedding; "
+                             "'gated' fuses via the GatedFusion residual gate "
+                             "(same-channel). Ignored by non-tessera families.")
+
+    # Early stopping metric
+    parser.add_argument("--early-stop-metric", type=str,
+                        default=_defaults.early_stop_metric,
+                        choices=["miou", "worst_class_iou", "combined"],
+                        help="Metric for early stopping")
+
+    # Auxiliary channels — all 8 enabled by default for unified training
+    # Individual disable flags for when you want to ablate specific channels
+    parser.add_argument("--disable-height", action="store_true",
+                        help="Disable tree height aux channel")
+    parser.add_argument("--disable-volume", action="store_true",
+                        help="Disable timber volume aux channel")
+    parser.add_argument("--disable-basal-area", action="store_true",
+                        help="Disable basal area aux channel")
+    parser.add_argument("--disable-diameter", action="store_true",
+                        help="Disable stem diameter aux channel")
+    parser.add_argument("--disable-dem", action="store_true",
+                        help="Disable DEM terrain elevation aux channel")
+    parser.add_argument("--disable-vpp", action="store_true",
+                        help="Disable HR-VPP phenology aux channels (sosd, eosd)")
+    parser.add_argument("--disable-all-aux", action="store_true",
+                        help="Disable all auxiliary channels")
+    parser.add_argument("--enable-markfukt", action="store_true",
+                        help="Enable SLU Markfuktighetskarta soil-moisture "
+                             "aux channel (11th aux, appended last). Default "
+                             "OFF — keeps the 10-aux path byte-identical.")
+    parser.add_argument("--enable-delta-sar", action="store_true",
+                        help="Enable ΔVV/ΔVH SAR-change aux channels "
+                             "(season γ⁰ − 2016 γ⁰ in dB), computed at read "
+                             "time from the tile's S1 keys. Appended LAST. "
+                             "The 2016 clearcut anchor via the aux path. "
+                             "Default OFF.")
+    parser.add_argument("--era5-mode", choices=["off", "control", "treatment"],
+                        default="off", help="Explicit weather arm. control uses neutral "
+                        "channels; treatment requires --era5-dir with validated sidecars.")
+
+    # Temporal
+    parser.add_argument("--enable-multitemporal", action="store_true",
+                        help="Use 4-frame multi-temporal input (autumn + 3 growing season)")
+    parser.add_argument("--num-temporal-frames", type=int, default=4,
+                        help="Number of temporal frames (default: 4)")
+
+    # Two-stage training
+    parser.add_argument("--freeze-spectral", action="store_true",
+                        help="Stage 2: freeze backbone+decoder, train only AuxEncoder")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Path to checkpoint to load (spectral model for stage 2)")
+    parser.add_argument("--warm-start-from", type=str, default=None,
+                        help="Finetune: warm-start model weights from a "
+                             "best_model.pt (no optimizer/epoch resume, "
+                             "nothing frozen). Expands the aux input conv on "
+                             "a channel-count mismatch (e.g. 10 → 11 aux with "
+                             "--enable-markfukt).")
+
+    # Dashboard
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Launch live training dashboard in browser")
+    parser.add_argument("--dashboard-port", type=int, default=8000,
+                        help="Port for dashboard HTTP server (default: 8000)")
+
+    # Background mode
+    parser.add_argument("--background", action="store_true",
+                        help="Run training as a detached background process")
+
+    # Evaluate-only mode
+    parser.add_argument("--evaluate-only", action="store_true",
+                        help="Only evaluate an existing checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint for evaluation")
+
+    args = parser.parse_args()
+
+    # Parse comma-separated data directories
+    data_dirs = [d.strip() for d in args.data_dirs.split(",") if d.strip()]
+
+    # ── Background mode: re-exec as detached process ──────────────
+    if args.background:
+        import subprocess
+        cmd = [sys.executable, __file__]
+        # Forward all args except --background
+        for arg in sys.argv[1:]:
+            if arg != "--background":
+                cmd.append(arg)
+        # Always enable dashboard in background mode
+        if "--dashboard" not in cmd:
+            cmd.append("--dashboard")
+
+        log_dir = Path(args.checkpoint_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "train.log"
+
+        with open(log_file, "w") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        print(f"\n  Training started in background (PID {proc.pid})")
+        print(f"  Log: {log_file}")
+        print(f"  Dashboard: http://localhost:{args.dashboard_port}/training_dashboard.html")
+        print(f"\n  To stop: kill {proc.pid}")
+        return
+
+    config = TrainingConfig(
+        data_dir=data_dirs[0],  # Primary dir for TrainingConfig compatibility
+        backbone_name=args.backbone_name,
+        enable_bf16_autocast=not args.disable_bf16,
+        enable_collapse_rewind=args.collapse_rewind,
+        collapse_threshold=args.collapse_threshold,
+        collapse_lr_factor=args.collapse_lr_factor,
+        collapse_max_rewinds=args.collapse_max_rewinds,
+        num_classes=args.num_classes,
+        epochs=args.epochs,
+        seed=args.seed,
+        deterministic=args.deterministic,
+        deterministic_warn_only=args.deterministic_warn_only,
+        preflight_one_batch=args.preflight_one_batch,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        early_stopping_patience=args.patience,
+        train_loss_patience=args.train_loss_patience,
+        train_loss_min_delta=args.train_loss_min_delta,
+        log_confusion_every_epoch=args.log_confusion_every_epoch,
+        log_training_exposure=args.log_training_exposure,
+        num_workers=args.num_workers,
+        decoder_channels=args.decoder_channels,
+        dropout=args.dropout,
+        device=args.device,
+        patch_pixels=args.patch_size,
+        img_size=args.img_size,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every_n_epochs=args.save_every,
+        fixed_checkpoint_only=args.fixed_checkpoint_only,
+        loss_type=args.loss_type,
+        focal_gamma=args.focal_gamma,
+        max_class_weight=args.max_class_weight,
+        weighting_method=args.weighting_method,
+        class_stats_path=args.class_stats,
+        label_smoothing=args.label_smoothing,
+        lovasz_weight=args.lovasz_weight,
+        early_stop_metric=args.early_stop_metric,
+        unfreeze_backbone_layers=args.unfreeze_layers,
+        backbone_lr_factor=args.backbone_lr_factor,
+        # Multi-temporal: 4-frame autumn-first pattern when enabled
+        enable_multitemporal=args.enable_multitemporal,
+        num_temporal_frames=args.num_temporal_frames if args.enable_multitemporal else 1,
+        # 5 skogliga + VPP (5 band) = 10 aux
+        enable_height_channel=True,
+        enable_volume_channel=True,
+        enable_basal_area_channel=True,
+        enable_diameter_channel=True,
+        enable_dem_channel=True,
+        enable_vpp_channels=True,
+        # markfukt: 11th aux, flag-gated, default OFF. When on it is
+        # appended LAST so the existing 10-aux ordering is untouched.
+        enable_markfukt_channel=args.enable_markfukt,
+        # ΔSAR: 2 aux channels (delta_vv, delta_vh), computed at read time
+        # from the tile's S1 keys. Appended AFTER markfukt so prior indices
+        # are untouched. Default OFF.
+        enable_delta_sar_channels=args.enable_delta_sar,
+        enable_era5_channels=args.era5_mode != "off",
+        era5_mode=args.era5_mode,
+        freeze_spectral=args.freeze_spectral,
+        strict_checkpoint_loading=args.strict_checkpoint_loading,
+        resume_from_checkpoint=args.resume_from,
+        warm_start_from_checkpoint=args.warm_start_from,
+        # Trädslag fraction head (multi-task). Off by default.
+        enable_tradslag_head=args.enable_tradslag_head,
+        lambda_frac=args.lambda_frac,
+        frac_loss_type=args.frac_loss_type,
+        # Tessera-only aux fusion mode ("concat" default | "gated").
+        aux_fusion=args.aux_fusion,
+    )
+
+    # ── Load datasets ─────────────────────────────────────────────
+    print(f"\n  Loading unified datasets from {len(data_dirs)} director{'y' if len(data_dirs) == 1 else 'ies'}:")
+    for d in data_dirs:
+        print(f"    - {d}")
+    print(f"  Num classes: {args.num_classes} (unified schema)")
+    print(f"  Class names: {UNIFIED_CLASS_NAMES}")
+    if args.limit_tiles:
+        print(f"  Tile limit: {args.limit_tiles}")
+
+    # Map data_dirs to lulc_dir / crop_dir
+    lulc_dir = data_dirs[0] if len(data_dirs) > 0 else None
+    crop_dir = data_dirs[1] if len(data_dirs) > 1 else None
+
+    # Resolve the backbone family so the dataset reads the right image key
+    # (Prithvi → `spectral` reflectance; tessera → pre-baked `tessera`
+    # embedding). Explicit routing on family, never on tile shape.
+    from imint.fm.registry import MODEL_CONFIGS, resolve_backbone_name
+    registry_name = resolve_backbone_name(config.backbone_name, config.backbone)
+    backbone_family = MODEL_CONFIGS[registry_name].family
+
+    # Per-model input tensors: the dataset only builds the Clay/CROMA/TerraMind
+    # stacks (s2_clay / s2_croma / s2_terramind / s1_vv_vh) when the active
+    # backbone's registry key is in model_keys. Prithvi/Tessera need no extra
+    # keys (empty tuple → historical byte-identical behaviour). The dataset
+    # also uses model_keys to filter its tile index to tiles that carry every
+    # required key for the backbone (e.g. SAR is on ~6011/7882 tiles).
+    from imint.training.unified_dataset import UnifiedDataset as _UD
+    model_keys = (
+        (registry_name,) if registry_name in _UD._SUPPORTED_MODEL_KEYS else ()
+    )
+    if model_keys:
+        print(f"  Model-specific dataset keys: {model_keys}")
+
+    # Honour the config's enabled aux set (adds markfukt when the flag is
+    # on; otherwise identical to the canonical 10-channel list).
+    aux_names = config.enabled_aux_names
+    train_dataset = UnifiedDataset(
+        lulc_dir=lulc_dir,
+        crop_dir=crop_dir,
+        split="train",
+        patch_size=config.patch_pixels,
+        enable_aux=True,
+        multitemporal=config.enable_multitemporal,
+        num_temporal_frames=config.num_temporal_frames,
+        aux_channel_names=aux_names,
+        label_dir=args.label_dir,
+        cohort_dir=args.cohort_dir,
+        frac_dir=args.frac_dir,
+        era5_dir=args.era5_dir,
+        era5_mode=args.era5_mode,
+        split_dir=args.split_dir,
+        limit_tiles=args.limit_tiles,
+        backbone_family=backbone_family,
+        model_keys=model_keys,
+    )
+    val_dataset = UnifiedDataset(
+        lulc_dir=lulc_dir,
+        crop_dir=crop_dir,
+        split="val",
+        patch_size=config.patch_pixels,
+        enable_aux=True,
+        multitemporal=config.enable_multitemporal,
+        num_temporal_frames=config.num_temporal_frames,
+        aux_channel_names=aux_names,
+        label_dir=args.label_dir,
+        cohort_dir=args.cohort_dir,
+        frac_dir=args.frac_dir,
+        era5_dir=args.era5_dir,
+        era5_mode=args.era5_mode,
+        split_dir=args.split_dir,
+        limit_tiles=args.limit_tiles,
+        backbone_family=backbone_family,
+        model_keys=model_keys,
+    )
+    print(f"  Train: {len(train_dataset)} tiles, Val: {len(val_dataset)} tiles")
+
+    # Print aux channel summary
+    print(f"  Aux channels ({len(aux_names)}): {', '.join(aux_names)}")
+
+    if args.evaluate_only:
+        # Evaluate-only mode. Prithvi-only: the model rebuild below is a
+        # hardcoded single-date Prithvi head, so other families would be
+        # silently mis-evaluated — refuse loudly instead.
+        if backbone_family != "prithvi":
+            raise SystemExit(
+                f"--evaluate-only rebuilds a Prithvi model; backbone family "
+                f"{backbone_family!r} is not supported here. Use "
+                f"scripts/inference_comparison.py for non-Prithvi checkpoints."
+            )
+        checkpoint_path = args.checkpoint or str(
+            Path(config.checkpoint_dir) / "best_model.pt"
+        )
+        print(f"\n  Evaluating checkpoint: {checkpoint_path}")
+
+        import torch
+        from imint.fm.terratorch_loader import _load_prithvi_from_hf
+        from imint.fm.upernet import PrithviSegmentationModel
+
+        # Load model (single-date)
+        backbone = _load_prithvi_from_hf(pretrained=True, num_frames=1)
+        model = PrithviSegmentationModel(
+            encoder=backbone,
+            feature_indices=config.feature_indices,
+            decoder_channels=config.decoder_channels,
+            num_classes=config.num_classes + 1,
+            dropout=config.dropout,
+        )
+
+        # Load checkpoint
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt)
+        # Strip "model." prefix
+        clean_sd = {}
+        for k, v in state_dict.items():
+            key = k[len("model."):] if k.startswith("model.") else k
+            clean_sd[key] = v
+        model.load_state_dict(clean_sd, strict=False)
+
+        device = torch.device(config.device or "cpu")
+        model.to(device)
+
+        # Evaluate on test set if available
+        for split_name in ["test", "val"]:
+            try:
+                ds = UnifiedDataset(
+                    lulc_dir=lulc_dir,
+                    crop_dir=crop_dir,
+                    split=split_name,
+                    patch_size=config.patch_pixels,
+                    enable_aux=True,
+                    multitemporal=config.enable_multitemporal,
+                    num_temporal_frames=config.num_temporal_frames,
+                    aux_channel_names=aux_names,
+                    label_dir=args.label_dir,
+                    cohort_dir=args.cohort_dir,
+                    frac_dir=args.frac_dir,
+                    era5_dir=args.era5_dir,
+                    era5_mode=args.era5_mode,
+                    split_dir=args.split_dir,
+                    limit_tiles=args.limit_tiles,
+                    backbone_family=backbone_family,
+                )
+                print(f"\n  Evaluating on {split_name} ({len(ds)} tiles)...")
+                metrics = evaluate_model(model, ds, config, device)
+                print(f"  mIoU: {metrics['miou']:.4f}")
+                print(f"  Overall Accuracy: {metrics['overall_accuracy']:.4f}")
+                print(f"  Per-class IoU:")
+                for name, iou in metrics["per_class_iou"].items():
+                    print(f"    {name:30s} {iou:.4f}")
+            except FileNotFoundError:
+                print(f"  Split '{split_name}' not found, skipping.")
+
+    else:
+        # Training mode
+        if args.dashboard:
+            from imint.training.dashboard import start_dashboard_server
+            start_dashboard_server(
+                config.data_dir,
+                port=args.dashboard_port,
+                open_browser=True,
+            )
+
+        trainer = LULCTrainer(config)
+        result = trainer.train(train_dataset, val_dataset)
+
+        print(f"\n{'='*60}")
+        print(f"  Result:")
+        print(f"    Best mIoU:     {result['best_miou']:.4f}")
+        print(f"    Best epoch:    {result['best_epoch']}")
+        print(f"    Checkpoint:    {result['checkpoint']}")
+        print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

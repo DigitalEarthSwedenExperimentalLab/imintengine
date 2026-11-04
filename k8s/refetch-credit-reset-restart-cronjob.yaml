@@ -1,0 +1,151 @@
+# CronJob: kicks the refetch-late-autumn-512 pod every monthly CDSE
+# credit-reset window so the in-process credit-guard (cleared by pod
+# restart) gets a chance to retry CDSE openEO.
+#
+# Why: the credit-guard in imint/data/openeo_tile_graph.py marks
+# cdse-openeo dead for the rest of the Python process on the first 402.
+# When the monthly CDSE credit pool refills, the dead-mark prevents the
+# running pod from noticing. Restarting the pod clears the in-process
+# set, the new pod retries CDSE, and if credits are back it stays there
+# for the rest of its lifetime (~150 s/tile DES → ~60 s/tile CDSE).
+#
+# Schedule: 00:01 UTC on the 1st of every month — best guess for when
+# CDSE's monthly free-tier resets. Refine after observing one cycle.
+# If the pod is already restarting from another cause around that time,
+# concurrencyPolicy: Forbid keeps us from racing two restart attempts.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: refetch-pod-restarter
+  namespace: prithvi-training-default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: refetch-pod-restarter
+  namespace: prithvi-training-default
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  # Need to unsuspend a suspended Job before the new pod can start.
+  # Patch is the minimum verb needed for spec.suspend mutation.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: refetch-pod-restarter
+  namespace: prithvi-training-default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: refetch-pod-restarter
+subjects:
+  - kind: ServiceAccount
+    name: refetch-pod-restarter
+    namespace: prithvi-training-default
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: refetch-credit-reset-restart
+  namespace: prithvi-training-default
+  labels:
+    purpose: cdse-credit-reset-pod-kicker
+spec:
+  # 00:01 UTC on the 1st of every month. The minute-1 offset (vs :00)
+  # gives the monthly billing event a moment to land in CDSE's system
+  # before we try a fresh fetch.
+  schedule: "1 0 1 * *"
+  timeZone: "UTC"
+  # Don't overlap if a previous restart-job is still finalising.
+  concurrencyPolicy: Forbid
+  # Survive a couple of transient failures (API server hiccup, etc.)
+  # without spamming alerts.
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # 2026-06-01: bumped 300 → 1200. The first fire (29671201) died
+      # DeadlineExceeded at 5 min — bitnami/kubectl image-pull on a cold
+      # node + pending-scheduling ate the deadline before kubectl ran.
+      # DeadlineExceeded is terminal (ignores backoffLimit), so a tight
+      # deadline silently no-ops the whole monthly restart. 20 min gives
+      # ample room for image pull + schedule + the trivial kubectl work.
+      activeDeadlineSeconds: 1200
+      template:
+        metadata:
+          labels:
+            app: refetch-pod-restarter
+        spec:
+          serviceAccountName: refetch-pod-restarter
+          restartPolicy: OnFailure
+          # Avoid the broken nodes we excluded from the refetch job.
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: kubernetes.io/hostname
+                        operator: NotIn
+                        values: ["p02r09srv04", "p02r09srv06"]
+          containers:
+            - name: kubectl
+              # bitnami/kubectl 1.29 — major-version stable. The Job
+              # only runs kubectl-get + kubectl-delete; minor-version
+              # drift doesn't affect those APIs.
+              image: bitnami/kubectl:1.29
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  echo "=== refetch-credit-reset-restart $(date -u) ==="
+                  NS=prithvi-training-default
+                  JOB=refetch-late-autumn-512
+
+                  # Step 1: unsuspend the Job if it's suspended. The
+                  # operator may have suspended it manually (e.g. during
+                  # DES backend degradation between credit cycles); we
+                  # want CDSE-reset day to kick everything back to life.
+                  SUSPENDED=$(kubectl get job/$JOB -n $NS \
+                                -o jsonpath='{.spec.suspend}' 2>/dev/null \
+                                || echo "missing")
+                  echo "Job suspend status: $SUSPENDED"
+                  if [ "$SUSPENDED" = "true" ]; then
+                    echo "Unsuspending Job..."
+                    kubectl patch job/$JOB -n $NS \
+                      -p '{"spec":{"suspend":false}}' || true
+                  elif [ "$SUSPENDED" = "missing" ]; then
+                    echo "Job $JOB not found in namespace $NS; nothing to do."
+                    exit 0
+                  fi
+
+                  # Step 2: delete any existing pods so the Job
+                  # controller spawns a fresh one. Each pod-restart
+                  # clears the in-process credit-guard dead-set; the
+                  # new Python process retries CDSE openEO and stays
+                  # there if credits have refilled.
+                  echo "Looking for existing $JOB pods..."
+                  PODS=$(kubectl get pods -l job-name=$JOB -n $NS \
+                           -o name 2>/dev/null || true)
+                  if [ -n "$PODS" ]; then
+                    echo "Deleting:"
+                    echo "$PODS"
+                    echo "$PODS" | xargs -r kubectl delete -n $NS --wait=false
+                  else
+                    echo "No existing pods — Job controller will create"
+                    echo "one automatically now that suspend=false."
+                  fi
+                  echo
+                  echo "=== done $(date -u) ==="
+              resources:
+                requests: {cpu: "100m", memory: "128Mi"}
+                limits:   {cpu: "100m", memory: "128Mi"}

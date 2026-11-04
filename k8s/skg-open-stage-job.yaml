@@ -1,0 +1,131 @@
+---
+# Stage Skogsstyrelsen's open GeoTIFF products on the PVC (backlog IM-022).
+#
+# Replaces the retired kartportal ImageServer proxies as the source of the
+# forestry aux channels (height, volume, basal_area, diameter) and SLU
+# markfukt. Runs scripts/stage_skg_open.py: downloads the per-county zips
+# from geodpags.skogsstyrelsen.se to /data/skg_open/raw, re-encodes each
+# raster as a tiled COG, builds one VRT per product and writes
+# /data/skg_open/MANIFEST.json (source URL, sha256, bytes, dates, git sha).
+#
+# Scope of this manifest: grunddata omdrev 1-3 (volym, grundyta,
+# medeldiameter) + markfukt, 174 files, 97.3 GiB raw as planned 2026-10-12
+# (PVC free before: 626 GiB). Trädhöjd (329 GiB raw at 1 m) is a separate
+# run with --products tradhojd once its size is approved.
+#
+# Resumable: re-apply under a new name after a failure; files already
+# hashed in the manifest with their COG present are skipped. Writes ONLY
+# under /data/skg_open. No tile is touched.
+#
+# Image digest: python:3.11-slim as resolved 2026-10-12 (same pin as
+# k8s/skg-endpoint-probe-job.yaml). Code pin: IMINT_COMMIT (full sha) and
+# IMINT_SCRIPT_SHA256 (sha256 of scripts/stage_skg_open.py at that commit,
+# `git show <sha>:scripts/stage_skg_open.py | sha256sum`); the pod refuses
+# to run if either check fails. Bump both when the script changes.
+#
+# The 2026-10-12 staging run used ce466af (no manifest lock). The pin now
+# points at a commit whose script holds /data/skg_open/MANIFEST.lock from its
+# first manifest read to its last save, so a re-apply can no longer erase the
+# records of a Trädhöjd or raw-drop run (review 5571030640, L1). Items whose
+# raw zip was deleted after verification (raw_deleted_at) are skipped. Apply
+# only when no skg-open-stage Job shows ACTIVE > 0 in
+# `kubectl get jobs -l purpose=skg-open-stage`. The original Job object
+# skg-open-stage (failed run 1, 2026-10-12) still exists and a Job's spec is
+# immutable: apply under a new metadata.name (e.g. skg-open-stage-r4).
+# bash forwards SIGTERM to the script (forward_term), so a deadline,
+# eviction or delete releases the lock within terminationGracePeriodSeconds.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: skg-open-stage
+  namespace: prithvi-training-default
+  labels: {app: fieldtruth-prep, purpose: skg-open-stage}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 172800        # 48 h cap; ~100 GiB download + COG conversion
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: fieldtruth-prep}
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 120   # time for the script to unwind and release MANIFEST.lock
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # p02r09srv04 + srv06 fail pod-sandbox creation (runc bug)
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["p02r09srv04", "p02r09srv06"]
+      containers:
+        - name: stage
+          image: python:3.11-slim@sha256:5be45dbade29bebd6886af6b438fd7e0b4eb7b611f39ba62b430263f82de36d2
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              export PYTHONUNBUFFERED=1
+              echo "=== skg-open-stage — $(date -u) ==="
+              apt-get update -qq && apt-get install -y -qq git gdal-bin >/dev/null 2>&1
+              pip install -q --no-cache-dir numpy rasterio inflate64
+              gdalinfo --version
+              mkdir -p /workspace && cd /workspace
+              # Pinned to a reviewed full commit, never a branch tip: a branch
+              # resolves to whatever it points at when the pod starts.
+              git init -q ie && cd ie
+              git fetch -q --depth 1 https://github.com/TobiasEdman/ImintEngine.git "${IMINT_COMMIT}"
+              git checkout -q FETCH_HEAD
+              export IMINT_GIT_SHA="$(git rev-parse HEAD)"
+              test "${IMINT_GIT_SHA}" = "${IMINT_COMMIT}"
+              echo "${IMINT_SCRIPT_SHA256}  scripts/stage_skg_open.py" | sha256sum -c -
+              echo "HEAD: ${IMINT_GIT_SHA}"
+              # Kubernetes sends SIGTERM only to PID 1, this bash, which neither
+              # dies from it nor passes it on; the pod would be SIGKILLed after
+              # the grace period with MANIFEST.lock left behind. forward_term
+              # runs the script in the background, forwards TERM to it, waits
+              # for its real exit code (RC) and exits with it if TERM came.
+              forward_term() {
+                "$@" &
+                CHILD=$!
+                trap 'kill -TERM "${CHILD}" 2>/dev/null || true; TERMINATED=1' TERM
+                RC=0
+                wait "${CHILD}" || RC=$?
+                while kill -0 "${CHILD}" 2>/dev/null; do RC=0; wait "${CHILD}" || RC=$?; done
+                trap - TERM
+                if [ "${TERMINATED:-0}" = 1 ]; then exit "${RC}"; fi
+              }
+              df -h /data | tail -1
+              forward_term python scripts/stage_skg_open.py --dest /data/skg_open \
+                --products ${STAGE_PRODUCTS} --omdrev 1 2 3
+              if [ "${RC}" != 0 ]; then exit "${RC}"; fi
+              echo "=== manifest summary ==="
+              python - <<'PY'
+              import json
+              m = json.load(open("/data/skg_open/MANIFEST.json"))
+              raw = sum(r["bytes"] for r in m["files"].values() if not r.get("raw_deleted_at"))
+              der = sum(r["bytes"] for r in m["derived"].values())
+              print(f"files {len(m['files'])}, derived {len(m['derived'])}, vrt {len(m['vrt'])}")
+              print(f"raw {raw/2**30:.1f} GiB, derived {der/2**30:.1f} GiB, git {m['git_sha']}")
+              PY
+              du -sh /data/skg_open/raw /data/skg_open/grunddata /data/skg_open/markfukt 2>/dev/null || true
+              df -h /data | tail -1
+              echo "=== done: $(date -u) ==="
+          env:
+            - {name: IMINT_COMMIT, value: "1ef10d1b6abb7e2296b13225537734b8e7c30ee9"}
+            - {name: IMINT_SCRIPT_SHA256, value: "5071b098b453add5d3ab93e34ca15d378fa676cb6667fd3ab04f9de0c2c22169"}
+            - {name: STAGE_PRODUCTS, value: "grunddata markfukt"}
+            # 2026-10-12 run 1 (8Gi, cache 2048 MB) was OOM-killed on the
+            # 10.6 GiB markfukt county 23 after 171/174 files: the page cache
+            # of the sequential 10+ GiB write counts against the cgroup.
+            - {name: GDAL_CACHEMAX, value: "512"}
+          resources:
+            requests: {cpu: "4", memory: "24Gi"}
+            limits: {cpu: "4", memory: "24Gi"}
+          volumeMounts:
+            - {name: d, mountPath: /data}
+      volumes:
+        - name: d
+          persistentVolumeClaim: {claimName: training-data-cephfs}

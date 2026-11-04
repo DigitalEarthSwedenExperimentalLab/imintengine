@@ -1,0 +1,320 @@
+"""
+imint/training/config.py — Training configuration
+
+Centralised dataclass for all hyperparameters, paths, and options
+used by the LULC training pipeline.
+
+Environment-aware: if ``IMINT_*`` environment variables are set
+(e.g. via ``config/environments/dev.env``), they override the
+dataclass defaults.  CLI arguments still take highest priority.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from .era5_aux import ERA5_AUX_NORM
+
+
+@dataclass
+class TrainingConfig:
+    """Configuration for Prithvi LULC training pipeline."""
+
+    # ── Data ──────────────────────────────────────────────────────────────
+    data_dir: str = "data/lulc_training"
+    years: list[str] = field(default_factory=lambda: ["2019", "2018"])
+    growing_season: tuple[int, int] = (6, 8)          # June – August
+    grid_spacing_m: int = 10_000                       # 10 km grid
+    patch_pixels: int = 224                            # Training crop size
+    fetch_pixels: int = 256                            # Tile fetch resolution
+    img_size: int = 224                                # ViT input resolution (224, 256, 448)
+    cloud_threshold: float = 0.05
+    b02_haze_threshold: float = 0.06                  # Max mean B02 reflectance
+                                                       # for clear-sky quality gate
+    fetch_sources: list[str] = field(                  # Backends for data fetching
+        default_factory=lambda: ["copernicus", "des"]  # "copernicus" (CDSE), "des"
+    )                                                  # Multiple = parallel load balance
+
+    # ── Multitemporal / seasonal ─────────────────────────────────────────
+    # When enabled, each tile stores T temporal frames as (T*6, H, W).
+    # Prithvi-EO-2.0 supports up to num_frames=4 temporal steps.
+    enable_multitemporal: bool = False                 # Single-date by default
+    num_temporal_frames: int = 5                       # 1 background + 1 autumn + 3 growing
+    seasonal_windows: list[tuple[int, int]] = field(
+        default_factory=lambda: [
+            (9, 10),   # autumn:        Sep – Oct (post-harvest stubble, autumn-sown)
+            (4, 5),    # early spring:  Apr – May (bare soil vs green, spring plowing)
+            (6, 7),    # peak summer:   Jun – Jul (max crop diff, peak NDVI)
+            (8, 8),    # late summer:   Aug (harvest timing, rapeseed done vs cereals)
+        ]
+    )
+    enable_vpp_guided_windows: bool = True             # Use VPP phenology per tile
+    seasonal_cloud_threshold: float = 0.10             # Slightly relaxed
+    seasonal_require_all: bool = False                 # If False, pad missing seasons
+                                                       # with zeros (masked in model)
+
+    # ── Class schema ─────────────────────────────────────────────────────
+    num_classes: int = 23                              # Unified 23-class schema
+    ignore_index: int = 0                              # Background
+
+    # ── Fine-detail / small parcel weighting ──────────────────────────────
+    # Pixels belonging to small LPIS parcels are up-weighted in the loss so
+    # the model learns to delineate sub-hectare field boundaries.
+    # Weight function: w = clip(1/√area_ha, 1.0, area_weight_max)
+    #                  with w = area_weight_max for parcels < mmu_ha.
+    mmu_ha: float = 0.25                               # NMD standard MMU (ha)
+    area_weight_max: float = 4.0                       # Max weight for sub-MMU pixels
+    enable_area_weighting: bool = True                 # Set False to disable
+
+    # ── Precision ─────────────────────────────────────────────────────────
+    # BF16 autocast is a large H100 throughput win but halves mantissa
+    # precision (7 bits vs FP32's 23). In v7/v7b we observed rare-class
+    # IoU collapse to exactly 0.0 for classes (vete, korn, bete, trindsäd,
+    # råg, majs) that v6a's FP32 baseline kept healthy. Leave the knob
+    # exposed so runs can disable it to isolate the cause.
+    enable_bf16_autocast: bool = True
+
+    # ── Collapse-rewind ───────────────────────────────────────────────────
+    # Across v7/v7b/v7c-2080 we observed the same pattern: rare classes
+    # (vete, korn, bete, …) drop to exactly 0.0 IoU between consecutive
+    # epochs and never recover because the cosine LR has decayed too far.
+    # When enabled, the trainer detects collapse, reloads the best
+    # checkpoint, halves the LR, and re-anneals the cosine over the
+    # remaining epochs. Up to `collapse_max_rewinds` recoveries before
+    # giving up.
+    enable_collapse_rewind: bool = False
+    # Number of NEW classes hitting 0.0 IoU (vs the best-checkpoint
+    # epoch's collapsed set) that triggers a rewind. 1 is conservative;
+    # larger means we tolerate one or two collapses before reacting.
+    collapse_threshold: int = 2
+    # LR multiplier on each rewind. 0.5 = halve. Applied per-group so
+    # backbone-vs-decoder ratio is preserved.
+    collapse_lr_factor: float = 0.5
+    # Hard cap on rewinds per run. If we hit this, training continues
+    # without further rewinds (best checkpoint is whatever we had).
+    collapse_max_rewinds: int = 3
+
+    # ── Model ─────────────────────────────────────────────────────────────
+    # Preferred: registry key from imint.fm.registry.MODEL_CONFIGS.
+    # When None, trainer falls back to `backbone` via LEGACY_BACKBONE_ALIAS.
+    # Valid keys: "prithvi_300m", "prithvi_600m", "terramind_v1_base",
+    #             "clay_v1_5", "croma_base", "thor_v1_base".
+    backbone_name: str | None = None
+    # Legacy field — kept for BC. Maps via LEGACY_BACKBONE_ALIAS.
+    backbone: str = "prithvi_eo_v2_300m_tl"
+    decoder_type: str = "upernet"
+    decoder_channels: int = 256
+    # When None, trainer uses spec.feature_indices from the registry.
+    feature_indices: list[int] | None = None
+    dropout: float = 0.1
+    unfreeze_backbone_layers: int = 6                  # Unfreeze last N transformer blocks
+    backbone_lr_factor: float = 0.1                    # Backbone LR = lr * this factor
+
+    # ── Training ──────────────────────────────────────────────────────────
+    batch_size: int = 8
+    num_workers: int = 4
+    epochs: int = 50
+    seed: int = 42
+    deterministic: bool = False
+    deterministic_warn_only: bool = False
+    preflight_one_batch: bool = False
+    lr: float = 1e-4
+    weight_decay: float = 0.35                    # Prithvi multi-crop segmentation standard
+    warmup_fraction: float = 0.05
+    early_stopping_patience: int = 15                  # Epochs without val improvement
+    train_loss_min_delta: float = 0.005                # Stop if train loss change < this
+    train_loss_patience: int = 5                       # over this many epochs
+    log_confusion_every_epoch: bool = False
+    log_training_exposure: bool = False
+    max_class_weight: float = 5.0
+    weighting_method: str = "sqrt"                    # "inverse", "sqrt", "effective_number"
+    class_stats_path: str | None = None                # None → <data_dir>/class_stats.json
+    device: str | None = None                          # Auto-detect
+
+    # ── Architecture v5 ──────────────────────────────────────────────────
+    enable_temporal_pooling: bool = True                # Mean+max temporal pooling
+    enable_multilevel_aux: bool = True                  # Gated LiDAR fusion per FPN level
+    # Tessera-only aux fusion mode: "concat" (default, historical) or
+    # "gated" (GatedFusion residual gate). Ignored by non-tessera families.
+    aux_fusion: str = "concat"                          # "concat" | "gated"
+
+    # ── Loss ───────────────────────────────────────────────────────────
+    loss_type: str = "focal_dice"                      # "cross_entropy", "focal", "focal_dice"
+    focal_gamma: float = 2.0                           # Focal loss focusing parameter
+    label_smoothing: float = 0.05                     # 0.0 = disabled
+    lovasz_weight: float = 0.0                        # 0.0 = disabled, 0.3 = recommended
+
+    # ── Trädslag fraction head (multi-task, continuous crown-cover) ──────
+    # When enabled, a parallel Conv2d(decoder_channels, 4, 1) fraction head is
+    # added on the same decoder feature that feeds the classifier, supervised
+    # by NMD2023 Trädslag crown-cover targets (masked L1). Off by default →
+    # existing paths byte-identical (no head, no loss term, no frac keys).
+    enable_tradslag_head: bool = False
+    num_tradslag: int = 4                              # tall/gran/trivial/adel
+    lambda_frac: float = 1.0                           # weight on L_frac
+    frac_loss_type: str = "l1"                         # "l1" | "smooth_l1"
+
+    # ── Rare class handling ────────────────────────────────────────────
+    rare_class_threshold: float = 0.02                 # Classes < 2% are "rare"
+    max_tile_weight: float = 5.0                       # Max oversampling for rare tiles
+    early_stop_metric: str = "miou"                    # "miou", "worst_class_iou", "combined"
+    worst_class_weight: float = 0.3                    # Weight in combined metric
+
+    # ── Grid densification ─────────────────────────────────────────────
+    enable_grid_densification: bool = False             # Opt-in for rare-class areas
+    densify_spacing_m: int = 5_000                     # 5 km sub-grid in dense areas
+    enable_scb_densification: bool = False              # SCB tätort urban oversampling
+    scb_min_population: int = 2_000                    # Min population for inclusion
+    scb_densify_spacing_m: int = 2_500                 # Tighter spacing in urban areas
+    enable_sea_densification: bool = False              # Coastal water oversampling
+    max_sea_distance_m: int = 5_000                    # Max distance from land (meters)
+    enable_sumpskog_densification: bool = False         # Skogsstyrelsen sumpskog
+    sumpskog_min_density_pct: float = 5.0              # Min sumpskog % per scan cell
+    sumpskog_densify_spacing_m: int = 10_000           # Sub-grid spacing in wetland areas
+
+    # ── Auxiliary raster channels ──────────────────────────────────────────
+    enable_height_channel: bool = False                  # Skogsstyrelsen tree height
+    enable_volume_channel: bool = False                  # Skogliga grunddata volume
+    enable_basal_area_channel: bool = False              # Grundyta (Gy), m²/ha
+    enable_diameter_channel: bool = False                # Medeldiameter (Dgv), cm
+    enable_dem_channel: bool = False                     # Copernicus DEM (terrain elev.)
+    enable_vpp_channels: bool = False                    # HR-VPP phenology (5 bands)
+    enable_markfukt_channel: bool = False                # SLU Markfuktighetskarta (soil moisture)
+    # ΔSAR: 2 aux channels (delta_vv, delta_vh) computed at read time from the
+    # tile's S1 keys (season γ⁰ − 2016 γ⁰, in dB). Appended LAST so the
+    # existing aux ordering is untouched. Default OFF.
+    enable_delta_sar_channels: bool = False              # ΔVV/ΔVH clearcut change (2016 anchor)
+    enable_era5_channels: bool = False                    # ERA5-Land growing-season context
+    era5_mode: str = "off"                                # off | control | treatment
+    aux_cache_enabled: bool = True                       # Cache aux tiles as .npy
+
+    # Z-score normalization for aux channels: {name: (mean, std)}
+    # Computed from non-zero pixels across 5796 seasonal tiles (lulc_seasonal).
+    # Recompute with: python scripts/compute_aux_stats.py --data-dir data/lulc_seasonal
+    aux_norm: dict = field(default_factory=lambda: {
+        "height":     (7.36, 6.55),        # meters (Skogsstyrelsen trädhöjd)
+        "volume":     (118.53, 112.67),    # m³sk/ha (Skogliga grunddata)
+        "basal_area": (15.98, 10.20),      # m²/ha (grundyta)
+        "diameter":   (16.33, 7.84),       # cm (medeldiameter)
+        "dem":        (264.03, 215.37),    # meters a.s.l. (Copernicus DEM)
+        "vpp_sosd":   (129.40, 31.11),     # DOY (YYDDD decoded), spring green-up
+        "vpp_eosd":   (263.40, 38.32),     # DOY (YYDDD decoded), autumn senescence
+        "vpp_length": (141.61, 41.39),     # days, season length
+        "vpp_maxv":   (0.88, 0.57),        # PPI unitless, max vegetation index
+        "vpp_minv":   (0.04, 0.05),        # PPI unitless, min vegetation index
+        # markfukt: SLU Markfuktighetskarta soil-moisture probability. In the
+        # npz it is already float32 in [0.01, 1.00] (raw code/100) with 1.01 =
+        # saturated water and NaN = nodata (see tile_fetch.py L546). NaN is
+        # filled with the channel's finite mean before z-score in the loader.
+        # (mean, std) are a broad prior over the [0, 1.01] probability range;
+        # refine with compute_aux_stats.py once real-tile stats are gathered.
+        "markfukt":   (0.50, 0.25),        # soil-moisture probability, unitless
+        # ΔVV/ΔVH: SAR backscatter change in dB (season γ⁰ − 2016 γ⁰),
+        # computed at read time from s1_vv_vh − s1_vv_vh_2016. Centred on
+        # 0 dB (no change); a clearcut is a sharp −3..−10 dB negative step.
+        # std=4.0 dB → a −8 dB harvest at z≈−2, phenology jitter inside ±0.5 z.
+        "delta_vv":   (0.0, 4.0),          # dB backscatter change, VV
+        "delta_vh":   (0.0, 4.0),          # dB backscatter change, VH
+        **ERA5_AUX_NORM,
+    })
+
+    # ── Validation split (latitude-based) ─────────────────────────────────
+    val_latitude_min: float = 64.0
+    val_latitude_max: float = 66.0
+    test_latitude_min: float = 66.0
+
+    # ── Augmentation ──────────────────────────────────────────────────────
+    random_flip: bool = True
+    random_rotation: bool = True
+    random_crop: bool = True
+
+    # ── Checkpoint ────────────────────────────────────────────────────────
+    checkpoint_dir: str = "checkpoints/lulc"
+    save_every_n_epochs: int = 5
+    # Fixed-protocol experiments can omit redundant best/resume snapshots and
+    # persist only the explicitly scheduled epoch_NNN.pt artifact.
+    fixed_checkpoint_only: bool = False
+    resume_from_checkpoint: str | None = None     # Path to last_checkpoint.pt
+    freeze_spectral: bool = False                  # Stage 2: freeze backbone+decoder, train only aux
+    strict_checkpoint_loading: bool = False
+    # Warm-start finetune: load model weights from a best_model.pt (no
+    # optimizer/epoch resume, nothing frozen) and start a fresh schedule.
+    # Used to finetune an existing checkpoint into a new architecture — e.g.
+    # expanding v8b's 10-aux input to 11 aux (markfukt) via
+    # _expand_aux_input_conv. Distinct from resume_from_checkpoint (which
+    # restores full training state) and freeze_spectral (which freezes all
+    # but the aux branch).
+    warm_start_from_checkpoint: str | None = None
+
+    # ── Prithvi normalization (from config.json, DN-scale) ────────────────
+    prithvi_mean: list[float] = field(
+        default_factory=lambda: [1087.0, 1342.0, 1433.0, 2734.0, 1958.0, 1363.0]
+    )
+    prithvi_std: list[float] = field(
+        default_factory=lambda: [2248.0, 2179.0, 2178.0, 1850.0, 1242.0, 1049.0]
+    )
+    prithvi_bands: list[str] = field(
+        default_factory=lambda: ["B02", "B03", "B04", "B8A", "B11", "B12"]
+    )
+
+    @property
+    def enabled_aux_names(self) -> tuple[str, ...]:
+        """Canonical ordered list of enabled auxiliary channel names.
+
+        Use this everywhere instead of hardcoding channel name lists.
+        Order must match how channels are stacked in the dataset.
+        """
+        names: list[str] = []
+        if self.enable_height_channel:
+            names.append("height")
+        if self.enable_volume_channel:
+            names.append("volume")
+        if self.enable_basal_area_channel:
+            names.append("basal_area")
+        if self.enable_diameter_channel:
+            names.append("diameter")
+        if self.enable_dem_channel:
+            names.append("dem")
+        if self.enable_vpp_channels:
+            names.extend([
+                "vpp_sosd", "vpp_eosd", "vpp_length",
+                "vpp_maxv", "vpp_minv",
+            ])
+        # markfukt is appended LAST (after vpp) so the existing 10-aux
+        # ordering is untouched — the warm-started channels keep their
+        # index and the new markfukt channel is the trailing one that
+        # cold-starts on checkpoint expansion.
+        if self.enable_markfukt_channel:
+            names.append("markfukt")
+        # ΔSAR appended LAST (after markfukt) so every prior channel keeps
+        # its index — the two new channels cold-start on a checkpoint
+        # aux-input-conv expansion, like markfukt did.
+        if self.enable_delta_sar_channels:
+            names.extend(["delta_vv", "delta_vh"])
+        if self.enable_era5_channels:
+            names.extend([
+                "era5_t2m_mean", "era5_tp_sum", "era5_swvl1_mean",
+                "era5_ssrd_sum", "era5_gdd",
+            ])
+        return tuple(names)
+
+    def __post_init__(self) -> None:
+        """Override defaults from ``IMINT_*`` environment variables.
+
+        Only applies when the env var is set *and* the field still has
+        its default value (so CLI argparse overrides still win).
+        """
+        _env_overrides: dict[str, tuple[str, type]] = {
+            "IMINT_BATCH_SIZE":   ("batch_size",   int),
+            "IMINT_NUM_WORKERS":  ("num_workers",  int),
+            "IMINT_EPOCHS":       ("epochs",       int),
+            "IMINT_DEVICE":       ("device",       str),
+            "IMINT_DATA_DIR":     ("data_dir",     str),
+        }
+        for env_key, (attr, typ) in _env_overrides.items():
+            val = os.environ.get(env_key)
+            if val is not None and val != "":
+                try:
+                    setattr(self, attr, typ(val))
+                except (ValueError, TypeError):
+                    pass  # ignore malformed env values

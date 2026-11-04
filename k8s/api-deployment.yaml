@@ -1,0 +1,140 @@
+# ImintEngine API — single-replica K8s deployment (ephemeral job state).
+#
+# Prerequisite: the ConfigMap imint-api-resource-budget (key max_pixels)
+# must exist in namespace imint before apply, holding your validated pixel
+# budget; the repo ships no value (see imint/api/v1/README.md). Without
+# it the pod stays in CreateContainerConfigError:
+#   kubectl -n imint create configmap imint-api-resource-budget \
+#     --from-literal=max_pixels="$VALIDATED_MAX_PIXELS"
+# Apply: kubectl apply -f k8s/api-deployment.yaml
+# Do not scale above one replica: there is no shared job store.
+# Recreate prevents overlap during upgrades. Restart loses jobs and outputs
+# unless an operator separately supplies persistent artifact storage.
+# Keep behind a trusted access boundary; application authentication is absent.
+#
+# Image must be pre-built and pushed:
+#   docker build -f Dockerfile.api -t <registry>/imint-engine-api:v0.1.0 .
+#   docker push <registry>/imint-engine-api:v0.1.0
+#
+# Replace <registry> with your registry path before applying.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imint-engine-api
+  namespace: imint
+  labels:
+    app: imint-engine-api
+    component: api
+    version: v0.1.0
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: imint-engine-api
+  template:
+    metadata:
+      labels:
+        app: imint-engine-api
+        component: api
+        version: v0.1.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/v1/metrics"
+    spec:
+      containers:
+        - name: api
+          image: <registry>/imint-engine-api:v0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # REQUIRED operator ConfigMap; no guessed default budget.
+            # Validate max_pixels for the enabled analyzers before rollout.
+            # 4Gi memory alone does not determine a safe raster size.
+            - name: IMINT_API_MAX_PIXELS
+              valueFrom:
+                configMapKeyRef:
+                  name: imint-api-resource-budget
+                  key: max_pixels
+                  optional: false
+            - name: PORT
+              value: "8000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # OTel — optional. If the cluster has a collector at the address
+            # below, instrumentation activates automatically (fail-open).
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability:4317"
+            - name: OTEL_SERVICE_NAME
+              value: "imint-engine-api"
+            # Credentials come from K8s Secret (W1.2 hardening).
+            - name: DES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: imint-credentials
+                  key: DES_USER
+            - name: DES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: imint-credentials
+                  key: DES_PASSWORD
+            - name: CDSE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: imint-credentials
+                  key: CDSE_CLIENT_ID
+            - name: CDSE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: imint-credentials
+                  key: CDSE_CLIENT_SECRET
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: imint-engine-api
+  namespace: imint
+  labels:
+    app: imint-engine-api
+spec:
+  type: ClusterIP
+  selector:
+    app: imint-engine-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
+---
+# Ingress is left as a separate file; environments differ on
+# ingress-controller flavour (nginx, Traefik, ICE custom) and TLS source
+# (cert-manager, manually-provisioned). Recommend ingress yaml lives in
+# infrastructure repo, not application repo.
