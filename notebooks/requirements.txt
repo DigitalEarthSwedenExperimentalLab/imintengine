@@ -2,5 +2,10 @@ jupyterlab>=4.0
 matplotlib>=3.7
 folium>=0.15
 openeo>=0.28
-imint-engine[fetch,inference] @ git+https://github.com/DigitalEarthSwedenExperimentalLab/imintengine@b183e1a
-# 030 and 070 (vessel detection) also need: sahi ultralytics  (AGPL-3.0)
+imint-engine[fetch,inference] @ git+https://github.com/DigitalEarthSwedenExperimentalLab/imintengine@b183e1abd4653cb843a75557b05c09915fb85904
+# 030 and 070 (vessel detection) also need these; both are AGPL-3.0:
+# sahi==0.14.0
+# ultralytics==8.4.216
+# 140 (super-resolution) also needs these; SEN2SR is CC0 1.0, mlstac MIT:
+# sen2sr==0.8.5
+# mlstac==0.4.9
