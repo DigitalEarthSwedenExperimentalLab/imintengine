@@ -2,17 +2,17 @@ name: sdl3-cases
 channels:
   - conda-forge
 dependencies:
-  - python=3.11
+  - python=3.12
   - jupyterlab
-  - ipywidgets
-  - numpy
   - matplotlib
   - folium
-  - rasterio
-  - geopandas
-  - contextily
   - pip
   - pip:
       - openeo
-      - papermill
-      - git+https://github.com/TobiasEdman/imintengine.git
+      - "imint-engine[fetch,inference] @ git+https://github.com/DigitalEarthSwedenExperimentalLab/imintengine@b183e1abd4653cb843a75557b05c09915fb85904"
+      # 030 and 070 (vessel detection), AGPL-3.0:
+      # - sahi==0.14.0
+      # - ultralytics==8.4.216
+      # 140 (super-resolution), CC0 1.0 and MIT:
+      # - sen2sr==0.8.5
+      # - mlstac==0.4.9

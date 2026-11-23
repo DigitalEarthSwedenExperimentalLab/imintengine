@@ -1,11 +1,11 @@
 jupyterlab>=4.0
-ipywidgets>=8.0
-numpy>=1.24
 matplotlib>=3.7
 folium>=0.15
-rasterio>=1.3
-geopandas>=0.14
-contextily>=1.4
 openeo>=0.28
-papermill>=2.5
-git+https://github.com/TobiasEdman/imintengine.git@v0.1.0
+imint-engine[fetch,inference] @ git+https://github.com/DigitalEarthSwedenExperimentalLab/imintengine@b183e1abd4653cb843a75557b05c09915fb85904
+# 030 and 070 (vessel detection) also need these; both are AGPL-3.0:
+# sahi==0.14.0
+# ultralytics==8.4.216
+# 140 (super-resolution) also needs these; SEN2SR is CC0 1.0, mlstac MIT:
+# sen2sr==0.8.5
+# mlstac==0.4.9
